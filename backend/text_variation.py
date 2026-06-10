@@ -370,11 +370,24 @@ def _build_title(title: str, rng: random.Random, facts: dict[str, str], used: se
         if clipped and clipped not in used:
             return clipped
     # Резерв (вырожденный случай: однословное название без фактов): добивка «!».
+    # Укорачиваем базу заранее, чтобы суффикс «!» не нарушил лимит 50 символов.
     fallback = _clip_title(title) or title.strip()[:TITLE_MAX_LEN]
     while fallback in used:
-        fallback += "!"
-    if len(fallback) > TITLE_MAX_LEN:
-        logger.warning("Резервное название длиннее лимита %d: %r", TITLE_MAX_LEN, fallback)
+        # Сколько символов «!» войдёт в итог (текущий хвост + 1 новый).
+        suffix_len = len(fallback) - len(fallback.rstrip("!")) + 1
+        max_base = TITLE_MAX_LEN - suffix_len
+        if max_base <= 0:
+            # Предельный вырожденный случай: всё место занято «!» — берём только «!».
+            fallback = "!" * TITLE_MAX_LEN
+            break
+        # База — часть без «!»-хвоста; при необходимости укорачиваем до max_base.
+        base_part = fallback.rstrip("!")
+        if len(base_part) > max_base:
+            # Пробуем обрезать по границе слова через _clip_title.
+            trimmed = _clip_title(base_part[:max_base])
+            # _clip_title может вернуть строку до max_base; если пуста — жёсткая обрезка.
+            base_part = (trimmed or base_part)[:max_base]
+        fallback = base_part + "!" * suffix_len
     return fallback
 
 
@@ -573,7 +586,17 @@ if __name__ == "__main__":
     assert len({v.title for v in vl}) == 3
     print("[OK] Тест 11: обрезка длинного названия по словам")
 
-    # ── Тест 12: обязательный базовый блок из ТЗ ─────────────────────────────
+    # ── Тест 12: вырожденный случай — однословное название 50 символов ──────────
+    degen_title = "А" * 50
+    degen_desc = "Продаю вещь. Хорошее состояние."
+    vd = vary_listing(degen_title, degen_desc, 3, seed=1)
+    assert vd[0].title == degen_title, "Вариант 0 тронут"
+    assert len({v.title for v in vd}) == 3, f"Названия не попарно различны: {[v.title for v in vd]}"
+    for v in vd:
+        assert len(v.title) <= 50, f"Название длиннее 50 ({len(v.title)}): {v.title!r}"
+    print("[OK] Тест 12: вырожденный случай — все названия ≤50, попарно различны, вариант 0 — оригинал")
+
+    # ── Тест 13: обязательный базовый блок из ТЗ ─────────────────────────────
     vs = vary_listing("Пиджак Hugo Boss", base, 5, seed=42,
                       facts={"size": "48 (M)", "brand": "Hugo Boss"})
     assert len(vs) == 5 and all(v.description.strip() and v.title.strip() for v in vs)
@@ -584,3 +607,4 @@ if __name__ == "__main__":
     assert vary_listing("Пиджак Hugo Boss", base, 5, seed=42,
                         facts={"size": "48 (M)", "brand": "Hugo Boss"}) == vs
     print("[OK] text_variation: все самотесты пройдены")
+
