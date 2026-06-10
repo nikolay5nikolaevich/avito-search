@@ -9,6 +9,7 @@ cache.db
 smoke_cache.db
 logs/
 debug/
+tmp/
 
 # Профиль Playwright (личные куки/сессия — не коммитить)
 .pw-profile/

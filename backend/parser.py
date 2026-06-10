@@ -41,16 +41,19 @@ CDP-режим (cdp_url задан):
 import asyncio
 import json
 import logging
-import pathlib
 import random
 import re
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from bs4 import BeautifulSoup
-from playwright.async_api import Browser, BrowserContext, Page, async_playwright
+from playwright.async_api import Page, async_playwright
 
 import avito_selectors as sel  # переименовано: selectors.py конфликтует со stdlib selectors
+from browser import (  # общий модуль подключения к браузеру (parser + publisher)
+    connect_over_cdp,
+    launch_persistent_context,
+)
 from cities import CITIES, City, build_search_url, is_local_listing
 
 if TYPE_CHECKING:
@@ -72,19 +75,6 @@ BASE_URL: str = "https://www.avito.ru"
 # Задержки между запросами — имитируем человека
 DELAY_MIN: float = 1.0
 DELAY_MAX: float = 3.0
-
-# User-Agent — актуальный Chrome 124 Desktop на Windows.
-# При запуске реального Chrome (channel="chrome") этот UA не подставляется —
-# Chrome сам отдаёт корректный UA. Используется только с Chromium-fallback.
-USER_AGENT: str = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
-
-# Папка для persistent-профиля браузера (куки, localStorage, сессия Авито).
-# Добавьте .pw-profile/ в .gitignore, чтобы не коммитить личные данные.
-_PROFILE_DIR: pathlib.Path = pathlib.Path(".pw-profile")
 
 # Маркеры ЗАГОЛОВКОВ страниц-заглушек Авито.
 # Сравниваем с page.title() — это точный, не подстрочный матч.
@@ -108,58 +98,6 @@ BLOCK_HTML_MARKERS: list[str] = [
 
 # Для обратной совместимости: объединённый список (используется в diag.py)
 BLOCK_MARKERS: list[str] = BLOCK_TITLE_MARKERS + BLOCK_HTML_MARKERS
-
-# Init-скрипт для маскировки автоматизации Playwright.
-# Выполняется в каждой новой странице ДО загрузки HTML.
-_STEALTH_SCRIPT: str = """
-// Убираем флаг автоматизации
-Object.defineProperty(navigator, 'webdriver', {
-    get: () => undefined,
-    configurable: true
-});
-
-// Русские языки — как у обычного пользователя из России
-Object.defineProperty(navigator, 'languages', {
-    get: () => ['ru-RU', 'ru'],
-    configurable: true
-});
-
-// Эмулируем объект window.chrome, который есть в настоящем Chrome
-if (!window.chrome) {
-    window.chrome = {
-        runtime: {},
-        loadTimes: function() {},
-        csi: function() {},
-        app: {}
-    };
-}
-
-// Эмулируем плагины — пустой массив выдаёт headless-режим
-const pluginData = [
-    { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-    { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
-    { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
-];
-const fakePlugins = Object.create(PluginArray.prototype);
-Object.defineProperty(fakePlugins, 'length', { get: () => pluginData.length });
-pluginData.forEach((p, i) => {
-    const plugin = Object.create(Plugin.prototype);
-    Object.defineProperty(plugin, 'name', { get: () => p.name });
-    Object.defineProperty(plugin, 'filename', { get: () => p.filename });
-    Object.defineProperty(plugin, 'description', { get: () => p.description });
-    Object.defineProperty(fakePlugins, i, { get: () => plugin });
-});
-Object.defineProperty(navigator, 'plugins', { get: () => fakePlugins, configurable: true });
-
-// Патч navigator.permissions.query — chrome headless возвращает 'denied' для notifications
-const originalQuery = window.navigator.permissions.query.bind(window.navigator.permissions);
-window.navigator.permissions.query = (parameters) => {
-    if (parameters.name === 'notifications') {
-        return Promise.resolve({ state: Notification.permission });
-    }
-    return originalQuery(parameters);
-};
-"""
 
 logger = logging.getLogger(__name__)
 
@@ -923,130 +861,6 @@ def _find_key_in_json(obj: Any, keys: tuple[str, ...]) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Создание браузера (persistent context с антидетект-мерами)
-# ---------------------------------------------------------------------------
-
-async def _launch_persistent_context(
-    pw: Any,
-    headless: bool,
-) -> BrowserContext:
-    """
-    Запускает браузер как persistent context с антидетект-настройками.
-
-    Сначала пытается использовать реальный установленный Chrome
-    (channel="chrome"). Если Chrome не найден — fallback на встроенный
-    Chromium с логом WARNING.
-
-    Persistent context (.pw-profile/) сохраняет куки и сессию между
-    запусками — Авито реже гоняет проверки у «знакомого» браузера.
-    """
-    # Убеждаемся, что папка профиля существует
-    _PROFILE_DIR.mkdir(exist_ok=True)
-    profile_path = str(_PROFILE_DIR.resolve())
-
-    # Общие kwargs для launch_persistent_context
-    ctx_kwargs: dict[str, Any] = dict(
-        headless=headless,
-        args=["--disable-blink-features=AutomationControlled"],
-        # Реалистичный viewport — самый популярный у десктоп-пользователей
-        viewport={"width": 1366, "height": 768},
-        locale="ru-RU",
-        timezone_id="Europe/Moscow",
-        extra_http_headers={
-            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Accept": (
-                "text/html,application/xhtml+xml,application/xml;"
-                "q=0.9,image/avif,image/webp,*/*;q=0.8"
-            ),
-        },
-    )
-
-    # Попытка 1: реальный Chrome — он сам даёт корректный UA, не переопределяем
-    try:
-        context = await pw.chromium.launch_persistent_context(
-            profile_path,
-            channel="chrome",
-            **ctx_kwargs,
-        )
-        logger.info("Браузер запущен: реальный Chrome (channel='chrome')")
-    except Exception as chrome_err:
-        # Chrome не установлен или не найден Playwright — используем Chromium
-        logger.warning(
-            "Реальный Chrome не найден (%s) — fallback на встроенный Chromium",
-            chrome_err,
-        )
-        # При Chromium устанавливаем UA явно, чтобы не светить headless-строкой
-        ctx_kwargs["user_agent"] = USER_AGENT
-        context = await pw.chromium.launch_persistent_context(
-            profile_path,
-            **ctx_kwargs,
-        )
-        logger.info("Браузер запущен: встроенный Chromium (fallback)")
-
-    # Регистрируем stealth-скрипт — выполнится в каждой новой странице
-    await context.add_init_script(_STEALTH_SCRIPT)
-    logger.debug("Stealth init-скрипт зарегистрирован на контексте")
-
-    return context
-
-
-async def _connect_over_cdp(
-    pw: Any,
-    cdp_url: str,
-) -> tuple[Browser, BrowserContext]:
-    """
-    Подключается к уже запущенному пользовательскому Chrome через CDP.
-
-    Пользователь должен запустить Chrome ВРУЧНУЮ командой:
-        chrome.exe --remote-debugging-port=9222 --user-data-dir=<путь>
-
-    Затем зайти на avito.ru вручную (прогреть сессию) и только потом
-    вызывать этот метод.
-
-    Возвращает (browser, context):
-        browser  — объект подключения (НЕ закрывать! это чужой Chrome)
-        context  — существующий контекст браузера (contexts[0]) или новый.
-
-    ВАЖНО: не закрывай browser/context — это Chrome пользователя.
-    Закрывай только страницы (page), которые сам открыл.
-
-    При неудаче подключения поднимает RuntimeError с инструкцией.
-    """
-    logger.info("CDP: подключаемся к браузеру по адресу %s", cdp_url)
-    try:
-        browser: Browser = await pw.chromium.connect_over_cdp(cdp_url)
-    except Exception as exc:
-        # Понятное сообщение, если Chrome не запущен с нужным флагом
-        raise RuntimeError(
-            f"Не удалось подключиться к Chrome по CDP ({cdp_url}).\n"
-            "Убедитесь, что Chrome запущен с флагом --remote-debugging-port.\n"
-            "Пример команды:\n"
-            '  & "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" '
-            "--remote-debugging-port=9222 "
-            '--user-data-dir="C:\\Users\\TBG\\avito-chrome-profile"\n'
-            f"Исходная ошибка: {exc}"
-        ) from exc
-
-    # Берём существующий контекст (вкладки пользователя) или создаём новый
-    if browser.contexts:
-        context: BrowserContext = browser.contexts[0]
-        logger.info("CDP: используем существующий контекст (contexts[0])")
-    else:
-        context = await browser.new_context()
-        logger.info("CDP: создан новый контекст (contexts[0] не было)")
-
-    # Stealth-скрипт — дополнительная мера, хотя Chrome пользователя уже «чистый»
-    try:
-        await context.add_init_script(_STEALTH_SCRIPT)
-        logger.debug("CDP: stealth init-скрипт добавлен в контекст")
-    except Exception as exc:
-        # В режиме CDP add_init_script может не поддерживаться — не критично
-        logger.debug("CDP: add_init_script не удалось применить: %s", exc)
-
-    return browser, context
-
-
-# ---------------------------------------------------------------------------
 # Публичный API
 # ---------------------------------------------------------------------------
 
@@ -1089,10 +903,10 @@ async def parse_city(
 
         if use_cdp:
             # CDP-режим: подключаемся к Chrome пользователя
-            browser, context = await _connect_over_cdp(pw, cdp_url)  # type: ignore[arg-type]
+            context = await connect_over_cdp(pw, cdp_url)  # type: ignore[arg-type]
         else:
             # Обычный режим: запускаем persistent context с антидетект-мерами
-            context = await _launch_persistent_context(pw, headless=headless)
+            context = await launch_persistent_context(pw, headless=headless)
 
         # Открываем свою страницу для работы
         page = await context.new_page()

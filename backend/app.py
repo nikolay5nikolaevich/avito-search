@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import uvicorn
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, File, Form, Query, Request, UploadFile
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -27,6 +27,7 @@ from fastapi.responses import (
 import analytics
 import cache as cache_mod
 import parser as avito_parser
+import publisher
 from cities import CITIES, City, get_cities_by_slugs, get_city_by_slug
 from filters import SearchFilters
 from parser import AvitoBlockedError
@@ -108,6 +109,13 @@ FRONTEND_ASSETS_DIR = FRONTEND_DIST_DIR / "assets"
 # ---------------------------------------------------------------------------
 
 JOBS: dict[str, dict[str, Any]] = {}
+
+# Задачи публикации черновиков — ОТДЕЛЬНЫЙ dict (не смешивать с JOBS аналитики).
+# Кэша для publish-задач нет: каждый запуск — новый черновик.
+PUBLISH_JOBS: dict[str, dict[str, Any]] = {}
+
+# Временное хранилище фото для publish-задач: tmp/publish/{job_id}/
+TMP_PUBLISH_DIR = Path("tmp") / "publish"
 
 
 def _serialize_city(city: City) -> dict[str, Any]:
@@ -418,6 +426,12 @@ async def workspace_page() -> Response:
     return _frontend_index_response()
 
 
+@app.get("/draft", response_class=HTMLResponse)
+async def draft_page() -> Response:
+    """Клиентский маршрут React для экрана черновика объявления."""
+    return _frontend_index_response()
+
+
 @app.get("/assets/{asset_path:path}")
 async def frontend_assets(asset_path: str) -> Response:
     """Раздаёт собранные Vite-ассеты."""
@@ -632,6 +646,176 @@ def _format_top3_cells(top3: list) -> list[str]:
         cells.append("")
 
     return cells
+
+
+# ---------------------------------------------------------------------------
+# Публикация черновиков объявлений (ТЗ «черновики Avito», §10)
+# ---------------------------------------------------------------------------
+
+def _serialize_publish_status(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
+    """
+    JSON-статус publish-задачи: {job_id, status, step, step_label, done, total,
+    error, debug_dir} + поля пакетного режима (ТЗ §16): draft_index,
+    drafts_total, drafts_saved.
+    step/step_label/done/total описывают ТЕКУЩИЙ черновик, не суммарный прогресс.
+    debug_dir — относительный путь дампа сбоя «debug/publish/<job_id>» или None.
+    Дефолты всех ключей задаются ОДИН раз при создании задачи в api_publish_start.
+    """
+    return {
+        "job_id": job_id,
+        "status": job.get("status"),
+        "step": job.get("step"),
+        "step_label": job.get("step_label"),
+        "done": job.get("done"),
+        "total": job.get("total"),
+        "error": job.get("error"),
+        "debug_dir": job.get("debug_dir"),
+        "draft_index": job.get("draft_index"),
+        "drafts_total": job.get("drafts_total"),
+        "drafts_saved": job.get("drafts_saved"),
+    }
+
+
+@app.post("/api/publish/start")
+async def api_publish_start(
+    title: str = Form(""),
+    trade_type: str = Form(""),
+    condition: str = Form(""),
+    size: str = Form(""),
+    brand: str = Form(""),
+    color: str = Form(""),
+    description: str = Form(""),
+    price: str = Form(""),
+    city: str = Form(""),
+    address: str = Form(""),
+    drafts_count: str = Form(""),
+    photos: list[UploadFile] = File([]),
+) -> JSONResponse:
+    """
+    Запуск задачи сохранения черновика объявления (multipart/form-data).
+
+    Серверная валидация по ТЗ §8 — backend не доверяет фронту.
+    Невалидная форма → HTTP 422 со списком полей, задача НЕ создаётся.
+    Валидная → фото сохраняются в tmp/publish/{job_id}/, задача уходит в фон.
+
+    Пакетный режим (ТЗ §16): drafts_count (1–10, дефолт 1) — сколько одинаковых
+    черновиков сделать за задачу. Запрос БЕЗ drafts_count работает как раньше.
+    """
+    fields: dict[str, Any] = {
+        "title": title,
+        "trade_type": trade_type,
+        "condition": condition,
+        "size": size,
+        "brand": brand,
+        "color": color,
+        "description": description,
+        "price": price,
+        "city": city,
+        "address": address,
+        "drafts_count": drafts_count,
+    }
+
+    # Метаданные фото для валидации БЕЗ чтения содержимого в память:
+    # размер берём по спулу Starlette через seek/tell (лимит 25 МБ/файл
+    # проверяется по факту, пиковая память не растёт со списком blob'ов)
+    photo_meta: list[tuple[str, Optional[str], int]] = []
+    for upload in photos:
+        upload.file.seek(0, os.SEEK_END)
+        size = upload.file.tell()
+        upload.file.seek(0)
+        photo_meta.append((upload.filename or "", upload.content_type, size))
+
+    errors = publisher.validate_publish_form(fields, photo_meta)
+    if errors:
+        logger.info("Publish: форма не прошла валидацию (%d ошибок)", len(errors))
+        return JSONResponse({"errors": errors}, status_code=422)
+
+    # Создаём задачу и сохраняем фото в tmp/publish/{job_id}/ —
+    # читаем и пишем ПО ОДНОМУ файлу, не накапливая их содержимое в памяти
+    job_id = str(uuid.uuid4())
+    tmp_dir = TMP_PUBLISH_DIR / job_id
+    photo_paths: list[str] = []
+    try:
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        for idx, upload in enumerate(photos, start=1):
+            # Безопасное имя: порядковый номер + расширение исходника
+            ext = Path(upload.filename or "").suffix.lower() or ".jpg"
+            file_path = tmp_dir / f"photo_{idx:02d}{ext}"
+            file_path.write_bytes(await upload.read())
+            photo_paths.append(str(file_path))
+    except OSError as exc:
+        logger.error("Publish: не удалось сохранить фото в %s: %s", tmp_dir, exc)
+        return JSONResponse(
+            {"errors": [{"field": "photos", "error": f"Не удалось сохранить фото: {exc}"}]},
+            status_code=500,
+        )
+
+    draft = publisher.build_draft_data(fields, photo_paths)
+
+    # Сколько черновиков (ТЗ §16): валидация уже прошла, None невозможен,
+    # но на всякий случай откатываемся к дефолту.
+    drafts_total = publisher.parse_drafts_count(drafts_count) or publisher.DRAFTS_DEFAULT
+
+    PUBLISH_JOBS[job_id] = {
+        "status": "queued",
+        "step": "",
+        "step_label": "",
+        "done": 0,
+        "total": publisher.TOTAL_STEPS,
+        "error": None,
+        "debug_dir": None,  # путь дампа сбоя; заполняет publisher._dump_failure
+        "result_url": None,
+        "summary": draft.summary(),
+        # Пакетный режим (ТЗ §16); run_publish_job читает drafts_total отсюда
+        "draft_index": 0,
+        "drafts_total": drafts_total,
+        "drafts_saved": 0,
+        "saved_urls": [],
+    }
+
+    asyncio.create_task(
+        publisher.run_publish_job(
+            job_id,
+            PUBLISH_JOBS[job_id],
+            draft,
+            cdp_url=CDP_URL,
+            tmp_dir=str(tmp_dir),
+        )
+    )
+
+    logger.info(
+        "Publish-задача %s создана: '%s', фото: %d, черновиков: %d",
+        job_id, draft.title, len(photo_paths), drafts_total,
+    )
+    return JSONResponse({"job_id": job_id})
+
+
+@app.get("/api/publish/status/{job_id}")
+async def api_publish_status(job_id: str) -> JSONResponse:
+    """JSON-статус publish-задачи для опроса фронтом."""
+    if job_id not in PUBLISH_JOBS:
+        return JSONResponse({"status": "not_found"}, status_code=404)
+
+    return JSONResponse(_serialize_publish_status(job_id, PUBLISH_JOBS[job_id]))
+
+
+@app.get("/api/publish/result/{job_id}")
+async def api_publish_result(job_id: str) -> JSONResponse:
+    """Итог publish-задачи: статус, конечный URL, ошибка/инструкция, сводка данных."""
+    if job_id not in PUBLISH_JOBS:
+        return JSONResponse({"status": "not_found"}, status_code=404)
+
+    job = PUBLISH_JOBS[job_id]
+    return JSONResponse(
+        {
+            **_serialize_publish_status(job_id, job),
+            "result_url": job.get("result_url"),
+            "summary": job.get("summary") or {},
+            # Пакетный режим (ТЗ §16): drafts_saved/drafts_total уже в статусе,
+            # здесь добавляем список конечных URL по сохранённым черновикам
+            "saved_urls": job.get("saved_urls") or [],
+        }
+    )
 
 
 # ---------------------------------------------------------------------------

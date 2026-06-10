@@ -1,7 +1,9 @@
 import { Fragment, useEffect, useState } from "react";
-import { Link } from "react-router-dom";
 import { fetchBootstrap, fetchResults, fetchStatus, startSearch } from "../lib/api";
 import { formatAverage, formatPopulation, formatTopViews } from "../lib/formatters";
+import ProgressBar from "../components/ProgressBar";
+import SiteFooter from "../components/SiteFooter";
+import Topbar from "../components/Topbar";
 
 function buildInitialForm(bootstrap) {
   return {
@@ -309,9 +311,7 @@ function ProgressPanel({ status, onReset }) {
         </div>
       </div>
 
-      <div className="workspace-progress-shell">
-        <div className="progress-bar-fill" style={{ width: `${percent}%` }} />
-      </div>
+      <ProgressBar percent={percent} />
 
       <div className="workspace-progress-meta">
         <span className="workspace-progress-value">
@@ -671,12 +671,13 @@ export default function WorkspacePage() {
 
       <div className="page-container workspace-page-shell">
         <header className="workspace-page-header">
-          <nav className="topbar" aria-label="Навигация рабочего экрана">
-            <span className="topbar-wordmark">AVITO RESEARCH</span>
-            <Link to="/" className="secondary-button">
-              Назад к кейсу
-            </Link>
-          </nav>
+          <Topbar
+            ariaLabel="Навигация рабочего экрана"
+            links={[
+              { to: "/draft", label: "Черновик объявления" },
+              { to: "/", label: "Назад к кейсу" },
+            ]}
+          />
 
           <div className="workspace-header-shell">
             <div className="workspace-header-copy">
@@ -733,14 +734,7 @@ export default function WorkspacePage() {
           ) : null}
         </section>
 
-        <footer className="site-footer workspace-footer" role="contentinfo">
-          <p className="footer-left">© 2026 Avito Research</p>
-          <nav className="footer-right" aria-label="Навигация футера">
-            <Link to="/" className="footer-link">
-              К кейсу
-            </Link>
-          </nav>
-        </footer>
+        <SiteFooter links={[{ to: "/", label: "К кейсу" }]} />
       </div>
     </main>
   );

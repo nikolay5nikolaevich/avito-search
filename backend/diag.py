@@ -62,14 +62,15 @@ logger = logging.getLogger("diag")
 # Импорты проекта (после настройки логирования)
 # ---------------------------------------------------------------------------
 
+from browser import (
+    connect_over_cdp,             # CDP: подключение к Chrome пользователя
+    launch_persistent_context,    # persistent context с антидетект-мерами
+)
 from cities import CITIES, build_search_url, get_city_by_slug
 from parser import (
-    USER_AGENT,
     AvitoBlockedError,
     BLOCK_MARKERS,
     _check_block,
-    _connect_over_cdp,            # CDP: подключение к Chrome пользователя
-    _launch_persistent_context,   # persistent context с антидетект-мерами
     _extract_items_from_html,
     _extract_items_from_json,
     _item_from_json,
@@ -133,12 +134,12 @@ async def run_diagnostics(
     async with async_playwright() as pw:
         # Выбираем режим: CDP или собственный браузер
         if use_cdp:
-            # CDP: подключаемся к Chrome пользователя — переиспользуем из parser.py
-            _browser, context = await _connect_over_cdp(pw, cdp_url)  # type: ignore[arg-type]
+            # CDP: подключаемся к Chrome пользователя — общий browser.py
+            context = await connect_over_cdp(pw, cdp_url)  # type: ignore[arg-type]
         else:
             # Обычный режим: persistent context с антидетект-мерами.
             # headless=False: видимое окно позволяет решить капчу вручную.
-            context = await _launch_persistent_context(pw, headless=False)
+            context = await launch_persistent_context(pw, headless=False)
 
         # Открываем свою вкладку в браузере (в CDP — новая вкладка в Chrome пользователя)
         page = await context.new_page()

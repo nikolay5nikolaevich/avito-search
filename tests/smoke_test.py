@@ -5,7 +5,7 @@ Smoke-тест веб-слоя (JSON API): GET / → /api/bootstrap → /api/sea
 Запуск (без новых зависимостей):
     python tests/smoke_test.py
 
-Сервер запускается в фоновом потоке через uvicorn.
+Сервер запускается в фоновом потоке через uvicorn (хелперы — tests/smoke_helpers.py).
 HTTP-запросы делаются через встроенный urllib — httpx/requests не нужны.
 Парсинг Авито НЕ вызывается — используется синтетическая async-заглушка.
 Тестовый кэш хранится в smoke_cache.db и удаляется после теста.
@@ -22,19 +22,21 @@ import json
 import logging
 import os
 import sys
-import threading
 import time
 import unittest.mock as mock
 import urllib.error
 import urllib.parse
 import urllib.request
 
-# Корень проекта и каталог backend/ в sys.path (модули бэкенда лежат в backend/)
-_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Каталог tests/, корень проекта и backend/ в sys.path
+_tests_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.dirname(_tests_dir)
 _backend_dir = os.path.join(_project_root, "backend")
-for _p in (_project_root, _backend_dir):
+for _p in (_tests_dir, _project_root, _backend_dir):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+
+from smoke_helpers import http_get, start_server, wait_server_ready  # noqa: E402
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -141,22 +143,14 @@ async def _fake_parse_all(
     return {city.slug: _ALL_SYNTHETIC.get(city.slug, []) for city in city_list}
 
 
-# ── HTTP-хелперы (только stdlib) ──────────────────────────────────────────────
+# ── HTTP-хелперы (общие — в smoke_helpers; здесь только специфичные) ──────────
 
 BASE_URL = f"http://127.0.0.1:{TEST_PORT}"
 
 
 def _get(path: str, params: dict | None = None) -> tuple[int, str, dict]:
-    """GET-запрос. Возвращает (status_code, body_text, headers)."""
-    url = BASE_URL + path
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status, resp.read().decode("utf-8", errors="replace"), dict(resp.headers)
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", errors="replace"), {}
+    """GET к тестовому серверу (обёртка над smoke_helpers.http_get)."""
+    return http_get(BASE_URL, path, params)
 
 
 def _post_json(path: str, payload: dict) -> tuple[int, str, dict]:
@@ -198,18 +192,6 @@ def _get_bytes(path: str, params=None) -> tuple[int, bytes, dict]:
         return e.code, e.read(), {}
 
 
-def _wait_server_ready(timeout: float = 15.0) -> None:
-    """Ждёт, пока сервер начнёт отвечать на /."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            urllib.request.urlopen(f"{BASE_URL}/", timeout=1)
-            return
-        except Exception:
-            time.sleep(0.2)
-    raise RuntimeError(f"Сервер не поднялся за {timeout}с на порту {TEST_PORT}")
-
-
 def _wait_for_done(job_id: str, timeout: float = 30.0) -> dict:
     """
     Опрашивает /api/status/{job_id} до получения статуса != 'running'.
@@ -226,29 +208,6 @@ def _wait_for_done(job_id: str, timeout: float = 30.0) -> dict:
     raise AssertionError(
         f"Таймаут {timeout}с: задача {job_id} так и осталась в статусе 'running'"
     )
-
-
-# ── Запуск тестового сервера в потоке ─────────────────────────────────────────
-
-def _start_server(app) -> threading.Thread:
-    """Запускает uvicorn в демон-потоке. Возвращает поток."""
-    import uvicorn
-
-    config = uvicorn.Config(
-        app,
-        host="127.0.0.1",
-        port=TEST_PORT,
-        log_level="warning",
-        loop="asyncio",
-    )
-    server = uvicorn.Server(config)
-
-    def _run():
-        server.run()
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    return t
 
 
 # ── Основной тест ─────────────────────────────────────────────────────────────
@@ -312,8 +271,8 @@ def run_smoke_test() -> None:
         # app.py: import parser as avito_parser → патчим avito_parser.parse_all
         mock.patch.object(app_module.avito_parser, "parse_all", _fake_parse_all),
     ):
-        _start_server(app_module.app)
-        _wait_server_ready(timeout=15.0)
+        start_server(app_module.app, TEST_PORT)
+        wait_server_ready(BASE_URL, timeout=15.0)
 
         # ── Шаг 1: GET / (frontend shell) ─────────────────────────────────────
         print("Шаг 1: GET / (frontend shell)")

@@ -1539,3 +1539,541 @@ button {
     text-align: left;
   }
 }
+
+/* ─── Draft Page ──────────────────────────────────────────────────────────── */
+
+/* Навигация topbar с несколькими кнопками */
+.draft-topbar-nav {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+/* Уведомление о категории */
+.draft-category-notice {
+  border: 1px solid rgba(159, 210, 255, 0.18);
+  border-radius: 1.1rem;
+  background: rgba(159, 210, 255, 0.05);
+  padding: 1rem 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.draft-category-text {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.65;
+  color: var(--bone-dim);
+}
+
+.draft-category-text strong {
+  color: var(--bone);
+  font-weight: 700;
+}
+
+/* Общая ошибка */
+.draft-general-error {
+  border: 1px solid rgba(255, 120, 120, 0.24);
+  border-radius: 1.1rem;
+  background: rgba(30, 8, 8, 0.6);
+  padding: 1rem 1.25rem;
+}
+
+/* Поле с ошибкой */
+.field-shell-invalid {
+  border-color: rgba(255, 120, 120, 0.35) !important;
+}
+
+/* Сообщение об ошибке поля */
+.draft-field-error {
+  margin: 0;
+  color: rgba(255, 120, 120, 0.85);
+  font-size: 0.82rem;
+  line-height: 1.5;
+  font-family: var(--font-mono);
+}
+
+/* Select в стиле проекта */
+.draft-select {
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%236f6d68' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 1rem center;
+  padding-right: 2.5rem !important;
+  cursor: pointer;
+}
+
+.draft-select option {
+  background-color: var(--ink-800);
+  color: var(--bone);
+}
+
+/* Общая база pill-кнопок формы черновика (radio-чипы, кнопка добавления фото) */
+.draft-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 2.85rem;
+  padding: 0.65rem 1.1rem;
+  border-radius: var(--radius-pill);
+  font-size: 0.9rem;
+  font-weight: 600;
+  transition:
+    border-color var(--transition),
+    background-color var(--transition),
+    color var(--transition),
+    transform var(--transition);
+}
+
+/* Radio-чипы для состояния */
+.draft-radio-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.draft-radio-chip {
+  position: relative;
+  border: 1px solid var(--hairline);
+  background: transparent;
+  color: var(--bone-dim);
+  cursor: pointer;
+}
+
+.draft-radio-chip input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.draft-radio-chip-active {
+  border-color: rgba(159, 210, 255, 0.35);
+  background: rgba(159, 210, 255, 0.08);
+  color: var(--bone);
+}
+
+.draft-radio-chip:hover {
+  transform: translateY(-1px);
+  border-color: rgba(255, 255, 255, 0.14);
+  color: var(--bone);
+}
+
+/* Зона загрузки фото */
+.draft-photo-zone {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.draft-photo-add-btn {
+  border: 1px solid rgba(159, 210, 255, 0.28);
+  background: rgba(159, 210, 255, 0.07);
+  color: var(--bone-dim);
+}
+
+.draft-photo-add-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  border-color: rgba(159, 210, 255, 0.45);
+  color: var(--bone);
+}
+
+.draft-photo-add-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.draft-photo-hint {
+  margin: 0;
+  color: var(--bone-faint);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.06em;
+  line-height: 1.6;
+}
+
+/* Список файлов */
+.draft-photo-list {
+  margin: 0.75rem 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0.4rem;
+}
+
+.draft-photo-item {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 0.85rem;
+  border-radius: 0.75rem;
+  border: 1px solid var(--hairline);
+  background-color: var(--ink-900);
+  font-size: 0.875rem;
+}
+
+.draft-photo-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--bone);
+}
+
+.draft-photo-size {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--bone-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.draft-photo-remove {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  border-radius: 50%;
+  border: 1px solid var(--hairline);
+  background: transparent;
+  color: var(--bone-faint);
+  font-size: 1rem;
+  line-height: 1;
+  transition:
+    border-color var(--transition),
+    color var(--transition),
+    background-color var(--transition);
+}
+
+.draft-photo-remove:hover {
+  border-color: rgba(255, 120, 120, 0.4);
+  color: rgba(255, 120, 120, 0.85);
+  background-color: rgba(255, 120, 120, 0.06);
+}
+
+/* Textarea */
+.draft-textarea {
+  min-height: 8rem;
+  resize: vertical;
+  line-height: 1.65;
+}
+
+/* Двухколоночный ряд */
+.draft-two-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+}
+
+@media (max-width: 640px) {
+  .draft-two-col {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Кнопка запуска */
+.draft-submit-row {
+  padding-top: 0.5rem;
+}
+
+/* Форма целиком */
+.draft-form {
+  display: grid;
+  gap: 1rem;
+}
+
+/* ─── Прогресс публикации ─────────────────────────────────────────────────── */
+
+.draft-progress-panel {
+  display: grid;
+  gap: 1.25rem;
+}
+
+/* Сводка данных объявления */
+.draft-summary-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 2rem;
+  padding: 0.9rem 1rem;
+  border-radius: 1rem;
+  border: 1px solid var(--hairline);
+  background-color: var(--ink-700);
+}
+
+.draft-summary-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.draft-summary-label {
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  font-weight: 500;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--bone-faint);
+}
+
+.draft-summary-value {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--bone);
+  line-height: 1.4;
+}
+
+/* Список шагов */
+.draft-steps-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0;
+}
+
+.draft-step {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  padding: 0.85rem 0;
+  border-bottom: 1px solid var(--hairline-soft);
+}
+
+.draft-step:last-child {
+  border-bottom: none;
+}
+
+.draft-step-icon {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.6rem;
+  height: 1.6rem;
+  border-radius: 50%;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 600;
+  transition:
+    background-color var(--transition),
+    border-color var(--transition),
+    color var(--transition);
+}
+
+.draft-step-pending .draft-step-icon {
+  border: 1px solid var(--hairline);
+  color: var(--bone-faint);
+  background: transparent;
+}
+
+.draft-step-done .draft-step-icon {
+  border: 1px solid rgba(100, 210, 130, 0.4);
+  background: rgba(100, 210, 130, 0.1);
+  color: rgba(130, 220, 150, 0.9);
+}
+
+.draft-step-active .draft-step-icon {
+  border: 1px solid rgba(159, 210, 255, 0.45);
+  background: rgba(159, 210, 255, 0.12);
+  color: var(--ice);
+}
+
+.draft-step-error .draft-step-icon {
+  border: 1px solid rgba(255, 120, 120, 0.4);
+  background: rgba(255, 120, 120, 0.08);
+  color: rgba(255, 120, 120, 0.85);
+}
+
+.draft-step-label {
+  font-size: 0.92rem;
+  font-weight: 500;
+  color: var(--bone-dim);
+  line-height: 1.4;
+}
+
+.draft-step-done .draft-step-label {
+  color: var(--bone);
+}
+
+.draft-step-active .draft-step-label {
+  color: var(--bone);
+  font-weight: 700;
+}
+
+.draft-step-error .draft-step-label {
+  color: rgba(255, 120, 120, 0.85);
+}
+
+/* Спиннер активного шага */
+.draft-step-spinner {
+  margin-left: auto;
+  flex-shrink: 0;
+  width: 1rem;
+  height: 1rem;
+  border-radius: 50%;
+  border: 2px solid rgba(159, 210, 255, 0.2);
+  border-top-color: var(--ice);
+  animation: draft-spin 0.8s linear infinite;
+}
+
+@keyframes draft-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Терминальные блоки */
+.draft-terminal {
+  border-radius: 1.1rem;
+  padding: 1.25rem 1.4rem;
+}
+
+.draft-terminal-done {
+  border: 1px solid rgba(100, 210, 130, 0.28);
+  background: rgba(10, 30, 15, 0.6);
+}
+
+.draft-terminal-action {
+  border: 1px solid rgba(255, 200, 80, 0.28);
+  background: rgba(30, 25, 5, 0.6);
+}
+
+.draft-terminal-error {
+  border: 1px solid rgba(255, 120, 120, 0.24);
+  background: rgba(30, 8, 8, 0.6);
+}
+
+.draft-terminal-title {
+  margin: 0;
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: var(--bone);
+  line-height: 1.4;
+}
+
+.draft-terminal-done .draft-terminal-title {
+  color: rgba(140, 230, 160, 0.95);
+}
+
+.draft-terminal-action .draft-terminal-title {
+  color: rgba(255, 210, 100, 0.9);
+}
+
+.draft-terminal-error .draft-terminal-title {
+  color: rgba(255, 120, 120, 0.85);
+}
+
+.draft-terminal-copy {
+  margin: 0.6rem 0 0;
+  font-size: 0.9rem;
+  line-height: 1.7;
+  color: var(--bone-dim);
+  text-wrap: pretty;
+}
+
+.draft-terminal-copy strong {
+  color: var(--bone);
+  font-weight: 700;
+}
+
+.draft-terminal-copy code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  color: var(--ice);
+  background: rgba(159, 210, 255, 0.08);
+  padding: 0.1em 0.4em;
+  border-radius: 0.3em;
+}
+
+/* ─── Пакетный режим ──────────────────────────────────────────────────────── */
+
+/* Подсказка под полем «Сколько черновиков» */
+.draft-batch-hint {
+  margin: 0;
+  color: var(--bone-faint);
+  font-size: 0.82rem;
+  line-height: 1.6;
+  text-wrap: pretty;
+}
+
+/* Счётчик черновика в шапке прогресса */
+.draft-batch-counter {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.draft-batch-counter-main {
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--ice);
+}
+
+/* Бейдж «X сохранено» рядом со счётчиком */
+.draft-batch-saved-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.25rem 0.75rem;
+  border-radius: var(--radius-pill);
+  border: 1px solid rgba(100, 210, 130, 0.35);
+  background: rgba(100, 210, 130, 0.08);
+  color: rgba(140, 230, 160, 0.9);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+}
+
+/* Строка частичного успеха в терминальных блоках */
+.draft-terminal-partial {
+  font-weight: 700;
+  color: var(--bone) !important;
+  margin-bottom: 0.35rem;
+}
+
+/* Список сохранённых URL */
+.draft-saved-urls-list {
+  margin: 1rem 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.draft-saved-urls-item {
+  /* пустой — стилизация идёт через ссылку */
+}
+
+.draft-saved-url-link {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.45rem 1rem;
+  border-radius: var(--radius-pill);
+  border: 1px solid rgba(100, 210, 130, 0.32);
+  background: rgba(100, 210, 130, 0.07);
+  color: rgba(140, 230, 160, 0.9);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  transition:
+    border-color var(--transition),
+    background-color var(--transition),
+    color var(--transition),
+    transform var(--transition);
+}
+
+.draft-saved-url-link:hover {
+  transform: translateY(-1px);
+  border-color: rgba(100, 210, 130, 0.5);
+  background: rgba(100, 210, 130, 0.13);
+  color: rgba(160, 240, 175, 1);
+}
