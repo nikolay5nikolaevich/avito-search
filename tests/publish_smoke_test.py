@@ -680,6 +680,154 @@ def run_publish_smoke_test() -> None:
         # Убираем из PREP_JOBS
         app_module.PREP_JOBS.pop(_prep_id_integ, None)
 
+    # ── Шаг 19: после успешной заливки prep-папка удаляется (ТЗ §17.4) ────────
+    print("Шаг 19: успешный publish с prep_id → prep-папка удалена")
+    _prep_id_clean = "smoke-prep-cleanup-0001"
+    _real_tmp_publish = app_module.TMP_PUBLISH_DIR
+    _prep_dir_clean = _real_tmp_publish / f"prep_{_prep_id_clean}"
+    _tmp_prep_dir_clean: str | None = None
+    try:
+        # Создаём временную базовую директорию и наполняем её
+        _tmp_prep_dir_clean = tempfile.mkdtemp(prefix="publish_smoke_cleanup_")
+        _prep_base_clean = Path(_tmp_prep_dir_clean)
+        for _draft_num in (1, 2):
+            _dd = _prep_base_clean / f"draft_{_draft_num:02d}"
+            _dd_photos = _dd / "photos"
+            _dd_photos.mkdir(parents=True, exist_ok=True)
+            (_dd / "title.txt").write_text(f"Заголовок {_draft_num}", encoding="utf-8")
+            (_dd / "text.txt").write_text(f"Описание {_draft_num}", encoding="utf-8")
+            (_dd_photos / "photo_01.jpg").write_bytes(png1)
+
+        # Кладём в ожидаемое место TMP_PUBLISH_DIR/prep_{prep_id}
+        if _prep_dir_clean.exists():
+            shutil.rmtree(_prep_dir_clean)
+        shutil.copytree(_prep_base_clean, _prep_dir_clean)
+
+        # Регистрируем в PREP_JOBS
+        app_module.PREP_JOBS[_prep_id_clean] = {
+            "status": "done",
+            "step": "done",
+            "step_label": "Готово",
+            "done": 3,
+            "total": 3,
+            "error": None,
+            "drafts_count": 2,
+        }
+
+        with mock.patch.object(pub_module, "run_publish_job", _make_fake_job()):
+            clean_fields = dict(_valid_fields(), prep_id=_prep_id_clean)
+            sc, body, _ = _post_multipart(
+                "/api/publish/start",
+                clean_fields,
+                [("photos", "photo_c.png", png1)],
+            )
+            assert sc == 200, (
+                f"start (cleanup test): ожидали 200, получили {sc}. Тело: {body[:300]}"
+            )
+            clean_job_id = json.loads(body).get("job_id")
+            assert clean_job_id, f"Нет job_id в ответе cleanup-теста: {body[:200]}"
+
+            # Polling до терминального статуса
+            clean_final = _wait_publish_done(clean_job_id, timeout=20.0)
+            assert clean_final.get("status") == "done", (
+                f"cleanup-тест: ожидали status='done', получили: {clean_final.get('status')!r}"
+            )
+
+        assert not _prep_dir_clean.exists(), (
+            f"Проверка 23 FAIL: prep-папка не удалена после успешной заливки: {_prep_dir_clean}"
+        )
+        assert _prep_id_clean not in app_module.PREP_JOBS, (
+            "Проверка 23 FAIL: запись PREP_JOBS не удалена после успешной заливки"
+        )
+        checks_passed += 1
+        print("  Проверка 23 PASS: prep-папка и запись PREP_JOBS удалены после успеха")
+
+    finally:
+        if _tmp_prep_dir_clean and os.path.exists(_tmp_prep_dir_clean):
+            try:
+                shutil.rmtree(_tmp_prep_dir_clean)
+            except OSError:
+                pass
+        if _prep_dir_clean.exists():
+            try:
+                shutil.rmtree(_prep_dir_clean)
+            except OSError:
+                pass
+        app_module.PREP_JOBS.pop(_prep_id_clean, None)
+
+    # ── Шаг 20: при падении заливки prep-папка ОСТАЁТСЯ (ТЗ §17.4) ────────────
+    print("Шаг 20: неуспешный publish с prep_id → prep-папка остаётся")
+    _prep_id_keep = "smoke-prep-cleanup-0002"
+    _prep_dir_keep = _real_tmp_publish / f"prep_{_prep_id_keep}"
+    _tmp_prep_dir_keep: str | None = None
+    try:
+        # Собираем структуру
+        _tmp_prep_dir_keep = tempfile.mkdtemp(prefix="publish_smoke_keep_")
+        _prep_base_keep = Path(_tmp_prep_dir_keep)
+        for _draft_num in (1, 2):
+            _dd = _prep_base_keep / f"draft_{_draft_num:02d}"
+            _dd_photos = _dd / "photos"
+            _dd_photos.mkdir(parents=True, exist_ok=True)
+            (_dd / "title.txt").write_text(f"Заголовок {_draft_num}", encoding="utf-8")
+            (_dd / "text.txt").write_text(f"Описание {_draft_num}", encoding="utf-8")
+            (_dd_photos / "photo_01.jpg").write_bytes(png1)
+
+        if _prep_dir_keep.exists():
+            shutil.rmtree(_prep_dir_keep)
+        shutil.copytree(_prep_base_keep, _prep_dir_keep)
+
+        app_module.PREP_JOBS[_prep_id_keep] = {
+            "status": "done",
+            "step": "done",
+            "step_label": "Готово",
+            "done": 3,
+            "total": 3,
+            "error": None,
+            "drafts_count": 2,
+        }
+
+        with mock.patch.object(pub_module, "run_publish_job", _make_fake_job(fail_at=2)):
+            keep_fields = dict(_valid_fields(), prep_id=_prep_id_keep, drafts_count="3")
+            sc, body, _ = _post_multipart(
+                "/api/publish/start",
+                keep_fields,
+                [("photos", "photo_k.png", png1)],
+            )
+            assert sc == 200, (
+                f"start (keep test): ожидали 200, получили {sc}. Тело: {body[:300]}"
+            )
+            keep_job_id = json.loads(body).get("job_id")
+            assert keep_job_id, f"Нет job_id в ответе keep-теста: {body[:200]}"
+
+            keep_final = _wait_publish_done(keep_job_id, timeout=20.0)
+            terminal_statuses_keep = {"failed", "needs_user_action"}
+            assert keep_final.get("status") in terminal_statuses_keep, (
+                f"keep-тест: ожидали failed/needs_user_action, "
+                f"получили: {keep_final.get('status')!r}"
+            )
+
+        assert _prep_dir_keep.exists(), (
+            "Проверка 24 FAIL: prep-папка удалена при НЕуспешной заливке"
+        )
+        assert _prep_id_keep in app_module.PREP_JOBS, (
+            "Проверка 24 FAIL: запись PREP_JOBS удалена при НЕуспешной заливке"
+        )
+        checks_passed += 1
+        print("  Проверка 24 PASS: при падении prep-папка и запись сохранены")
+
+    finally:
+        if _tmp_prep_dir_keep and os.path.exists(_tmp_prep_dir_keep):
+            try:
+                shutil.rmtree(_tmp_prep_dir_keep)
+            except OSError:
+                pass
+        if _prep_dir_keep.exists():
+            try:
+                shutil.rmtree(_prep_dir_keep)
+            except OSError:
+                pass
+        app_module.PREP_JOBS.pop(_prep_id_keep, None)
+
     print(f"\n=== PUBLISH SMOKE TEST: OK: {checks_passed} проверок ===")
 
 

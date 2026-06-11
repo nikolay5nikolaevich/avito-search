@@ -10,6 +10,7 @@ import io
 import logging
 import mimetypes
 import os
+import shutil
 import urllib.parse
 import uuid
 from pathlib import Path
@@ -676,6 +677,29 @@ def _serialize_publish_status(job_id: str, job: dict[str, Any]) -> dict[str, Any
     }
 
 
+async def _run_publish_and_cleanup(
+    job_id: str,
+    draft: "publisher.DraftData",
+    tmp_dir: Path,
+    prep_id: Optional[str],
+) -> None:
+    """Обёртка фоновой publish-задачи: после ПОЛНОГО успеха удаляет подготовленные
+    варианты prep_{prep_id} и запись PREP_JOBS (ТЗ §17.4); при падении/частичном
+    успехе — оставляет для разбора. ВАЖНО: run_publish_job вызывается через атрибут
+    модуля (publisher.run_publish_job), чтобы подмена в smoke-тестах работала."""
+    await publisher.run_publish_job(
+        job_id, PUBLISH_JOBS[job_id], draft, cdp_url=CDP_URL, tmp_dir=str(tmp_dir),
+    )
+    if not prep_id:
+        return
+    if PUBLISH_JOBS.get(job_id, {}).get("status") != "done":
+        logger.info("Prep %s оставлен для разбора: задача %s не успешна", prep_id, job_id)
+        return
+    shutil.rmtree(TMP_PUBLISH_DIR / f"prep_{prep_id}", ignore_errors=True)
+    PREP_JOBS.pop(prep_id, None)
+    logger.info("Prep %s удалён после успешной заливки (задача %s)", prep_id, job_id)
+
+
 @app.post("/api/publish/start")
 async def api_publish_start(
     title: str = Form(""),
@@ -786,13 +810,7 @@ async def api_publish_start(
     }
 
     asyncio.create_task(
-        publisher.run_publish_job(
-            job_id,
-            PUBLISH_JOBS[job_id],
-            draft,
-            cdp_url=CDP_URL,
-            tmp_dir=str(tmp_dir),
-        )
+        _run_publish_and_cleanup(job_id, draft, tmp_dir, prep_id if prep_id else None)
     )
 
     logger.info(
