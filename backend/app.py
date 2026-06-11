@@ -433,18 +433,6 @@ async def index() -> Response:
     return _frontend_index_response()
 
 
-@app.get("/workspace", response_class=HTMLResponse)
-async def workspace_page() -> Response:
-    """Отдельный route React workspace."""
-    return _frontend_index_response()
-
-
-@app.get("/draft", response_class=HTMLResponse)
-async def draft_page() -> Response:
-    """Клиентский маршрут React для экрана черновика объявления."""
-    return _frontend_index_response()
-
-
 @app.get("/assets/{asset_path:path}")
 async def frontend_assets(asset_path: str) -> Response:
     """Раздаёт собранные Vite-ассеты."""

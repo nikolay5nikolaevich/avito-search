@@ -340,19 +340,19 @@ def run_publish_smoke_test() -> None:
         checks_passed += 1
         print(f"  Проверка 1 PASS: GET / → 200, Content-Type={ct!r}")
 
-        # ── Шаг 2: GET /draft → 200, Content-Type text/html ──────────────
-        print("Шаг 2: GET /draft → 200 (проверка нового маршрута)")
-        sc, body, headers = _get("/draft")
+        # ── Шаг 2: GET / → 200, Content-Type text/html (SPA отдаётся) ──────
+        print("Шаг 2: GET / → 200 (SPA отдаётся сервером)")
+        sc, body, headers = _get("/")
         assert sc == 200, (
-            f"GET /draft вернул {sc}, ожидали 200. "
-            "Маршрут /draft не зарегистрирован в app.py"
+            f"GET / вернул {sc}, ожидали 200. "
+            "Главная страница SPA не отдаётся app.py"
         )
         ct = headers.get("content-type", headers.get("Content-Type", ""))
         assert "text/html" in ct.lower(), (
-            f"GET /draft должен вернуть text/html, получили: {ct}"
+            f"GET / должен вернуть text/html, получили: {ct}"
         )
         checks_passed += 1
-        print(f"  Проверка 2 PASS: GET /draft → 200, Content-Type={ct!r}")
+        print(f"  Проверка 2 PASS: GET / → 200, Content-Type={ct!r}")
 
         # ── Шаг 3: позитивный сценарий — обратная совместимость (без drafts_count) ──
         print("Шаг 3: POST /api/publish/start (без drafts_count — обратная совместимость)")
