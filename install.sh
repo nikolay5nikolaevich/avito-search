@@ -6,11 +6,11 @@
 set -e  # Прерываем выполнение при любой ошибке
 
 echo "=== Шаг 1: создаём виртуальное окружение ==="
-python3 -m venv venv
+python3 -m venv .venv
 
 echo "=== Шаг 2: активируем виртуальное окружение ==="
 # shellcheck disable=SC1091
-source venv/bin/activate
+source .venv/bin/activate
 
 echo "=== Шаг 3: обновляем pip до актуальной версии ==="
 pip install --upgrade pip
@@ -24,6 +24,6 @@ playwright install chromium
 echo ""
 echo "Установка завершена!"
 echo "Чтобы запустить сервис:"
-echo "  source venv/bin/activate"
-echo "  python app.py"
+echo "  source .venv/bin/activate"
+echo "  python backend/app.py"
 echo "Затем открой http://localhost:8000 в браузере."
