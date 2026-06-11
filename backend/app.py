@@ -204,6 +204,14 @@ def _parse_count(raw_count: Any) -> int:
     return max(1, min(500, count))
 
 
+def _build_cities_key(slugs: list[str]) -> str:
+    """Канонический ключ кэша по городам: валидация slug'ов, дедупликация и
+    сортировка через справочник — единый для поиска и export.csv."""
+    valid = [s for s in slugs if get_city_by_slug(s) is not None]
+    cities = get_cities_by_slugs(valid)
+    return ",".join(sorted(city.slug for city in cities))
+
+
 def _normalize_search_payload(
     query: str,
     count: Any,
@@ -232,7 +240,7 @@ def _normalize_search_payload(
         return None
 
     selected_cities = get_cities_by_slugs(valid_slugs)
-    cities_key = ",".join(sorted(city.slug for city in selected_cities))
+    cities_key = _build_cities_key(cities)
 
     return {
         "query": clean_query,
@@ -559,8 +567,7 @@ async def export_csv(
     filters = SearchFilters.from_form(price_min, price_max, gender_val)
 
     # Валидируем и разрешаем города (как в /results)
-    valid_slugs = [s for s in cities if get_city_by_slug(s) is not None]
-    cities_key = ",".join(sorted(valid_slugs))
+    cities_key = _build_cities_key(cities)
 
     results: Optional[list] = (
         cache_mod.get_result(

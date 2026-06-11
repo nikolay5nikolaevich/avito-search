@@ -432,6 +432,19 @@ def run_smoke_test() -> None:
         )
         print("Assert 5 PASS: CSV корректен, станции метро присутствуют")
 
+        # ── Шаг 6а: export.csv с задублированным slug города ─────────────────
+        # Ключ кэша экспорта обязан совпадать с поисковым даже при дублях slug'ов
+        # в query (раньше дубль давал другой ключ и «пустой» CSV при тёплом кэше).
+        print("Шаг 6а: GET /export.csv с дублем slug")
+        first_city_slug = TEST_CITY_SLUGS[0]  # "moskva"
+        dup_path = f"{export_url}&cities={first_city_slug}"
+        sc_dup, csv_dup_bytes, _ = _get_bytes(dup_path)
+        assert sc_dup == 200, f"Assert 6а-1 FAIL: дубль slug → {sc_dup}"
+        assert csv_dup_bytes == csv_bytes, (
+            "Assert 6а-2 FAIL: CSV с дублем slug отличается от обычного"
+        )
+        print("Шаг 6а пройден: дубль slug не меняет результат экспорта")
+
     # ── Подчистка ──────────────────────────────────────────────────────────────
     gc.collect()  # освобождаем SQLite-соединения (важно для Windows)
     if os.path.exists(SMOKE_DB):
