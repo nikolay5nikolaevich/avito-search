@@ -36,7 +36,7 @@ import pathlib
 import random
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable, Optional
 
 import avito_publish_selectors as psel
@@ -99,6 +99,9 @@ ALLOWED_PHOTO_MIME: frozenset[str] = frozenset(
 # Каталоги артефактов (пути относительно корня проекта — app.py делает chdir)
 DEBUG_PUBLISH_DIR = pathlib.Path("debug") / "publish"
 LOGS_DIR = pathlib.Path("logs")
+# База папок подготовки вариантов (ТЗ §17): tmp/publish/prep_{prep_id}/.
+# Должна совпадать с app.TMP_PUBLISH_DIR (импорт из app.py невозможен — цикл).
+TMP_PUBLISH_DIR = pathlib.Path("tmp") / "publish"
 
 # ---------------------------------------------------------------------------
 # Логгер 'publisher' → logs/publisher.log (+ наследование консоли от root)
@@ -1318,6 +1321,48 @@ def _format_partial_error(message: str, drafts_saved: int, drafts_total: int) ->
     return f"{message} Сохранено {drafts_saved} из {drafts_total}."
 
 
+def _load_prep_variant(
+    prep_dir: pathlib.Path, draft_index: int
+) -> tuple[str, str, list[str]]:
+    """
+    Читает title/description/фото варианта draft_index из папки подготовки
+    tmp/publish/prep_{prep_id}/draft_{i:02d}/ (ТЗ §17; пишет preparation.py).
+
+    Возвращает (title, description, отсортированный список путей фото).
+    Нет папки/файлов/фото или пустые тексты → StepError с понятным русским
+    текстом (какой именно путь не найден/пуст). Чистая функция без Playwright.
+    """
+    draft_dir = prep_dir / f"draft_{draft_index:02d}"
+    if not draft_dir.is_dir():
+        raise StepError(f"Папка варианта черновика не найдена: {draft_dir}")
+
+    title_path = draft_dir / "title.txt"
+    text_path = draft_dir / "text.txt"
+    for path, label in ((title_path, "названием"), (text_path, "описанием")):
+        if not path.is_file():
+            raise StepError(f"Файл с {label} варианта не найден: {path}")
+
+    try:
+        title = title_path.read_text(encoding="utf-8").strip()
+        description = text_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise StepError(
+            f"Не удалось прочитать тексты варианта из {draft_dir}: {exc}"
+        ) from exc
+    if not title:
+        raise StepError(f"Название варианта пустое: {title_path}")
+    if not description:
+        raise StepError(f"Описание варианта пустое: {text_path}")
+
+    photos_dir = draft_dir / "photos"
+    if not photos_dir.is_dir():
+        raise StepError(f"Папка фото варианта не найдена: {photos_dir}")
+    photo_paths = [str(p) for p in sorted(photos_dir.iterdir()) if p.is_file()]
+    if not photo_paths:
+        raise StepError(f"В папке фото варианта нет файлов: {photos_dir}")
+    return title, description, photo_paths
+
+
 async def run_publish_job(
     job_id: str,
     job: dict[str, Any],
@@ -1333,6 +1378,11 @@ async def run_publish_job(
     (кладёт app.py; отсутствует → 1, обратная совместимость). connect_chrome —
     один раз, затем полный цикл шагов на каждый черновик, пауза 5–15 с между
     черновиками. Прогресс пакета — job["draft_index"/"drafts_saved"/"saved_urls"].
+
+    Вариативность (ТЗ §17): если в job есть "prep_id" (кладёт app.py), на каждый
+    черновик i подставляются title/description/фото варианта из
+    tmp/publish/prep_{prep_id}/draft_{i:02d}/ (_load_prep_variant); без prep_id
+    поведение прежнее — данные data одинаковы для всех черновиков.
 
     Аргументы:
         job_id:  идентификатор задачи
@@ -1404,8 +1454,28 @@ async def run_publish_job(
                     await asyncio.sleep(pause_s)
 
                 logger.info("Черновик %d/%d: начат", draft_index, drafts_total)
+
+                # Вариативность (ТЗ §17): при наличии prep_id подставляем
+                # title/description/фото варианта i из папки подготовки.
+                # Без prep_id — прежнее поведение: data без изменений.
+                data_i = data
+                if job.get("prep_id"):
+                    title_i, desc_i, photos_i = _load_prep_variant(
+                        TMP_PUBLISH_DIR / f"prep_{job['prep_id']}", draft_index
+                    )
+                    data_i = replace(
+                        data,
+                        title=title_i,
+                        description=desc_i,
+                        photo_paths=tuple(photos_i),
+                    )
+                    logger.info(
+                        "Черновик %d/%d: взят вариант из подготовки (%d фото)",
+                        draft_index, drafts_total, len(photos_i),
+                    )
+
                 final_url = await _run_single_draft(
-                    page, job, data, draft_index, drafts_total
+                    page, job, data_i, draft_index, drafts_total
                 )
                 job["drafts_saved"] = draft_index
                 job["saved_urls"].append(final_url)
@@ -1696,5 +1766,47 @@ if __name__ == "__main__":
     asyncio.run(_test_wait_form_exited_form_gone())
     asyncio.run(_test_wait_form_exited_timeout())
     print("[OK] Тест 11: _wait_form_exited покрывает navigated/page_closed/form_gone/timeout")
+
+    # ── Тест 12: _load_prep_variant — чтение варианта из папки подготовки ────
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as _tmpdir:
+        _prep_dir = pathlib.Path(_tmpdir) / "prep_test"
+        _d1 = _prep_dir / "draft_01"
+        (_d1 / "photos").mkdir(parents=True)
+        (_d1 / "title.txt").write_text("Пиджак Hugo Boss, вариант 1", encoding="utf-8")
+        (_d1 / "text.txt").write_text("Описание варианта 1.", encoding="utf-8")
+        (_d1 / "photos" / "2.jpg").write_bytes(b"fake-jpeg-2")
+        (_d1 / "photos" / "1.jpg").write_bytes(b"fake-jpeg-1")
+
+        # Корректная папка → правильные значения, фото отсортированы
+        _t, _desc, _photos = _load_prep_variant(_prep_dir, 1)
+        assert _t == "Пиджак Hugo Boss, вариант 1", _t
+        assert _desc == "Описание варианта 1.", _desc
+        assert _photos == [
+            str(_d1 / "photos" / "1.jpg"),
+            str(_d1 / "photos" / "2.jpg"),
+        ], _photos
+
+        # Отсутствие папки draft_02 → StepError с путём в тексте
+        try:
+            _load_prep_variant(_prep_dir, 2)
+        except StepError as exc:
+            assert "draft_02" in str(exc), str(exc)
+        else:
+            raise AssertionError("Ожидали StepError для отсутствующей папки draft_02")
+
+        # Папка есть, но фото нет → StepError
+        _d3 = _prep_dir / "draft_03"
+        (_d3 / "photos").mkdir(parents=True)
+        (_d3 / "title.txt").write_text("Вариант 3", encoding="utf-8")
+        (_d3 / "text.txt").write_text("Описание 3.", encoding="utf-8")
+        try:
+            _load_prep_variant(_prep_dir, 3)
+        except StepError as exc:
+            assert "фото" in str(exc).lower(), str(exc)
+        else:
+            raise AssertionError("Ожидали StepError для варианта без фото")
+    print("[OK] Тест 12: _load_prep_variant - чтение варианта, нет папки/фото -> StepError")
 
     print("\n=== Все самотесты publisher.py пройдены ===")
