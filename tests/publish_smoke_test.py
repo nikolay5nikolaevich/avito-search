@@ -44,13 +44,16 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import struct
 import sys
+import tempfile
 import time
 import unittest.mock as mock
 import urllib.error
 import urllib.request
 import zlib
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 # Каталог tests/, корень проекта и backend/ в sys.path
@@ -567,6 +570,115 @@ def run_publish_smoke_test() -> None:
         )
         checks_passed += 1
         print(f"  Проверка 20 PASS: error содержит '1 из 3' ({error_text!r})")
+
+    # ── Шаги 17–18: интеграция publish с prep_id (ТЗ §17, Задача 8.3) ────────
+    # Сборка минимального prep вручную: две папки draft_01/draft_02 с текстами
+    # и фото, запись в PREP_JOBS со status="done", POST start с prep_id.
+    print("Шаг 17: start с валидным prep_id → job создан, job[prep_id] сохранён")
+
+    _tmp_prep_dir: str | None = None
+    _prep_id_integ = "smoke-prep-integration-0001"
+    try:
+        # Создаём tmp-директорию под prep
+        _tmp_prep_dir = tempfile.mkdtemp(prefix="publish_smoke_prep_")
+        _prep_base = Path(_tmp_prep_dir)
+
+        # Создаём структуру draft_01 и draft_02
+        for _draft_num in (1, 2):
+            _dd = _prep_base / f"draft_{_draft_num:02d}"
+            _dd_photos = _dd / "photos"
+            _dd_photos.mkdir(parents=True, exist_ok=True)
+            (_dd / "title.txt").write_text(f"Заголовок {_draft_num}", encoding="utf-8")
+            (_dd / "text.txt").write_text(f"Описание {_draft_num}", encoding="utf-8")
+            # Синтетическое JPEG-фото (минимальный валидный файл)
+            (_dd_photos / "photo_01.jpg").write_bytes(png1)
+
+        # Патчим TMP_PUBLISH_DIR в app_module так, чтобы сервер нашёл prep_dir
+        # Проще: регистрируем prep_id напрямую в PREP_JOBS и кладём папку
+        # туда, куда app.py ожидает: TMP_PUBLISH_DIR / f"prep_{prep_id}"
+        _real_tmp_publish = app_module.TMP_PUBLISH_DIR
+        _expected_prep_dir = _real_tmp_publish / f"prep_{_prep_id_integ}"
+        if _expected_prep_dir.exists():
+            shutil.rmtree(_expected_prep_dir)
+        # Копируем нашу заглушку в ожидаемое место
+        shutil.copytree(_prep_base, _expected_prep_dir)
+
+        # Регистрируем в PREP_JOBS
+        app_module.PREP_JOBS[_prep_id_integ] = {
+            "status": "done",
+            "step": "done",
+            "step_label": "Готово",
+            "done": 3,
+            "total": 3,
+            "error": None,
+            "drafts_count": 2,
+        }
+
+        # Теперь POST /api/publish/start с prep_id (и валидными остальными полями)
+        with mock.patch.object(pub_module, "run_publish_job", _make_fake_job()):
+            integ_fields = dict(_valid_fields(), prep_id=_prep_id_integ)
+            sc, body, _ = _post_multipart(
+                "/api/publish/start",
+                integ_fields,
+                [("photos", "photo_01.png", png1)],
+            )
+            assert sc == 200, (
+                f"start с prep_id: ожидали 200, получили {sc}. Тело: {body[:300]}"
+            )
+            integ_data = json.loads(body)
+            integ_job_id = integ_data.get("job_id")
+            assert integ_job_id, f"start с prep_id: нет job_id в ответе: {integ_data}"
+
+            # Проверяем что PUBLISH_JOBS содержит prep_id
+            integ_job = app_module.PUBLISH_JOBS.get(integ_job_id)
+            assert integ_job is not None, (
+                f"start с prep_id: задача {integ_job_id} не найдена в PUBLISH_JOBS"
+            )
+            assert integ_job.get("prep_id") == _prep_id_integ, (
+                f"start с prep_id: ожидали prep_id={_prep_id_integ!r}, "
+                f"получили: {integ_job.get('prep_id')!r}"
+            )
+            checks_passed += 1
+            print(
+                f"  Проверка 21 PASS: start с prep_id → job_id={integ_job_id[:8]}…, "
+                f"PUBLISH_JOBS[job_id]['prep_id']={integ_job.get('prep_id')[:8]}…"
+            )
+
+        # ── Шаг 18: start с мусорным prep_id → 422 ──────────────────────────
+        print("Шаг 18: start с мусорным prep_id → 422")
+        garbage_fields = dict(_valid_fields(), prep_id="мусор-неизвестный-prep")
+        sc_bad, body_bad, _ = _post_multipart(
+            "/api/publish/start",
+            garbage_fields,
+            [("photos", "photo_g.png", png1)],
+        )
+        assert sc_bad == 422, (
+            f"start с мусорным prep_id: ожидали 422, получили {sc_bad}. "
+            f"Тело: {body_bad[:300]}"
+        )
+        bad_data = json.loads(body_bad)
+        bad_fields = {e["field"] for e in bad_data.get("errors", [])}
+        assert "prep_id" in bad_fields, (
+            f"start с мусорным prep_id: в 422-ответе нет поля 'prep_id': {bad_data}"
+        )
+        checks_passed += 1
+        print(f"  Проверка 22 PASS: start с мусорным prep_id → 422 (поля={bad_fields})")
+
+    finally:
+        # Подчищаем tmp-артефакты (best effort)
+        if _tmp_prep_dir and os.path.exists(_tmp_prep_dir):
+            try:
+                shutil.rmtree(_tmp_prep_dir)
+            except OSError:
+                pass
+        _cleanup_path = app_module.TMP_PUBLISH_DIR / f"prep_{_prep_id_integ}"
+        if _cleanup_path.exists():
+            try:
+                shutil.rmtree(_cleanup_path)
+            except OSError:
+                pass
+        # Убираем из PREP_JOBS
+        app_module.PREP_JOBS.pop(_prep_id_integ, None)
 
     print(f"\n=== PUBLISH SMOKE TEST: OK: {checks_passed} проверок ===")
 
