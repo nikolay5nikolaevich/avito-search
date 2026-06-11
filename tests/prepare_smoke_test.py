@@ -32,12 +32,11 @@ import io
 import json
 import logging
 import os
-import struct
+import shutil
 import sys
 import time
 import urllib.error
 import urllib.request
-import zlib
 
 # Каталог tests/, корень проекта и backend/ в sys.path
 _tests_dir = os.path.dirname(os.path.abspath(__file__))
@@ -57,6 +56,9 @@ logger = logging.getLogger("prepare_smoke_test")
 
 TEST_PORT = 8003
 BASE_URL = f"http://127.0.0.1:{TEST_PORT}"
+
+# prep_id, созданные за прогон, — для уборки tmp/publish/prep_{id}/ в finally
+CREATED_PREP_IDS: list[str] = []
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +221,7 @@ def run_prepare_smoke_test() -> None:
     data = json.loads(body)
     prep_id = data.get("prep_id")
     assert prep_id, f"Ответ /api/publish/prepare не содержит prep_id: {data}"
+    CREATED_PREP_IDS.append(prep_id)
     checks_passed += 1
     print(f"  Проверка 1 PASS: prep_id получен ({prep_id[:8]}…)")
 
@@ -427,18 +430,42 @@ def run_prepare_smoke_test() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Уборка артефактов
+# ---------------------------------------------------------------------------
+
+def _cleanup_prep_dirs() -> None:
+    """Подчищает tmp/publish/prep_{id}/ за прогон (best effort, как в publish_smoke_test)."""
+    try:
+        import app as app_module  # noqa: PLC0415
+    except Exception:
+        return
+    for _pid in CREATED_PREP_IDS:
+        _prep_path = app_module.TMP_PUBLISH_DIR / f"prep_{_pid}"
+        if _prep_path.exists():
+            try:
+                shutil.rmtree(_prep_path)
+            except OSError:
+                pass
+        # Убираем из PREP_JOBS (сервер in-process, реестр доступен напрямую)
+        app_module.PREP_JOBS.pop(_pid, None)
+
+
+# ---------------------------------------------------------------------------
 # Самозапуск
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    exit_code = 0
     try:
         run_prepare_smoke_test()
-        sys.exit(0)
     except AssertionError as e:
         print(f"\n[FAIL] {e}", file=sys.stderr)
-        sys.exit(1)
+        exit_code = 1
     except Exception as e:
         import traceback
         print(f"\n[ERROR] {e}", file=sys.stderr)
         traceback.print_exc()
-        sys.exit(2)
+        exit_code = 2
+    finally:
+        _cleanup_prep_dirs()
+    sys.exit(exit_code)
