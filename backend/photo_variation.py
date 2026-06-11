@@ -64,20 +64,6 @@ _TEMP_VALUES: list[int] = [-7, -5, -3, 3, 5, 7]
 _NOISE_VALUES: list[float] = [0.01, 0.015, 0.02, 0.025, 0.03]
 _QUALITY_VALUES: list[int] = [86, 88, 90, 91, 93, 94, 95]
 
-# Имена семейств для сборки названия пресета
-_FAMILY_NAMES = {
-    "zoom": "зум",
-    "rotate": "поворот",
-    "brightness": "ярче",
-    "brightness_dark": "темнее",
-    "contrast": "контраст",
-    "saturation": "насыщ",
-    "temp_warm": "теплее",
-    "temp_cool": "холоднее",
-    "noise": "шум",
-    "quality": "jpeg",
-}
-
 
 # ---------------------------------------------------------------------------
 # Вспомогательная функция — максимальный вписанный прямоугольник после поворота
@@ -285,7 +271,16 @@ def _apply_preset_impl(image_bytes: bytes, preset: Preset) -> bytes:
     if img.mode == "CMYK":
         logger.debug("apply_preset: конвертируем CMYK → RGB")
         img = img.convert("RGB")
-    elif img.mode not in ("RGB", "RGBA", "L", "P"):
+    elif img.mode == "P":
+        # Палитровые изображения: ImageEnhance не поддерживает P-mode.
+        # P с прозрачностью (transparency) → RGBA, иначе → RGB.
+        if "transparency" in img.info:
+            logger.debug("apply_preset: конвертируем P (с прозрачностью) → RGBA")
+            img = img.convert("RGBA")
+        else:
+            logger.debug("apply_preset: конвертируем P → RGB")
+            img = img.convert("RGB")
+    elif img.mode not in ("RGB", "RGBA", "L"):
         img = img.convert("RGB")
 
     # --- Чистка EXIF: пересоздание без метаданных ---
@@ -352,9 +347,9 @@ def _apply_zoom(img, zoom_pct: float):
     # Размер обрезаемого поля с каждой стороны
     dw = int(w * zoom_pct / 100 / 2)
     dh = int(h * zoom_pct / 100 / 2)
-    # Гарантируем минимальный размер 1×1
-    left = min(dw, w // 2 - 1)
-    top = min(dh, h // 2 - 1)
+    # Гарантируем минимальный размер 1×1; координаты — неотрицательные
+    left = max(0, min(dw, w // 2 - 1))
+    top = max(0, min(dh, h // 2 - 1))
     right = w - left
     bottom = h - top
     cropped = img.crop((left, top, right, bottom))
@@ -579,6 +574,100 @@ if __name__ == "__main__":
     out_img = Image.open(io.BytesIO(result))
     assert out_img.format == "PNG", f"Ожидали PNG, получили {out_img.format}"
     print(f"[OK] Тест 10: результат обработки PNG → валидный PNG ({out_img.size})")
+
+    # ── Тест 11: палитровый (P-mode) PNG — обработка применяется, формат PNG сохранён ──────
+
+    def _make_palette_png(w: int, h: int) -> bytes:
+        """Создаём RGB-изображение с градиентом, конвертируем в P, сохраняем как PNG."""
+        base = Image.new("RGB", (w, h))
+        pixels = base.load()
+        for x in range(w):
+            for y in range(h):
+                pixels[x, y] = (x * 255 // max(w - 1, 1), y * 255 // max(h - 1, 1), 128)
+        palette_img = base.convert("P")
+        buf = io.BytesIO()
+        palette_img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    # Проверяем, что входной файл действительно P-mode
+    palette_png_bytes = _make_palette_png(60, 40)
+    _check_mode = Image.open(io.BytesIO(palette_png_bytes))
+    assert _check_mode.mode == "P", (
+        f"Тест 11: входной PNG должен быть P-mode, получили {_check_mode.mode!r}"
+    )
+
+    presets_5 = build_presets(5, seed=3)
+    neutral_preset = presets_5[0]
+    non_neutral_presets = [p for p in presets_5[1:] if _preset_key(p) != _preset_key(neutral_preset)]
+
+    # Нейтральный пресет — просто пересохранение, байты могут отличаться от P-PNG
+    neutral_result = apply_preset(palette_png_bytes, neutral_preset)
+    assert isinstance(neutral_result, bytes) and len(neutral_result) > 0, (
+        "Тест 11: нейтральный пресет на P-PNG → пустой результат"
+    )
+    out_neutral = Image.open(io.BytesIO(neutral_result))
+    out_neutral.load()
+    assert out_neutral.format == "PNG", (
+        f"Тест 11: нейтральный пресет должен вернуть PNG, получили {out_neutral.format}"
+    )
+
+    # Проверяем пресет с brightness — это именно тот случай, где ImageEnhance
+    # упадёт с "image has wrong mode" при P-mode изображении без конверсии.
+    # Создаём такой пресет явно.
+    brightness_preset = Preset(name="тест-ярче", brightness=1.05)
+    result_bright = apply_preset(palette_png_bytes, brightness_preset)
+    assert isinstance(result_bright, bytes) and len(result_bright) > 0, (
+        "Тест 11: brightness-пресет на P-PNG → пустой результат"
+    )
+    out_bright = Image.open(io.BytesIO(result_bright))
+    out_bright.load()
+    assert out_bright.format == "PNG", (
+        f"Тест 11: brightness-пресет → ожидали PNG, получили {out_bright.format}"
+    )
+    # Если обработка не применилась (P-mode не конвертировали), apply_preset вернёт
+    # оригинальные байты palette_png_bytes без изменений.
+    # Правильная обработка должна изменить пиксели (яркость +5%), байты будут другими.
+    assert result_bright != palette_png_bytes, (
+        "Тест 11: brightness-пресет на P-PNG вернул оригинал — обработка не применилась "
+        "(вероятно, ImageEnhance упал с 'image has wrong mode', фикс не внесён)"
+    )
+
+    # Все пресеты на P-PNG не должны падать и должны возвращать PNG
+    for i, p in enumerate(presets_5):
+        result = apply_preset(palette_png_bytes, p)
+        assert isinstance(result, bytes) and len(result) > 0, (
+            f"Тест 11: пресет {p.name!r} на P-PNG → пустой результат"
+        )
+        out_img = Image.open(io.BytesIO(result))
+        out_img.load()
+        assert out_img.format == "PNG", (
+            f"Тест 11: пресет {p.name!r} → ожидали PNG, получили {out_img.format}"
+        )
+
+    print("[OK] Тест 11: палитровый (P-mode) PNG — обработка применяется, формат PNG сохранён")
+
+    # ── Тест 12: JPEG 1×1 — не падает, размер результата ≥ 1×1 ──────────────────────────
+
+    def _make_jpeg_1x1() -> bytes:
+        img = Image.new("RGB", (1, 1), color=(200, 100, 50))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=90)
+        return buf.getvalue()
+
+    jpeg_1x1 = _make_jpeg_1x1()
+    presets_all = build_presets(5, seed=3)
+    for i, p in enumerate(presets_all):
+        result = apply_preset(jpeg_1x1, p)
+        assert isinstance(result, bytes) and len(result) > 0, (
+            f"Тест 12: пресет {p.name!r} на JPEG 1×1 → пустой результат"
+        )
+        out_img = Image.open(io.BytesIO(result))
+        out_img.load()
+        ow, oh = out_img.size
+        assert ow >= 1 and oh >= 1, (
+            f"Тест 12: пресет {p.name!r} → размер {ow}×{oh} < 1×1"
+        )
+    print("[OK] Тест 12: JPEG 1×1 — не падает, размер ≥ 1×1 для всех пресетов")
 
     print("\nВсе самотесты пройдены успешно.")
     sys.exit(0)
