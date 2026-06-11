@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 
 import {
   buildPublishFormData,
+  buildPrepPhotoUrl,
   extractPublishFieldErrors,
+  replaceDraftCard,
 } from "./publish.js";
 
 test("buildPublishFormData uses backend field names for publish form", () => {
@@ -59,4 +61,50 @@ test("extractPublishFieldErrors keeps FastAPI detail compatibility", () => {
   assert.deepEqual(fieldErrors, {
     photos: "field required",
   });
+});
+
+// ─── Тесты фазы превью ────────────────────────────────────────────────────────
+
+test("buildPrepPhotoUrl строит правильный путь", () => {
+  assert.equal(
+    buildPrepPhotoUrl("abc123", 2, 0),
+    "/api/publish/prepare/photo/abc123/2/0",
+  );
+  assert.equal(
+    buildPrepPhotoUrl("xyz-99", 0, 5),
+    "/api/publish/prepare/photo/xyz-99/0/5",
+  );
+});
+
+test("replaceDraftCard заменяет карточку по индексу и не мутирует исходный массив", () => {
+  const original = [
+    { index: 0, title: "Оригинал" },
+    { index: 1, title: "Вариант 1" },
+    { index: 2, title: "Вариант 2" },
+  ];
+
+  const updated = replaceDraftCard(original, 1, { index: 1, title: "Новый вариант 1" });
+
+  // Нужный элемент заменён
+  assert.equal(updated[1].title, "Новый вариант 1");
+
+  // Остальные элементы не изменились
+  assert.equal(updated[0].title, "Оригинал");
+  assert.equal(updated[2].title, "Вариант 2");
+
+  // Исходный массив не мутирован
+  assert.equal(original[1].title, "Вариант 1");
+
+  // Длина сохранена
+  assert.equal(updated.length, 3);
+});
+
+test("replaceDraftCard с индексом 0 заменяет первый элемент", () => {
+  const original = [
+    { index: 0, title: "Ст." },
+    { index: 1, title: "Вар." },
+  ];
+  const updated = replaceDraftCard(original, 0, { index: 0, title: "Обновлено" });
+  assert.equal(updated[0].title, "Обновлено");
+  assert.equal(updated[1].title, "Вар.");
 });

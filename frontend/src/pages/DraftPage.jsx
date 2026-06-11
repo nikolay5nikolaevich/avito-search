@@ -1,6 +1,19 @@
 import { useEffect, useRef, useState } from "react";
-import { fetchPublishResult, fetchPublishStatus, startPublish } from "../lib/api";
-import { buildPublishFormData, TERMINAL_STATUSES } from "../lib/publish";
+import {
+  fetchPublishResult,
+  fetchPublishStatus,
+  getPrepareResult,
+  getPrepareStatus,
+  prepPhotoUrl,
+  regenerateDraft,
+  startPrepare,
+  startPublish,
+} from "../lib/api";
+import {
+  buildPublishFormData,
+  replaceDraftCard,
+  TERMINAL_STATUSES,
+} from "../lib/publish";
 import FieldShell from "../components/FieldShell";
 import ProgressBar from "../components/ProgressBar";
 import SiteFooter from "../components/SiteFooter";
@@ -128,11 +141,12 @@ function validate(form, photos) {
   return errors;
 }
 
-function DraftForm({ onStarted }) {
+function DraftForm({ onStarted, onPrepared }) {
   const [form, setForm] = useState(buildInitialForm());
   const [photos, setPhotos] = useState([]);
   const [errors, setErrors] = useState({});
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isPreparing, setIsPreparing] = useState(false);
   const [generalError, setGeneralError] = useState("");
   const fileInputRef = useRef(null);
 
@@ -199,6 +213,45 @@ function DraftForm({ onStarted }) {
       setIsSubmitting(false);
     }
   }
+
+  // Кнопка «Подготовить варианты» (только при drafts_count >= 2)
+  async function handlePrepare(e) {
+    e.preventDefault();
+    setGeneralError("");
+
+    const validationErrors = validate(form, photos);
+    if (Object.keys(validationErrors).length > 0) {
+      setErrors(validationErrors);
+      const firstKey = Object.keys(validationErrors)[0];
+      document.querySelector(`[data-field="${firstKey}"]`)?.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      });
+      return;
+    }
+
+    setIsPreparing(true);
+
+    try {
+      const fd = buildPublishFormData(form, photos);
+      const result = await startPrepare(fd);
+      onPrepared(result.prep_id, form, photos, {
+        title: form.title.trim(),
+        price: Number(form.price),
+        city: form.city.trim(),
+        photosCount: photos.length,
+        draftsCount: Number(form.drafts_count),
+      });
+    } catch (err) {
+      setGeneralError(err.message || "Не удалось запустить подготовку вариантов");
+    } finally {
+      setIsPreparing(false);
+    }
+  }
+
+  const draftsNum = Number(form.drafts_count);
+  const showPrepareButton = Number.isInteger(draftsNum) && draftsNum >= 2;
+  const anyBusy = isSubmitting || isPreparing;
 
   return (
     <form className="workspace-panel draft-form space-y-5" onSubmit={handleSubmit}>
@@ -442,18 +495,271 @@ function DraftForm({ onStarted }) {
             ))}
           </select>
           <p className="draft-batch-hint">
-            Будут созданы одинаковые черновики — каждый можно отредактировать на Авито перед публикацией.
+            {showPrepareButton
+              ? "При N ≥ 2 доступна кнопка «Подготовить варианты» — сервис сгенерирует разные тексты и обработает фото. Снижает риск блокировки за дублирующийся контент, не гарантирует защиту."
+              : "Будут созданы одинаковые черновики — каждый можно отредактировать на Авито перед публикацией."}
           </p>
         </FieldShell>
       </div>
 
-      {/* Кнопка запуска */}
-      <div className="draft-submit-row">
-        <button className="submit-button" type="submit" disabled={isSubmitting}>
+      {/* Кнопки запуска */}
+      <div className="draft-submit-row draft-submit-buttons">
+        {showPrepareButton ? (
+          <button
+            className="secondary-button draft-prepare-btn"
+            type="button"
+            disabled={anyBusy}
+            onClick={handlePrepare}
+          >
+            {isPreparing ? "Готовим варианты..." : "Подготовить варианты"}
+          </button>
+        ) : null}
+        <button className="submit-button" type="submit" disabled={anyBusy}>
           {isSubmitting ? "Запускаем..." : "Сохранить черновик на Авито"}
         </button>
       </div>
     </form>
+  );
+}
+
+// ─── Экран подготовки вариантов (поллинг prepare) ────────────────────────────
+
+function PrepareProgressPanel({ prepId, onDone, onBack }) {
+  const [status, setStatus] = useState(null);
+  const [pollError, setPollError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function poll() {
+      try {
+        const s = await getPrepareStatus(prepId);
+        if (cancelled) return;
+        setStatus(s);
+
+        if (s.status === "failed") {
+          // Ошибка — показываем, дальше не идём
+          return;
+        }
+
+        if (s.status === "done") {
+          // Загружаем результат и переходим в превью
+          const result = await getPrepareResult(prepId);
+          if (!cancelled) onDone(result.drafts);
+          return;
+        }
+
+        // Ещё работает — продолжаем поллинг
+        setTimeout(poll, 2000);
+      } catch (err) {
+        if (!cancelled) setPollError(err.message || "Не удалось получить статус подготовки");
+      }
+    }
+
+    poll();
+    return () => { cancelled = true; };
+  }, [prepId, onDone]);
+
+  const percent = status?.total > 0
+    ? Math.min(100, Math.round(((status.done ?? 0) / status.total) * 100))
+    : 0;
+
+  return (
+    <section className="workspace-panel draft-progress-panel">
+      <div className="workspace-panel-header">
+        <div>
+          <p className="section-kicker">Подготовка</p>
+          <h2 className="workspace-panel-title">
+            {status?.status === "failed" ? "Ошибка подготовки" : "Готовим варианты"}
+          </h2>
+        </div>
+        <button type="button" className="secondary-button" onClick={onBack}>
+          Назад к форме
+        </button>
+      </div>
+
+      {status?.step_label ? (
+        <p className="workspace-body-copy" style={{ marginTop: "1rem" }}>
+          {status.step_label}
+        </p>
+      ) : null}
+
+      {status?.status !== "failed" ? (
+        <ProgressBar style={{ marginTop: "1.5rem" }} percent={percent} />
+      ) : null}
+
+      {pollError ? (
+        <div className="draft-general-error" style={{ marginTop: "1rem" }}>
+          <p className="workspace-body-copy">{pollError}</p>
+        </div>
+      ) : null}
+
+      {status?.status === "failed" ? (
+        <div className="draft-terminal draft-terminal-error" style={{ marginTop: "1rem" }}>
+          <p className="draft-terminal-title">Не удалось подготовить варианты</p>
+          <p className="draft-terminal-copy">
+            {status.error || "Произошла ошибка при генерации вариантов."}
+          </p>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+// ─── Карточка одного черновика в превью ───────────────────────────────────────
+
+function DraftPreviewCard({ draft, prepId, isOriginal, onRegenerated }) {
+  const [isRegenerating, setIsRegenerating] = useState(false);
+  const [regenError, setRegenError] = useState("");
+
+  async function handleRegenerate() {
+    setIsRegenerating(true);
+    setRegenError("");
+    try {
+      const updated = await regenerateDraft(prepId, draft.index);
+      onRegenerated(draft.index, updated);
+    } catch (err) {
+      setRegenError(err.message || "Не удалось перегенерировать вариант");
+    } finally {
+      setIsRegenerating(false);
+    }
+  }
+
+  return (
+    <div className={`draft-preview-card${isOriginal ? " draft-preview-card-original" : ""}`}>
+      {/* Заголовок карточки */}
+      <div className="draft-preview-card-header">
+        <div className="draft-preview-card-meta">
+          <span className="draft-preview-index">
+            {isOriginal ? "Вариант 1 — оригинал" : `Вариант ${draft.index + 1}`}
+          </span>
+          {draft.preset_name ? (
+            <span className="draft-preview-preset">{draft.preset_name}</span>
+          ) : null}
+        </div>
+
+        {/* Перегенерация только для вариантов 2+ */}
+        {!isOriginal ? (
+          <button
+            type="button"
+            className="secondary-button draft-regen-btn"
+            disabled={isRegenerating}
+            onClick={handleRegenerate}
+          >
+            {isRegenerating ? "Обновляем..." : "Перегенерировать"}
+          </button>
+        ) : null}
+      </div>
+
+      {regenError ? (
+        <div className="draft-general-error" style={{ marginTop: "0.75rem" }}>
+          <p className="workspace-body-copy" style={{ fontSize: "0.85rem" }}>{regenError}</p>
+        </div>
+      ) : null}
+
+      {/* Название */}
+      <p className="draft-preview-title">{draft.title}</p>
+
+      {/* Описание */}
+      <p className="draft-preview-description">{draft.description}</p>
+
+      {/* Миниатюры фото */}
+      {draft.photo_urls?.length > 0 ? (
+        <div className="draft-preview-photos">
+          {draft.photo_urls.map((_, pi) => (
+            <img
+              key={pi}
+              src={prepPhotoUrl(prepId, draft.index, pi)}
+              alt={`Фото ${pi + 1}`}
+              className="draft-preview-thumb"
+            />
+          ))}
+        </div>
+      ) : null}
+
+      {/* Заметки */}
+      {draft.notes ? (
+        <p className="draft-preview-notes">{draft.notes}</p>
+      ) : null}
+    </div>
+  );
+}
+
+// ─── Экран превью вариантов ───────────────────────────────────────────────────
+
+function PreviewPanel({ prepId, initialDrafts, onStartPublish, onBack }) {
+  const [drafts, setDrafts] = useState(initialDrafts);
+  const [isLaunching, setIsLaunching] = useState(false);
+  const [launchError, setLaunchError] = useState("");
+
+  function handleRegenerated(index, updatedCard) {
+    setDrafts((prev) => replaceDraftCard(prev, index, updatedCard));
+  }
+
+  async function handleLaunch() {
+    setIsLaunching(true);
+    setLaunchError("");
+    try {
+      // Передаём prep_id в startPublish — он подхватит уже подготовленные варианты
+      const fd = new FormData();
+      fd.append("prep_id", prepId);
+      const result = await startPublish(fd);
+      onStartPublish(result.job_id, {
+        draftsCount: drafts.length,
+      });
+    } catch (err) {
+      setLaunchError(err.message || "Не удалось запустить публикацию");
+      setIsLaunching(false);
+    }
+  }
+
+  return (
+    <section className="workspace-panel draft-progress-panel">
+      <div className="workspace-panel-header">
+        <div>
+          <p className="section-kicker">Превью</p>
+          <h2 className="workspace-panel-title">Варианты черновиков</h2>
+          <p className="workspace-intro-copy" style={{ marginTop: "0.6rem" }}>
+            Проверьте варианты. Использование разных текстов и обработанных фото снижает риск
+            блокировки за дублирующийся контент — но не гарантирует защиту от антиспам-систем.
+          </p>
+        </div>
+        <button type="button" className="secondary-button" onClick={onBack}>
+          Назад к форме
+        </button>
+      </div>
+
+      {/* Карточки вариантов */}
+      <div className="draft-preview-grid">
+        {drafts.map((draft, i) => (
+          <DraftPreviewCard
+            key={draft.index}
+            draft={draft}
+            prepId={prepId}
+            isOriginal={i === 0}
+            onRegenerated={handleRegenerated}
+          />
+        ))}
+      </div>
+
+      {launchError ? (
+        <div className="draft-general-error" style={{ marginTop: "1rem" }}>
+          <p className="workspace-body-copy">{launchError}</p>
+        </div>
+      ) : null}
+
+      {/* Запуск */}
+      <div className="draft-submit-row" style={{ marginTop: "1.5rem" }}>
+        <button
+          className="submit-button"
+          type="button"
+          disabled={isLaunching}
+          onClick={handleLaunch}
+        >
+          {isLaunching ? "Запускаем..." : `Запустить ${drafts.length} черновик${drafts.length === 1 ? "" : drafts.length < 5 ? "а" : "ов"}`}
+        </button>
+      </div>
+    </section>
   );
 }
 
@@ -547,16 +853,18 @@ function PublishProgressPanel({ jobId, summary, onBack }) {
           </span>
           <span className="draft-summary-item">
             <span className="draft-summary-label">Цена</span>
-            <span className="draft-summary-value">{summary.price.toLocaleString("ru-RU")} ₽</span>
+            <span className="draft-summary-value">{summary.price?.toLocaleString("ru-RU")} ₽</span>
           </span>
           <span className="draft-summary-item">
             <span className="draft-summary-label">Город</span>
             <span className="draft-summary-value">{summary.city}</span>
           </span>
-          <span className="draft-summary-item">
-            <span className="draft-summary-label">Фото</span>
-            <span className="draft-summary-value">{summary.photosCount}</span>
-          </span>
+          {summary.photosCount != null ? (
+            <span className="draft-summary-item">
+              <span className="draft-summary-label">Фото</span>
+              <span className="draft-summary-value">{summary.photosCount}</span>
+            </span>
+          ) : null}
           {summary.draftsCount != null && summary.draftsCount > 1 ? (
             <span className="draft-summary-item">
               <span className="draft-summary-label">Черновиков</span>
@@ -681,19 +989,58 @@ function PublishProgressPanel({ jobId, summary, onBack }) {
 
 // ─── Страница черновика (корень) ──────────────────────────────────────────────
 
+// Фазы: "form" | "preparing" | "preview" | "publishing"
 export default function DraftPage() {
+  const [phase, setPhase] = useState("form");
+
+  // Данные формы для случая «Назад к форме» не восстанавливаем (YAGNI) —
+  // пользователь просто видит чистую форму снова.
+
+  // Для фазы preparing/preview
+  const [prepId, setPrepId] = useState(null);
+  const [previewDrafts, setPreviewDrafts] = useState(null);
+
+  // Для фазы publishing
   const [jobId, setJobId] = useState(null);
   const [summary, setSummary] = useState(null);
 
+  // Форма → прямой запуск (N=1 или явный «Запустить»)
   function handleStarted(id, draftSummary) {
     setJobId(id);
     setSummary(draftSummary);
+    setPhase("publishing");
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
+  // Форма → подготовка вариантов (N >= 2)
+  function handlePrepared(pid) {
+    setPrepId(pid);
+    setPhase("preparing");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  // Подготовка завершена → показываем превью
+  function handlePrepareDone(drafts) {
+    setPreviewDrafts(drafts);
+    setPhase("preview");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  // Превью → публикация
+  function handlePreviewStartPublish(id, draftSummary) {
+    setJobId(id);
+    setSummary(draftSummary);
+    setPhase("publishing");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  // Кнопка «Назад» — всегда возвращает на форму
   function handleBack() {
     setJobId(null);
     setSummary(null);
+    setPrepId(null);
+    setPreviewDrafts(null);
+    setPhase("form");
   }
 
   return (
@@ -715,7 +1062,7 @@ export default function DraftPage() {
             <div className="workspace-header-copy">
               <p className="section-kicker">Draft</p>
               <h1 className="workspace-title">Черновик объявления</h1>
-              {!jobId ? (
+              {phase === "form" ? (
                 <p className="workspace-intro-copy">
                   Заполните форму — сервис откроет форму Авито в вашем Chrome и сохранит черновик
                   кнопкой «Сохранить и выйти». Для работы нужен запущенный{" "}
@@ -726,7 +1073,11 @@ export default function DraftPage() {
                 </p>
               ) : (
                 <p className="workspace-intro-copy">
-                  Задача запущена — следите за прогрессом ниже.
+                  {phase === "publishing"
+                    ? "Задача запущена — следите за прогрессом ниже."
+                    : phase === "preview"
+                    ? "Проверьте варианты и запустите публикацию."
+                    : "Готовим варианты — подождите..."}
                 </p>
               )}
             </div>
@@ -735,8 +1086,21 @@ export default function DraftPage() {
 
         {/* Основной контент */}
         <section className="workspace-main-stack" aria-label="Форма черновика">
-          {!jobId ? (
-            <DraftForm onStarted={handleStarted} />
+          {phase === "form" ? (
+            <DraftForm onStarted={handleStarted} onPrepared={handlePrepared} />
+          ) : phase === "preparing" ? (
+            <PrepareProgressPanel
+              prepId={prepId}
+              onDone={handlePrepareDone}
+              onBack={handleBack}
+            />
+          ) : phase === "preview" ? (
+            <PreviewPanel
+              prepId={prepId}
+              initialDrafts={previewDrafts}
+              onStartPublish={handlePreviewStartPublish}
+              onBack={handleBack}
+            />
           ) : (
             <PublishProgressPanel
               jobId={jobId}

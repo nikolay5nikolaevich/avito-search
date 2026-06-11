@@ -34,6 +34,19 @@ export function buildPublishFormData(form, photos) {
   return formData;
 }
 
+// ─── Вспомогательные функции фазы превью ─────────────────────────────────────
+
+// Заменяет одну карточку черновика в массиве (возвращает новый массив)
+export function replaceDraftCard(drafts, index, newCard) {
+  return drafts.map((card, i) => (i === index ? newCard : card));
+}
+
+// Строит URL к фото черновика для <img src> (аналог prepPhotoUrl из api.js,
+// вынесен сюда чтобы быть доступным в юнит-тестах без браузерного окружения)
+export function buildPrepPhotoUrl(prepId, draftIndex, photoIndex) {
+  return `/api/publish/prepare/photo/${prepId}/${draftIndex}/${photoIndex}`;
+}
+
 export function extractPublishFieldErrors(payload) {
   // Нормализуем оба формата в список пар [поле, сообщение]:
   // наш бэкенд шлёт {errors: [{field, error}]}, FastAPI — {detail: [{loc, msg}]}

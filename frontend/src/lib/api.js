@@ -68,3 +68,38 @@ export async function fetchPublishResult(jobId) {
   const response = await fetch(`/api/publish/result/${jobId}`);
   return readJson(response);
 }
+
+// ─── Prepare API (фаза превью вариантов) ─────────────────────────────────────
+
+export async function startPrepare(formData) {
+  // Отправляем multipart/form-data — браузер сам выставит Content-Type с boundary
+  const response = await fetch("/api/publish/prepare", {
+    method: "POST",
+    body: formData,
+  });
+  return readJson(response);
+}
+
+export async function getPrepareStatus(prepId) {
+  const response = await fetch(`/api/publish/prepare/status/${prepId}`);
+  return readJson(response);
+}
+
+export async function getPrepareResult(prepId) {
+  const response = await fetch(`/api/publish/prepare/result/${prepId}`);
+  return readJson(response);
+}
+
+export async function regenerateDraft(prepId, draftIndex) {
+  const response = await fetch("/api/publish/prepare/regenerate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prep_id: prepId, draft_index: draftIndex }),
+  });
+  return readJson(response);
+}
+
+// Строит URL к миниатюре фото черновика (не fetch — просто строка для <img src>)
+export function prepPhotoUrl(prepId, draftIndex, photoIndex) {
+  return `/api/publish/prepare/photo/${prepId}/${draftIndex}/${photoIndex}`;
+}

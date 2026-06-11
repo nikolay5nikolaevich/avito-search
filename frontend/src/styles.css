@@ -2077,3 +2077,141 @@ button {
   background: rgba(100, 210, 130, 0.13);
   color: rgba(160, 240, 175, 1);
 }
+
+/* ─── Кнопки формы: подготовка вариантов ─────────────────────────────────── */
+
+.draft-submit-buttons {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.draft-prepare-btn {
+  width: 100%;
+  min-height: 3rem;
+  padding: 0 1.35rem;
+  font-size: 0.9rem;
+  font-weight: 700;
+}
+
+/* ─── Превью вариантов ────────────────────────────────────────────────────── */
+
+/* Сетка карточек черновиков */
+.draft-preview-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 1.25rem;
+  margin-top: 1.5rem;
+}
+
+@media (min-width: 768px) {
+  .draft-preview-grid {
+    grid-template-columns: repeat(auto-fill, minmax(min(360px, 100%), 1fr));
+  }
+}
+
+/* Карточка одного варианта */
+.draft-preview-card {
+  border: 1px solid var(--hairline);
+  border-radius: 1.1rem;
+  background-color: var(--ink-700);
+  padding: 1.1rem 1.25rem 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.draft-preview-card-original {
+  border-color: rgba(159, 210, 255, 0.25);
+  background-color: rgba(159, 210, 255, 0.04);
+}
+
+/* Заголовок карточки (метаинфо + кнопка перегенерации) */
+.draft-preview-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.draft-preview-card-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+/* Номер варианта */
+.draft-preview-index {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ice);
+  opacity: 0.85;
+}
+
+/* Название пресета */
+.draft-preview-preset {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 400;
+  letter-spacing: 0.1em;
+  color: var(--bone-faint);
+}
+
+/* Кнопка «Перегенерировать» */
+.draft-regen-btn {
+  flex-shrink: 0;
+  min-height: 2.4rem;
+  padding: 0.5rem 0.95rem;
+  font-size: 0.82rem;
+}
+
+/* Название черновика */
+.draft-preview-title {
+  margin: 0;
+  font-size: 0.98rem;
+  font-weight: 700;
+  color: var(--bone);
+  line-height: 1.45;
+}
+
+/* Описание черновика */
+.draft-preview-description {
+  margin: 0;
+  font-size: 0.88rem;
+  line-height: 1.68;
+  color: var(--bone-dim);
+  white-space: pre-wrap;
+  text-wrap: pretty;
+}
+
+/* Сетка миниатюр фото */
+.draft-preview-photos {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.draft-preview-thumb {
+  width: 4.5rem;
+  height: 4.5rem;
+  object-fit: cover;
+  border-radius: 0.6rem;
+  border: 1px solid var(--hairline);
+  background-color: var(--ink-800);
+}
+
+/* Заметки (notes от бэкенда) */
+.draft-preview-notes {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  color: var(--bone-faint);
+  line-height: 1.6;
+  border-top: 1px solid var(--hairline-soft);
+  padding-top: 0.6rem;
+}
