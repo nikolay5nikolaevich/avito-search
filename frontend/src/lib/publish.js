@@ -36,9 +36,19 @@ export function buildPublishFormData(form, photos) {
 
 // ─── Вспомогательные функции фазы превью ─────────────────────────────────────
 
-// Заменяет одну карточку черновика в массиве (возвращает новый массив)
-export function replaceDraftCard(drafts, index, newCard) {
-  return drafts.map((card, i) => (i === index ? newCard : card));
+// Собирает FormData запуска публикации из превью: бэкенд валидирует ПОЛНУЮ
+// форму даже при наличии prep_id, поэтому шлём те же поля и фото, что и при
+// обычном запуске (drafts_count — в форме), плюс prep_id с готовыми вариантами
+export function buildLaunchFormData(form, photos, prepId) {
+  const formData = buildPublishFormData(form, photos);
+  formData.append("prep_id", prepId);
+  return formData;
+}
+
+// Заменяет карточку черновика на новую с тем же index (1-based, как в
+// контракте /api/publish/prepare/result); возвращает новый массив
+export function replaceDraftCard(drafts, newCard) {
+  return drafts.map((card) => (card.index === newCard.index ? newCard : card));
 }
 
 // Строит URL к фото черновика для <img src> (аналог prepPhotoUrl из api.js,

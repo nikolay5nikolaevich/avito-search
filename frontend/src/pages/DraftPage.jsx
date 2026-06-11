@@ -4,12 +4,12 @@ import {
   fetchPublishStatus,
   getPrepareResult,
   getPrepareStatus,
-  prepPhotoUrl,
   regenerateDraft,
   startPrepare,
   startPublish,
 } from "../lib/api";
 import {
+  buildLaunchFormData,
   buildPublishFormData,
   replaceDraftCard,
   TERMINAL_STATUSES,
@@ -616,8 +616,9 @@ function DraftPreviewCard({ draft, prepId, isOriginal, onRegenerated }) {
     setIsRegenerating(true);
     setRegenError("");
     try {
+      // draft.index — 1-based (контракт бэкенда), карточка в ответе с тем же index
       const updated = await regenerateDraft(prepId, draft.index);
-      onRegenerated(draft.index, updated);
+      onRegenerated(updated);
     } catch (err) {
       setRegenError(err.message || "Не удалось перегенерировать вариант");
     } finally {
@@ -631,7 +632,7 @@ function DraftPreviewCard({ draft, prepId, isOriginal, onRegenerated }) {
       <div className="draft-preview-card-header">
         <div className="draft-preview-card-meta">
           <span className="draft-preview-index">
-            {isOriginal ? "Вариант 1 — оригинал" : `Вариант ${draft.index + 1}`}
+            {isOriginal ? "Вариант 1 — оригинал" : `Вариант ${draft.index}`}
           </span>
           {draft.preset_name ? (
             <span className="draft-preview-preset">{draft.preset_name}</span>
@@ -663,13 +664,13 @@ function DraftPreviewCard({ draft, prepId, isOriginal, onRegenerated }) {
       {/* Описание */}
       <p className="draft-preview-description">{draft.description}</p>
 
-      {/* Миниатюры фото */}
+      {/* Миниатюры фото — бэкенд отдаёт готовые URL в photo_urls */}
       {draft.photo_urls?.length > 0 ? (
         <div className="draft-preview-photos">
-          {draft.photo_urls.map((_, pi) => (
+          {draft.photo_urls.map((url, pi) => (
             <img
-              key={pi}
-              src={prepPhotoUrl(prepId, draft.index, pi)}
+              key={url}
+              src={url}
               alt={`Фото ${pi + 1}`}
               className="draft-preview-thumb"
             />
@@ -687,28 +688,32 @@ function DraftPreviewCard({ draft, prepId, isOriginal, onRegenerated }) {
 
 // ─── Экран превью вариантов ───────────────────────────────────────────────────
 
-function PreviewPanel({ prepId, initialDrafts, onStartPublish, onBack }) {
+function PreviewPanel({ prepId, initialDrafts, form, photos, summary, onStartPublish, onBack }) {
   const [drafts, setDrafts] = useState(initialDrafts);
   const [isLaunching, setIsLaunching] = useState(false);
   const [launchError, setLaunchError] = useState("");
 
-  function handleRegenerated(index, updatedCard) {
-    setDrafts((prev) => replaceDraftCard(prev, index, updatedCard));
+  // Карточка из regenerate приходит с тем же 1-based index — замена по нему
+  function handleRegenerated(updatedCard) {
+    setDrafts((prev) => replaceDraftCard(prev, updatedCard));
   }
 
   async function handleLaunch() {
     setIsLaunching(true);
     setLaunchError("");
     try {
-      // Передаём prep_id в startPublish — он подхватит уже подготовленные варианты
-      const fd = new FormData();
-      fd.append("prep_id", prepId);
+      // Полная форма + фото + prep_id — бэкенд валидирует форму целиком
+      // даже при наличии подготовленных вариантов
+      const fd = buildLaunchFormData(form, photos, prepId);
       const result = await startPublish(fd);
-      onStartPublish(result.job_id, {
-        draftsCount: drafts.length,
-      });
+      onStartPublish(result.job_id, summary);
     } catch (err) {
-      setLaunchError(err.message || "Не удалось запустить публикацию");
+      // 422 от startPublish несёт fieldErrors — показываем их текстом,
+      // полей формы на этом экране нет
+      const fieldMessages = err.fieldErrors
+        ? Object.values(err.fieldErrors).filter(Boolean).join("; ")
+        : "";
+      setLaunchError(fieldMessages || err.message || "Не удалось запустить публикацию");
       setIsLaunching(false);
     }
   }
@@ -996,9 +1001,14 @@ export default function DraftPage() {
   // Данные формы для случая «Назад к форме» не восстанавливаем (YAGNI) —
   // пользователь просто видит чистую форму снова.
 
-  // Для фазы preparing/preview
+  // Для фазы preparing/preview: prepForm/prepPhotos нужны при запуске
+  // публикации из превью (бэкенд валидирует полную форму даже с prep_id),
+  // prepSummary — для экрана прогресса (название/город/цена)
   const [prepId, setPrepId] = useState(null);
   const [previewDrafts, setPreviewDrafts] = useState(null);
+  const [prepForm, setPrepForm] = useState(null);
+  const [prepPhotos, setPrepPhotos] = useState(null);
+  const [prepSummary, setPrepSummary] = useState(null);
 
   // Для фазы publishing
   const [jobId, setJobId] = useState(null);
@@ -1012,9 +1022,13 @@ export default function DraftPage() {
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
-  // Форма → подготовка вариантов (N >= 2)
-  function handlePrepared(pid) {
+  // Форма → подготовка вариантов (N >= 2); сохраняем форму, фото и сводку
+  // для последующего запуска публикации из превью
+  function handlePrepared(pid, form, photos, draftSummary) {
     setPrepId(pid);
+    setPrepForm(form);
+    setPrepPhotos(photos);
+    setPrepSummary(draftSummary);
     setPhase("preparing");
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
@@ -1040,6 +1054,9 @@ export default function DraftPage() {
     setSummary(null);
     setPrepId(null);
     setPreviewDrafts(null);
+    setPrepForm(null);
+    setPrepPhotos(null);
+    setPrepSummary(null);
     setPhase("form");
   }
 
@@ -1098,6 +1115,9 @@ export default function DraftPage() {
             <PreviewPanel
               prepId={prepId}
               initialDrafts={previewDrafts}
+              form={prepForm}
+              photos={prepPhotos}
+              summary={prepSummary}
               onStartPublish={handlePreviewStartPublish}
               onBack={handleBack}
             />

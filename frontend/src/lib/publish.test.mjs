@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  buildLaunchFormData,
   buildPublishFormData,
   buildPrepPhotoUrl,
   extractPublishFieldErrors,
@@ -65,46 +66,90 @@ test("extractPublishFieldErrors keeps FastAPI detail compatibility", () => {
 
 // ─── Тесты фазы превью ────────────────────────────────────────────────────────
 
-test("buildPrepPhotoUrl строит правильный путь", () => {
+test("buildLaunchFormData: полная форма + фото + prep_id для запуска из превью", () => {
+  const form = {
+    title: "Костюм Hugo Boss",
+    trade_type: "Продаю своё",
+    condition: "Отличное",
+    size: "50 (L)",
+    brand: "Hugo Boss",
+    color: "Чёрный",
+    description: "Почти не носили",
+    price: "15000",
+    city: "Москва",
+    address: "Арбат, 1",
+    drafts_count: 3,
+  };
+  const photos = [
+    new File(["photo"], "photo-1.png", { type: "image/png" }),
+    new File(["photo"], "photo-2.png", { type: "image/png" }),
+  ];
+
+  const formData = buildLaunchFormData(form, photos, "prep-abc-123");
+
+  // prep_id уходит вместе с формой
+  assert.equal(formData.get("prep_id"), "prep-abc-123");
+
+  // Полный набор полей формы — как при обычном запуске
+  assert.equal(formData.get("title"), "Костюм Hugo Boss");
+  assert.equal(formData.get("trade_type"), "Продаю своё");
+  assert.equal(formData.get("condition"), "Отличное");
+  assert.equal(formData.get("size"), "50 (L)");
+  assert.equal(formData.get("brand"), "Hugo Boss");
+  assert.equal(formData.get("color"), "Чёрный");
+  assert.equal(formData.get("description"), "Почти не носили");
+  assert.equal(formData.get("price"), "15000");
+  assert.equal(formData.get("city"), "Москва");
+  assert.equal(formData.get("address"), "Арбат, 1");
+  assert.equal(formData.get("drafts_count"), "3");
+
+  // Фото тоже уходят (бэкенд валидирует их даже при наличии prep_id)
+  assert.equal(formData.getAll("photos").length, 2);
+});
+
+test("buildPrepPhotoUrl строит правильный путь (1-based индексы контракта)", () => {
   assert.equal(
-    buildPrepPhotoUrl("abc123", 2, 0),
-    "/api/publish/prepare/photo/abc123/2/0",
+    buildPrepPhotoUrl("abc123", 2, 1),
+    "/api/publish/prepare/photo/abc123/2/1",
   );
   assert.equal(
-    buildPrepPhotoUrl("xyz-99", 0, 5),
-    "/api/publish/prepare/photo/xyz-99/0/5",
+    buildPrepPhotoUrl("xyz-99", 1, 5),
+    "/api/publish/prepare/photo/xyz-99/1/5",
   );
 });
 
-test("replaceDraftCard заменяет карточку по индексу и не мутирует исходный массив", () => {
+test("replaceDraftCard заменяет карточку по полю index (1-based) и не мутирует исходный массив", () => {
   const original = [
-    { index: 0, title: "Оригинал" },
-    { index: 1, title: "Вариант 1" },
+    { index: 1, title: "Оригинал" },
     { index: 2, title: "Вариант 2" },
+    { index: 3, title: "Вариант 3" },
   ];
 
-  const updated = replaceDraftCard(original, 1, { index: 1, title: "Новый вариант 1" });
+  const updated = replaceDraftCard(original, { index: 2, title: "Новый вариант 2" });
 
-  // Нужный элемент заменён
-  assert.equal(updated[1].title, "Новый вариант 1");
+  // Заменена именно карточка с index=2 (позиция 1 в массиве)
+  assert.equal(updated[1].title, "Новый вариант 2");
+  assert.equal(updated[1].index, 2);
 
-  // Остальные элементы не изменились
-  assert.equal(updated[0].title, "Оригинал");
-  assert.equal(updated[2].title, "Вариант 2");
+  // Соседние карточки 1 и 3 не тронуты (те же самые объекты)
+  assert.equal(updated[0], original[0]);
+  assert.equal(updated[2], original[2]);
 
   // Исходный массив не мутирован
-  assert.equal(original[1].title, "Вариант 1");
+  assert.equal(original[1].title, "Вариант 2");
 
   // Длина сохранена
   assert.equal(updated.length, 3);
 });
 
-test("replaceDraftCard с индексом 0 заменяет первый элемент", () => {
+test("replaceDraftCard с index последней карточки заменяет последний элемент", () => {
   const original = [
-    { index: 0, title: "Ст." },
-    { index: 1, title: "Вар." },
+    { index: 1, title: "Оригинал" },
+    { index: 2, title: "Вариант 2" },
+    { index: 3, title: "Вариант 3" },
   ];
-  const updated = replaceDraftCard(original, 0, { index: 0, title: "Обновлено" });
-  assert.equal(updated[0].title, "Обновлено");
-  assert.equal(updated[1].title, "Вар.");
+  const updated = replaceDraftCard(original, { index: 3, title: "Обновлено" });
+  assert.equal(updated[2].title, "Обновлено");
+  assert.equal(updated[0].title, "Оригинал");
+  assert.equal(updated[1].title, "Вариант 2");
 });
