@@ -8,6 +8,7 @@ import asyncio
 import csv
 import io
 import logging
+import mimetypes
 import os
 import urllib.parse
 import uuid
@@ -27,6 +28,7 @@ from fastapi.responses import (
 import analytics
 import cache as cache_mod
 import parser as avito_parser
+import preparation
 import publisher
 from cities import CITIES, City, get_cities_by_slugs, get_city_by_slug
 from filters import SearchFilters
@@ -113,6 +115,9 @@ JOBS: dict[str, dict[str, Any]] = {}
 # Задачи публикации черновиков — ОТДЕЛЬНЫЙ dict (не смешивать с JOBS аналитики).
 # Кэша для publish-задач нет: каждый запуск — новый черновик.
 PUBLISH_JOBS: dict[str, dict[str, Any]] = {}
+
+# Задачи фазы подготовки вариантов (ТЗ §17): prep_id → запись задачи.
+PREP_JOBS: dict[str, dict[str, Any]] = {}
 
 # Временное хранилище фото для publish-задач: tmp/publish/{job_id}/
 TMP_PUBLISH_DIR = Path("tmp") / "publish"
@@ -689,6 +694,7 @@ async def api_publish_start(
     city: str = Form(""),
     address: str = Form(""),
     drafts_count: str = Form(""),
+    prep_id: str = Form(""),
     photos: list[UploadFile] = File([]),
 ) -> JSONResponse:
     """
@@ -701,6 +707,15 @@ async def api_publish_start(
     Пакетный режим (ТЗ §16): drafts_count (1–10, дефолт 1) — сколько одинаковых
     черновиков сделать за задачу. Запрос БЕЗ drafts_count работает как раньше.
     """
+    # Шаг 5.7: если передан prep_id, проверяем что подготовка завершена
+    if prep_id:
+        prep_status = PREP_JOBS.get(prep_id, {}).get("status")
+        if prep_status != "done":
+            return JSONResponse(
+                {"errors": [{"field": "prep_id", "error": "Подготовка вариантов ещё не завершена или не найдена"}]},
+                status_code=422,
+            )
+
     fields: dict[str, Any] = {
         "title": title,
         "trade_type": trade_type,
@@ -771,6 +786,8 @@ async def api_publish_start(
         "drafts_total": drafts_total,
         "drafts_saved": 0,
         "saved_urls": [],
+        # prep_id задачи подготовки вариантов (если задан)
+        "prep_id": prep_id if prep_id else None,
     }
 
     asyncio.create_task(
@@ -816,6 +833,257 @@ async def api_publish_result(job_id: str) -> JSONResponse:
             "saved_urls": job.get("saved_urls") or [],
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# Фаза подготовки вариантов черновиков (ТЗ §17, Задача 5)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/publish/prepare")
+async def api_prepare_start(
+    title: str = Form(""),
+    description: str = Form(""),
+    drafts_count: str = Form(""),
+    size: str = Form(""),
+    condition: str = Form(""),
+    brand: str = Form(""),
+    photos: list[UploadFile] = File([]),
+) -> JSONResponse:
+    """
+    Запуск фазы подготовки N вариантов текста и фото (ТЗ §17).
+
+    Принимает multipart/form-data: title, description, drafts_count (обязательные),
+    size/condition/brand (опциональные, для facts), photos (1–10 файлов).
+    Невалидная форма → HTTP 422 со списком ошибок.
+    Валидная → фото сохраняются в tmp/publish/prep_{prep_id}/, задача уходит в фон.
+    Ответ: {"prep_id": "<uuid>"}.
+    """
+    # Метаданные фото для валидации (seek/tell, без чтения blob-ов в память)
+    photo_meta: list[tuple[str, Optional[str], int]] = []
+    for upload in photos:
+        upload.file.seek(0, os.SEEK_END)
+        file_size = upload.file.tell()
+        upload.file.seek(0)
+        photo_meta.append((upload.filename or "", upload.content_type, file_size))
+
+    fields: dict[str, Any] = {
+        "title": title,
+        "description": description,
+        "drafts_count": drafts_count,
+    }
+    errors = preparation.validate_prepare_form(fields, photo_meta)
+    if errors:
+        logger.info("Prepare: форма не прошла валидацию (%d ошибок)", len(errors))
+        return JSONResponse({"errors": errors}, status_code=422)
+
+    # Создаём prep_id и рабочую директорию
+    prep_id = str(uuid.uuid4())
+    prep_dir = TMP_PUBLISH_DIR / f"prep_{prep_id}"
+
+    # Сохраняем исходные фото во временные файлы
+    source_photos: list[Path] = []
+    try:
+        prep_dir.mkdir(parents=True, exist_ok=True)
+        tmp_photos_dir = prep_dir / "_input"
+        tmp_photos_dir.mkdir(parents=True, exist_ok=True)
+        for idx, upload in enumerate(photos, start=1):
+            ext = Path(upload.filename or "").suffix.lower() or ".jpg"
+            file_path = tmp_photos_dir / f"photo_{idx:02d}{ext}"
+            file_path.write_bytes(await upload.read())
+            source_photos.append(file_path)
+    except OSError as exc:
+        logger.error("Prepare: не удалось сохранить фото в %s: %s", prep_dir, exc)
+        return JSONResponse(
+            {"errors": [{"field": "photos", "error": f"Не удалось сохранить фото: {exc}"}]},
+            status_code=500,
+        )
+
+    # Количество черновиков (валидация уже прошла, None невозможен)
+    n_drafts = publisher.parse_drafts_count(drafts_count) or publisher.DRAFTS_DEFAULT
+
+    # facts — только из непустых опциональных полей
+    facts: dict[str, str] = {}
+    if size.strip():
+        facts["size"] = size.strip()
+    if condition.strip():
+        facts["condition"] = condition.strip()
+    if brand.strip():
+        facts["brand"] = brand.strip()
+
+    # Заводим запись задачи подготовки
+    PREP_JOBS[prep_id] = {
+        "status": "queued",
+        "step": "",
+        "step_label": "",
+        "done": 0,
+        "total": len(preparation.PREP_STEPS),
+        "error": None,
+        "drafts_count": n_drafts,
+    }
+
+    # Запускаем фоновую задачу
+    asyncio.create_task(
+        preparation.run_prep_job(
+            prep_id,
+            PREP_JOBS[prep_id],
+            title=title.strip(),
+            description=description.strip(),
+            source_photos=source_photos,
+            drafts_count=n_drafts,
+            facts=facts,
+            base_dir=prep_dir,
+        )
+    )
+
+    logger.info(
+        "Prepare-задача %s создана: '%s', фото: %d, черновиков: %d",
+        prep_id, title.strip(), len(source_photos), n_drafts,
+    )
+    return JSONResponse({"prep_id": prep_id})
+
+
+@app.get("/api/publish/prepare/status/{prep_id}")
+async def api_prepare_status(prep_id: str) -> JSONResponse:
+    """JSON-статус задачи подготовки вариантов для опроса фронтом."""
+    if prep_id not in PREP_JOBS:
+        return JSONResponse({"status": "not_found"}, status_code=404)
+
+    job = PREP_JOBS[prep_id]
+    return JSONResponse({
+        "prep_id": prep_id,
+        "status": job.get("status"),
+        "step": job.get("step"),
+        "step_label": job.get("step_label"),
+        "done": job.get("done"),
+        "total": job.get("total"),
+        "error": job.get("error"),
+        "drafts_count": job.get("drafts_count"),
+    })
+
+
+@app.get("/api/publish/prepare/result/{prep_id}")
+async def api_prepare_result(prep_id: str) -> JSONResponse:
+    """
+    Результат задачи подготовки: список карточек вариантов черновиков.
+
+    409, если задача ещё не завершена (status != done).
+    Иначе: {"prep_id", "drafts": [карточки...]}.
+    """
+    if prep_id not in PREP_JOBS:
+        return JSONResponse({"status": "not_found"}, status_code=404)
+
+    job = PREP_JOBS[prep_id]
+    if job.get("status") != "done":
+        return JSONResponse(
+            {"status": job.get("status"), "error": "Подготовка ещё не завершена"},
+            status_code=409,
+        )
+
+    prep_dir = TMP_PUBLISH_DIR / f"prep_{prep_id}"
+    drafts_count: int = job.get("drafts_count") or 1
+    drafts = preparation.build_result(prep_dir, drafts_count)
+
+    return JSONResponse({"prep_id": prep_id, "drafts": drafts})
+
+
+@app.get("/api/publish/prepare/photo/{prep_id}/{draft_index}/{photo_index}")
+async def api_prepare_photo(
+    prep_id: str,
+    draft_index: int,
+    photo_index: int,
+) -> Response:
+    """
+    Отдаёт фото варианта черновика.
+
+    Путь строится только из проверенного prep_id (по PREP_JOBS) и целых индексов
+    — защита от path traversal. prep_id из запроса не используется напрямую как
+    путь файловой системы без проверки.
+    Нет файла → 404.
+    """
+    if prep_id not in PREP_JOBS:
+        return JSONResponse({"status": "not_found"}, status_code=404)
+
+    prep_dir = TMP_PUBLISH_DIR / f"prep_{prep_id}"
+    photos_dir = prep_dir / f"draft_{draft_index:02d}" / "photos"
+
+    if not photos_dir.is_dir():
+        return JSONResponse({"status": "not_found"}, status_code=404)
+
+    # Ищем файл с именем photo_{NN}.* (расширение исходника)
+    photo_files = sorted(p for p in photos_dir.iterdir() if p.is_file())
+    if photo_index < 1 or photo_index > len(photo_files):
+        return JSONResponse({"status": "not_found"}, status_code=404)
+
+    photo_path = photo_files[photo_index - 1]  # photo_index — 1-based
+
+    if not photo_path.exists():
+        return JSONResponse({"status": "not_found"}, status_code=404)
+
+    # Определяем media_type по расширению
+    media_type, _ = mimetypes.guess_type(photo_path.name)
+    if not media_type:
+        media_type = "application/octet-stream"
+
+    return FileResponse(photo_path, media_type=media_type)
+
+
+@app.post("/api/publish/prepare/regenerate")
+async def api_prepare_regenerate(request: Request) -> JSONResponse:
+    """
+    Перегенерирует один черновик с новым seed.
+
+    Тело JSON: {"prep_id": str, "draft_index": int}.
+    404, если prep_id неизвестен.
+    422, если draft_index вне допустимого диапазона (2..N).
+    Иначе: обновлённая карточка черновика.
+    """
+    payload = await request.json()
+    prep_id: str = str(payload.get("prep_id") or "")
+    draft_index_raw = payload.get("draft_index")
+
+    if prep_id not in PREP_JOBS:
+        return JSONResponse({"status": "not_found"}, status_code=404)
+
+    job = PREP_JOBS[prep_id]
+    n_drafts: int = job.get("drafts_count") or 1
+
+    # Валидация draft_index: допустимо только 2..N
+    try:
+        draft_index = int(draft_index_raw)
+    except (TypeError, ValueError):
+        return JSONResponse(
+            {"errors": [{"field": "draft_index", "error": "draft_index должен быть целым числом"}]},
+            status_code=422,
+        )
+
+    if draft_index < 2 or draft_index > n_drafts:
+        return JSONResponse(
+            {
+                "errors": [{
+                    "field": "draft_index",
+                    "error": (
+                        f"draft_index должен быть в диапазоне 2..{n_drafts} "
+                        f"(вариант №1 — оригинал, не перегенерируется)"
+                    ),
+                }]
+            },
+            status_code=422,
+        )
+
+    prep_dir = TMP_PUBLISH_DIR / f"prep_{prep_id}"
+    try:
+        card = preparation.regenerate_draft(prep_dir, draft_index)
+    except ValueError as exc:
+        return JSONResponse(
+            {"errors": [{"field": "draft_index", "error": str(exc)}]},
+            status_code=422,
+        )
+
+    logger.info(
+        "Prepare %s: перегенерирован черновик %d", prep_id, draft_index
+    )
+    return JSONResponse(card)
 
 
 # ---------------------------------------------------------------------------
