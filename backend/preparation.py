@@ -31,7 +31,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from photo_variation import apply_preset, build_presets
+from photo_variation import apply_preset, build_presets, heif_available, output_ext_for
 from publisher import (
     ALLOWED_PHOTO_EXTENSIONS,
     ALLOWED_PHOTO_MIME,
@@ -160,6 +160,15 @@ def validate_prepare_form(
                         f"(разрешены jpeg/png/gif/heic)"
                     ),
                 })
+            if ext in (".heic", ".heif") and not heif_available():
+                errors.append({
+                    "field": "photos",
+                    "error": (
+                        f"Файл {filename!r}: HEIC-формат требует пакет pillow-heif "
+                        f"(pip install pillow-heif) — установите его или "
+                        f"конвертируйте фото в JPEG"
+                    ),
+                })
             if size > MAX_PHOTO_SIZE_BYTES:
                 errors.append({
                     "field": "photos",
@@ -283,7 +292,7 @@ async def run_prep_job(
             for j, (raw_bytes, src_photo) in enumerate(
                 zip(source_photo_bytes, copied_source_photos), start=1
             ):
-                ext = src_photo.suffix.lower() or ".jpg"
+                ext = output_ext_for(src_photo.suffix)
                 out_path = d_photos_dir / f"photo_{j:02d}{ext}"
                 processed = apply_preset(raw_bytes, preset)
                 # Если apply_preset вернул оригинал (ошибка была), фиксируем в заметках
@@ -413,7 +422,7 @@ def regenerate_draft(prep_dir: Path, draft_index: int) -> dict:
     notes_parts: list[str] = [tv.notes] if tv.notes else []
     for j, src_photo in enumerate(source_photo_paths, start=1):
         raw_bytes = src_photo.read_bytes()
-        ext = src_photo.suffix.lower() or ".jpg"
+        ext = output_ext_for(src_photo.suffix)
         out_path = d_photos_dir / f"photo_{j:02d}{ext}"
         processed = apply_preset(raw_bytes, preset)
         if processed == raw_bytes:
@@ -736,6 +745,22 @@ if __name__ == "__main__":
             f"Поле error должно быть непустым: {_job2}"
         )
         print("[OK] Тест 9: несуществующая папка исходников → status=failed, error непустой, исключения нет")
+
+    # ── Тест 10: HEIC отклоняется валидацией, когда pillow-heif недоступен ────
+    import photo_variation as _pv
+    _saved_flag = _pv._HEIF_REGISTERED
+    _pv._HEIF_REGISTERED = False
+    try:
+        errs = validate_prepare_form(
+            {"title": "Название", "description": "Описание", "drafts_count": "2"},
+            [("photo.heic", "image/heic", 1024)],
+        )
+        assert any(
+            e["field"] == "photos" and "pillow-heif" in e["error"] for e in errs
+        ), f"HEIC без pillow-heif должен отклоняться с подсказкой: {errs}"
+    finally:
+        _pv._HEIF_REGISTERED = _saved_flag
+    print("[OK] Тест 10: HEIC без pillow-heif → ошибка валидации с подсказкой")
 
     print("\n=== Все самотесты preparation.py пройдены ===")
     sys.exit(0)

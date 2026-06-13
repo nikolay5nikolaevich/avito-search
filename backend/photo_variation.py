@@ -11,7 +11,8 @@ mirror/flip в Preset отсутствуют намеренно.
 Правило ошибок: apply_preset на конкретном фото при любом исключении → лог +
 вернуть оригинальные байты, наружу не выпускать.
 
-HEIC: Pillow не открывает → лог + вернуть оригинал.
+HEIC: поддерживается через pillow-heif (ленивая регистрация, heif_available());
+без плагина валидация форм отклоняет HEIC заранее.
 
 Каждый пресет (кроме №1-оригинала) гарантированно содержит геометрию
 (зум/отдаление/поворот) + тон (яркость/контраст/насыщенность/температура).
@@ -25,6 +26,41 @@ from dataclasses import dataclass, fields as dc_fields
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# HEIC: Pillow открывает HEIC/HEIF только через плагин pillow-heif.
+# Регистрация ленивая и однократная. Без плагина heif_available() → False,
+# и валидация форм отклоняет HEIC заранее: молчаливый возврат оригинала
+# при N≥2 недопустим — все варианты получили бы одинаковые фото.
+# ---------------------------------------------------------------------------
+
+_HEIF_REGISTERED: Optional[bool] = None
+
+
+def heif_available() -> bool:
+    """True, если pillow-heif установлен и опенер зарегистрирован."""
+    global _HEIF_REGISTERED
+    if _HEIF_REGISTERED is None:
+        try:
+            from pillow_heif import register_heif_opener
+            register_heif_opener()
+            _HEIF_REGISTERED = True
+            logger.info("pillow-heif подключён: HEIC-фото поддерживаются")
+        except ImportError:
+            _HEIF_REGISTERED = False
+            logger.warning(
+                "pillow-heif не установлен: HEIC-фото будут отклоняться валидацией"
+            )
+    return _HEIF_REGISTERED
+
+
+def output_ext_for(src_ext: str) -> str:
+    """Расширение файла-результата обработки: HEIC/HEIF пересохраняются в JPEG."""
+    ext = (src_ext or "").lower()
+    if ext in (".heic", ".heif"):
+        return ".jpg"
+    return ext or ".jpg"
+
 
 # ---------------------------------------------------------------------------
 # Dataclass пресета
@@ -261,6 +297,7 @@ def apply_preset(image_bytes: bytes, preset: Preset) -> bytes:
 
 def _apply_preset_impl(image_bytes: bytes, preset: Preset) -> bytes:
     """Внутренняя реализация apply_preset (может бросать исключения)."""
+    heif_available()  # ленивая регистрация HEIF-опенера до Image.open
     from PIL import Image, ImageEnhance  # импорт внутри — не требуется на уровне модуля
 
     # Определяем формат из заголовка байтов
@@ -734,6 +771,27 @@ if __name__ == "__main__":
     _out.load()
     assert _out.size == (120, 90), f"Отдаление: размер {_out.size}, ожидали (120, 90)"
     print("[OK] Тест 14: отдаление -4% — размер сохранён, изображение изменено")
+
+    # ── Тест 15: HEIC через pillow-heif (если установлен) ────────────────────
+    if heif_available():
+        _heif_img = Image.new("RGB", (64, 48), color=(90, 120, 150))
+        _heif_buf = io.BytesIO()
+        _heif_img.save(_heif_buf, format="HEIF")
+        _heif_bytes = _heif_buf.getvalue()
+
+        _res15 = apply_preset(_heif_bytes, presets_10[1])
+        assert _res15 != _heif_bytes, "HEIC: вернулся оригинал — обработка не применилась"
+        _out15 = Image.open(io.BytesIO(_res15))
+        _out15.load()
+        assert _out15.format == "JPEG", (
+            f"HEIC должен пересохраняться в JPEG, получили {_out15.format}"
+        )
+        assert output_ext_for(".heic") == ".jpg", "output_ext_for('.heic') != '.jpg'"
+        assert output_ext_for(".HEIF") == ".jpg", "output_ext_for('.HEIF') != '.jpg'"
+        assert output_ext_for(".png") == ".png", "output_ext_for('.png') != '.png'"
+        print("[OK] Тест 15: HEIC открывается, выход JPEG, output_ext_for верен")
+    else:
+        print("[SKIP] Тест 15: pillow-heif не установлен — HEIC отклоняется валидацией")
 
     print("\nВсе самотесты пройдены успешно.")
     sys.exit(0)

@@ -21,3 +21,6 @@ python-multipart==0.0.18
 Pillow==11.0.0
 
 # sqlite3 встроен в Python — отдельная зависимость не нужна
+
+# HEIC-фото (iPhone): открытие в Pillow для вариативности (ТЗ §17)
+pillow-heif==0.21.0
