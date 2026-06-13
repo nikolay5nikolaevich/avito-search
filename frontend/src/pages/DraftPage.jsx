@@ -254,7 +254,10 @@ function DraftForm({ onStarted, onPrepared }) {
   const anyBusy = isSubmitting || isPreparing;
 
   return (
-    <form className="workspace-panel draft-form space-y-5" onSubmit={handleSubmit}>
+    <form
+      className="workspace-panel draft-form space-y-5"
+      onSubmit={showPrepareButton ? handlePrepare : handleSubmit}
+    >
       {/* Предупреждение о категории */}
       <div className="draft-category-notice">
         <span className="section-kicker">Категория</span>
@@ -496,26 +499,19 @@ function DraftForm({ onStarted, onPrepared }) {
           </select>
           <p className="draft-batch-hint">
             {showPrepareButton
-              ? "При N ≥ 2 доступна кнопка «Подготовить варианты» — сервис сгенерирует разные тексты и обработает фото. Снижает риск блокировки за дублирующийся контент, не гарантирует защиту."
-              : "Будут созданы одинаковые черновики — каждый можно отредактировать на Авито перед публикацией."}
+              ? "При N ≥ 2 сервис сначала готовит варианты: разные названия и описания, обработанные фото (зум/отдаление, поворот, контраст). Перед заливкой вы увидите превью. Снижает риск блокировки за дублирующийся контент, но не гарантирует защиту."
+              : "Один черновик — название, описание и фото сохраняются как есть."}
           </p>
         </FieldShell>
       </div>
 
-      {/* Кнопки запуска */}
+      {/* Кнопка запуска: при N ≥ 2 путь всегда через подготовку вариантов —
+          прямое сохранение делало бы N одинаковых черновиков */}
       <div className="draft-submit-row draft-submit-buttons">
-        {showPrepareButton ? (
-          <button
-            className="secondary-button draft-prepare-btn"
-            type="button"
-            disabled={anyBusy}
-            onClick={handlePrepare}
-          >
-            {isPreparing ? "Готовим варианты..." : "Подготовить варианты"}
-          </button>
-        ) : null}
         <button className="submit-button" type="submit" disabled={anyBusy}>
-          {isSubmitting ? "Запускаем..." : "Сохранить черновик на Авито"}
+          {showPrepareButton
+            ? (isPreparing ? "Готовим варианты..." : "Подготовить варианты")
+            : (isSubmitting ? "Запускаем..." : "Сохранить черновик на Авито")}
         </button>
       </div>
     </form>
