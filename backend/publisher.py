@@ -96,9 +96,14 @@ ALLOWED_PHOTO_MIME: frozenset[str] = frozenset(
     {"image/jpeg", "image/pjpeg", "image/png", "image/gif", "image/heic"}
 )
 
-# Каталоги артефактов (пути относительно корня проекта — app.py делает chdir)
+# Корень проекта: файловый хэндлер логгера создаётся при ИМПОРТЕ модуля,
+# то есть ДО os.chdir(PROJECT_ROOT) в app.py — путь к logs/ должен быть
+# абсолютным, иначе при запуске сервера из backend/ лог уезжает в backend/logs/.
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+# Каталоги артефактов (относительные пути резолвятся после chdir в app.py)
 DEBUG_PUBLISH_DIR = pathlib.Path("debug") / "publish"
-LOGS_DIR = pathlib.Path("logs")
+LOGS_DIR = PROJECT_ROOT / "logs"
 # База папок подготовки вариантов (ТЗ §17): tmp/publish/prep_{prep_id}/.
 # Должна совпадать с app.TMP_PUBLISH_DIR (импорт из app.py невозможен — цикл).
 TMP_PUBLISH_DIR = pathlib.Path("tmp") / "publish"
@@ -1808,5 +1813,17 @@ if __name__ == "__main__":
         else:
             raise AssertionError("Ожидали StepError для варианта без фото")
     print("[OK] Тест 12: _load_prep_variant - чтение варианта, нет папки/фото -> StepError")
+
+    # ── Тест: лог publisher пишется в logs/ КОРНЯ проекта (не зависит от cwd) ──
+    _file_handlers = [
+        h for h in logger.handlers if isinstance(h, logging.FileHandler)
+    ]
+    assert _file_handlers, "У логгера 'publisher' нет файлового хэндлера"
+    _log_path = pathlib.Path(_file_handlers[0].baseFilename).resolve()
+    _expected = (pathlib.Path(__file__).resolve().parent.parent / "logs" / "publisher.log").resolve()
+    assert _log_path == _expected, (
+        f"Лог publisher пишется в {_log_path}, ожидали {_expected}"
+    )
+    print("[OK] Тест: logs/publisher.log в корне проекта независимо от cwd")
 
     print("\n=== Все самотесты publisher.py пройдены ===")
