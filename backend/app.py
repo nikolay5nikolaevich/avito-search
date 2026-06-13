@@ -29,6 +29,7 @@ from fastapi.responses import (
 import analytics
 import cache as cache_mod
 import parser as avito_parser
+import photo_variation
 import preparation
 import publisher
 from cities import CITIES, City, get_cities_by_slugs, get_city_by_slug
@@ -683,12 +684,61 @@ async def _run_publish_and_cleanup(
     tmp_dir: Path,
     prep_id: Optional[str],
 ) -> None:
-    """Обёртка фоновой publish-задачи: после ПОЛНОГО успеха удаляет подготовленные
-    варианты prep_{prep_id} и запись PREP_JOBS (ТЗ §17.4); при падении/частичном
-    успехе — оставляет для разбора. ВАЖНО: run_publish_job вызывается через атрибут
-    модуля (publisher.run_publish_job), чтобы подмена в smoke-тестах работала."""
+    """Обёртка фоновой publish-задачи.
+
+    Авто-подготовка (ТЗ §17): N≥2 БЕЗ prep_id раньше молча давало N одинаковых
+    клонов (пакетный режим §16) — теперь варианты готовятся автоматически,
+    prep_id = job_id. После ПОЛНОГО успеха удаляются prep_{prep_id} и запись
+    PREP_JOBS (ТЗ §17.4); при падении/частичном успехе — остаются для разбора.
+    ВАЖНО: run_publish_job вызывается через атрибут модуля
+    (publisher.run_publish_job), чтобы подмена в smoke-тестах работала."""
+    job = PUBLISH_JOBS[job_id]
+    drafts_total = int(job.get("drafts_total") or 1)
+
+    if not prep_id and drafts_total >= 2:
+        prep_id = job_id  # отдельный uuid не нужен — job_id уникален
+        prep_dir = TMP_PUBLISH_DIR / f"prep_{prep_id}"
+        job["status"] = "running"
+        job["step"] = "prepare_variants"
+        job["step_label"] = "Подготовка вариантов"
+        facts = {
+            key: value
+            for key, value in (
+                ("size", draft.size),
+                ("condition", draft.condition),
+                ("brand", draft.brand),
+            )
+            if value.strip()
+        }
+        prep_job: dict[str, Any] = {}
+        logger.info(
+            "Авто-подготовка вариантов для задачи %s: %d черновиков",
+            job_id, drafts_total,
+        )
+        await preparation.run_prep_job(
+            prep_id,
+            prep_job,
+            title=draft.title,
+            description=draft.description,
+            source_photos=[Path(p) for p in draft.photo_paths],
+            drafts_count=drafts_total,
+            facts=facts,
+            base_dir=prep_dir,
+        )
+        if prep_job.get("status") != "done":
+            job["status"] = "failed"
+            job["error"] = (
+                "Не удалось подготовить варианты: "
+                f"{prep_job.get('error') or 'неизвестная ошибка'}"
+            )
+            logger.error(
+                "Авто-подготовка задачи %s провалилась: %s", job_id, job["error"]
+            )
+            return
+        job["prep_id"] = prep_id
+
     await publisher.run_publish_job(
-        job_id, PUBLISH_JOBS[job_id], draft, cdp_url=CDP_URL, tmp_dir=str(tmp_dir),
+        job_id, job, draft, cdp_url=CDP_URL, tmp_dir=str(tmp_dir),
     )
     if not prep_id:
         return
@@ -723,8 +773,10 @@ async def api_publish_start(
     Невалидная форма → HTTP 422 со списком полей, задача НЕ создаётся.
     Валидная → фото сохраняются в tmp/publish/{job_id}/, задача уходит в фон.
 
-    Пакетный режим (ТЗ §16): drafts_count (1–10, дефолт 1) — сколько одинаковых
-    черновиков сделать за задачу. Запрос БЕЗ drafts_count работает как раньше.
+    Пакетный режим (ТЗ §16) + вариативность (ТЗ §17): drafts_count (1–10, дефолт 1).
+    При drafts_count ≥ 2 без prep_id варианты готовятся автоматически перед
+    заливкой (N одинаковых клонов больше не создаются). prep_id из превью
+    используется как раньше.
     """
     # Шаг 5.7: если передан prep_id, проверяем что подготовка завершена
     if prep_id:
@@ -764,6 +816,29 @@ async def api_publish_start(
         logger.info("Publish: форма не прошла валидацию (%d ошибок)", len(errors))
         return JSONResponse({"errors": errors}, status_code=422)
 
+    # Сколько черновиков (ТЗ §16): валидация уже прошла, None невозможен
+    drafts_total = publisher.parse_drafts_count(drafts_count) or publisher.DRAFTS_DEFAULT
+
+    # Авто-подготовка при N≥2 обрабатывает фото через Pillow: HEIC без
+    # pillow-heif молча дал бы всем вариантам одинаковые оригиналы — отклоняем.
+    if drafts_total >= 2 and not prep_id:
+        has_heic = any(
+            Path(name or "").suffix.lower() in (".heic", ".heif")
+            for name, _, _ in photo_meta
+        )
+        if has_heic and not photo_variation.heif_available():
+            return JSONResponse(
+                {"errors": [{
+                    "field": "photos",
+                    "error": (
+                        "HEIC-фото при нескольких черновиках требуют пакет "
+                        "pillow-heif (pip install pillow-heif) — установите его "
+                        "или конвертируйте фото в JPEG"
+                    ),
+                }]},
+                status_code=422,
+            )
+
     # Создаём задачу и сохраняем фото в tmp/publish/{job_id}/ —
     # читаем и пишем ПО ОДНОМУ файлу, не накапливая их содержимое в памяти
     job_id = str(uuid.uuid4())
@@ -785,10 +860,6 @@ async def api_publish_start(
         )
 
     draft = publisher.build_draft_data(fields, photo_paths)
-
-    # Сколько черновиков (ТЗ §16): валидация уже прошла, None невозможен,
-    # но на всякий случай откатываемся к дефолту.
-    drafts_total = publisher.parse_drafts_count(drafts_count) or publisher.DRAFTS_DEFAULT
 
     PUBLISH_JOBS[job_id] = {
         "status": "queued",

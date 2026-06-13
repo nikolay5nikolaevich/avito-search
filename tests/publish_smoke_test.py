@@ -828,6 +828,73 @@ def run_publish_smoke_test() -> None:
                 pass
         app_module.PREP_JOBS.pop(_prep_id_keep, None)
 
+    # ── Шаг 21: N≥2 БЕЗ prep_id → авто-подготовка вариантов ─────────────────
+    # Главный фикс: раньше publisher молча делал N одинаковых клонов.
+    # Фейковый job падает на черновике 2 → prep-папка остаётся для разбора,
+    # можно проверить содержимое draft_01..03.
+    print("Шаг 21: start с drafts_count=3 без prep_id → авто-подготовка")
+    with mock.patch.object(pub_module, "run_publish_job", _make_fake_job(fail_at=2)):
+        auto_fields = dict(_valid_fields(), drafts_count="3")
+        sc, body, _ = _post_multipart(
+            "/api/publish/start", auto_fields,
+            [("photos", "auto1.png", png1)],
+        )
+        assert sc == 200, f"start без prep_id: ожидали 200, получили {sc}: {body[:300]}"
+        auto_job_id = json.loads(body)["job_id"]
+        auto_status = _wait_publish_done(auto_job_id)
+
+    auto_job = app_module.PUBLISH_JOBS.get(auto_job_id, {})
+    assert auto_job.get("prep_id") == auto_job_id, (
+        f"Авто-подготовка: ожидали prep_id={auto_job_id!r}, "
+        f"получили {auto_job.get('prep_id')!r}"
+    )
+    _auto_prep_dir = app_module.TMP_PUBLISH_DIR / f"prep_{auto_job_id}"
+    try:
+        assert _auto_prep_dir.is_dir(), (
+            f"Папка авто-подготовки не найдена: {_auto_prep_dir} "
+            f"(статус задачи: {auto_status.get('status')!r})"
+        )
+        _titles = [
+            (_auto_prep_dir / f"draft_{i:02d}" / "title.txt").read_text(encoding="utf-8")
+            for i in (1, 2, 3)
+        ]
+        assert len(set(_titles)) >= 2, (
+            f"Авто-подготовка: названия вариантов не различаются: {_titles}"
+        )
+        checks_passed += 1
+        print("  Проверка 25 PASS: авто-подготовка создала 3 варианта, названия различаются")
+    finally:
+        shutil.rmtree(_auto_prep_dir, ignore_errors=True)
+        app_module.PUBLISH_JOBS.pop(auto_job_id, None)
+
+    # ── Шаг 22: успешный авто-publish → prep-папка удалена ───────────────────
+    print("Шаг 22: успешный publish с авто-подготовкой → prep-папка удалена")
+    with mock.patch.object(pub_module, "run_publish_job", _make_fake_job()):
+        auto2_fields = dict(_valid_fields(), drafts_count="2")
+        sc, body, _ = _post_multipart(
+            "/api/publish/start", auto2_fields,
+            [("photos", "auto2.png", png2)],
+        )
+        assert sc == 200, f"ожидали 200, получили {sc}: {body[:300]}"
+        auto2_job_id = json.loads(body)["job_id"]
+        auto2_status = _wait_publish_done(auto2_job_id)
+
+    assert auto2_status.get("status") == "done", (
+        f"Ожидали done, получили {auto2_status.get('status')!r}: {auto2_status}"
+    )
+    _auto2_prep_dir = app_module.TMP_PUBLISH_DIR / f"prep_{auto2_job_id}"
+    # Очистка выполняется сразу ПОСЛЕ выставления done — даём ей до 5 с
+    for _ in range(50):
+        if not _auto2_prep_dir.exists():
+            break
+        time.sleep(0.1)
+    assert not _auto2_prep_dir.exists(), (
+        f"Папка авто-подготовки должна удаляться после успеха: {_auto2_prep_dir}"
+    )
+    app_module.PUBLISH_JOBS.pop(auto2_job_id, None)
+    checks_passed += 1
+    print("  Проверка 26 PASS: авто-подготовка очищена после успешной заливки")
+
     print(f"\n=== PUBLISH SMOKE TEST: OK: {checks_passed} проверок ===")
 
 
