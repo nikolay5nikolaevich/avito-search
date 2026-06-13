@@ -12,6 +12,9 @@ mirror/flip в Preset отсутствуют намеренно.
 вернуть оригинальные байты, наружу не выпускать.
 
 HEIC: Pillow не открывает → лог + вернуть оригинал.
+
+Каждый пресет (кроме №1-оригинала) гарантированно содержит геометрию
+(зум/отдаление/поворот) + тон (яркость/контраст/насыщенность/температура).
 """
 
 import io
@@ -39,7 +42,7 @@ class Preset:
     """
 
     name: str                 # Человекочитаемо, по-русски: "зум 4% + теплее"
-    zoom_pct: float = 0.0     # 0 или 2..6 — центральный/смещённый кроп
+    zoom_pct: float = 0.0     # 0, +2..6 — кроп (приближение); -2..-4 — отдаление
     rotate_deg: float = 0.0   # 0 или ±1..2 — с обрезкой полей (без чёрных углов)
     brightness: float = 1.0   # 0.92..1.08
     contrast: float = 1.0     # 0.92..1.08
@@ -55,7 +58,7 @@ class Preset:
 
 # Возможные значения для выборки (не включают нейтральные «дефолтные» значения,
 # кроме случаев, где нейтральное значение — тоже осмысленный вариант)
-_ZOOM_VALUES: list[float] = [2.0, 3.0, 4.0, 5.0, 6.0]
+_ZOOM_VALUES: list[float] = [-4.0, -3.0, -2.0, 2.0, 3.0, 4.0, 5.0, 6.0]
 _ROTATE_VALUES: list[float] = [-2.0, -1.5, -1.0, 1.0, 1.5, 2.0]
 _BRIGHTNESS_VALUES: list[float] = [0.93, 0.95, 0.97, 1.03, 1.05, 1.07]
 _CONTRAST_VALUES: list[float] = [0.93, 0.95, 0.97, 1.03, 1.05, 1.07]
@@ -130,14 +133,22 @@ def build_presets(n: int, seed: Optional[int] = None) -> list[Preset]:
     # Ключ уникальности — кортеж числовых параметров (без name)
     seen_keys: set[tuple] = {_preset_key(presets[0])}
 
-    # Семейства: имя → (поле, значения)
-    families = [
+    # Гарантия заметности: каждый пресет обязан содержать минимум одно
+    # ГЕОМЕТРИЧЕСКОЕ семейство (зум/отдаление или поворот) и минимум одно
+    # ТОНАЛЬНОЕ (яркость/контраст/насыщенность/температура); шум и
+    # jpeg-качество — только необязательная добавка. Иначе вариант может
+    # быть визуально неотличим от оригинала.
+    geometry_families = [
         ("zoom",        "zoom_pct",    _ZOOM_VALUES),
         ("rotate",      "rotate_deg",  _ROTATE_VALUES),
+    ]
+    tone_families = [
         ("brightness",  "brightness",  _BRIGHTNESS_VALUES),
         ("contrast",    "contrast",    _CONTRAST_VALUES),
         ("saturation",  "saturation",  _SATURATION_VALUES),
         ("temp",        "temp_shift",  _TEMP_VALUES),
+    ]
+    extra_families = [
         ("noise",       "noise_alpha", _NOISE_VALUES),
         ("quality",     "jpeg_quality",_QUALITY_VALUES),
     ]
@@ -148,9 +159,10 @@ def build_presets(n: int, seed: Optional[int] = None) -> list[Preset]:
     while len(presets) < n and attempts < max_attempts:
         attempts += 1
 
-        # Выбираем 2 или 3 семейства
-        k = rng.choice([2, 3])
-        chosen = rng.sample(families, k)
+        # 1 геометрическое + 1 тональное (+ иногда 1 добавка) = 2–3 семейства
+        chosen = [rng.choice(geometry_families), rng.choice(tone_families)]
+        if rng.random() < 0.5:
+            chosen.append(rng.choice(extra_families))
 
         kwargs: dict = {}
         name_parts: list[str] = []
@@ -161,7 +173,10 @@ def build_presets(n: int, seed: Optional[int] = None) -> list[Preset]:
 
             # Человекочитаемая часть названия
             if field_name == "zoom_pct":
-                name_parts.append(f"зум {int(val)}%")
+                if val > 0:
+                    name_parts.append(f"зум {int(val)}%")
+                else:
+                    name_parts.append(f"отдаление {int(abs(val))}%")
             elif field_name == "rotate_deg":
                 sign = "+" if val > 0 else ""
                 name_parts.append(f"поворот {sign}{val:.1f}°")
@@ -290,8 +305,8 @@ def _apply_preset_impl(image_bytes: bytes, preset: Preset) -> bytes:
     clean.paste(img)
     img = clean
 
-    # --- Зум/кроп ---
-    if preset.zoom_pct > 0:
+    # --- Зум (кроп) или отдаление (уменьшение с подложкой) ---
+    if preset.zoom_pct != 0:
         img = _apply_zoom(img, preset.zoom_pct)
 
     # --- Поворот с обрезкой чёрных углов ---
@@ -340,21 +355,33 @@ def _apply_preset_impl(image_bytes: bytes, preset: Preset) -> bytes:
 
 
 def _apply_zoom(img, zoom_pct: float):
-    """Центральный кроп с зумом zoom_pct процентов (убираем края)."""
-    from PIL import Image  # noqa: F401 — уже импортирован выше, но явно для ясности
+    """zoom_pct > 0 — центральный кроп с увеличением; zoom_pct < 0 — отдаление:
+    кадр уменьшается, поля заполняются размытой растяжкой самого фото
+    (информации за кадром нет — дорисовываем правдоподобную подложку)."""
+    from PIL import ImageFilter
 
     w, h = img.size
-    # Размер обрезаемого поля с каждой стороны
-    dw = int(w * zoom_pct / 100 / 2)
-    dh = int(h * zoom_pct / 100 / 2)
-    # Гарантируем минимальный размер 1×1; координаты — неотрицательные
-    left = max(0, min(dw, w // 2 - 1))
-    top = max(0, min(dh, h // 2 - 1))
-    right = w - left
-    bottom = h - top
-    cropped = img.crop((left, top, right, bottom))
-    # Масштабируем обратно до оригинального размера
-    return cropped.resize((w, h), resample=3)  # 3 = BICUBIC
+    if zoom_pct > 0:
+        # Размер обрезаемого поля с каждой стороны
+        dw = int(w * zoom_pct / 100 / 2)
+        dh = int(h * zoom_pct / 100 / 2)
+        # Гарантируем минимальный размер 1×1; координаты — неотрицательные
+        left = max(0, min(dw, w // 2 - 1))
+        top = max(0, min(dh, h // 2 - 1))
+        cropped = img.crop((left, top, w - left, h - top))
+        # Масштабируем обратно до оригинального размера
+        return cropped.resize((w, h), resample=3)  # 3 = BICUBIC
+
+    # Отдаление: подложка — само фото, размытое; сверху — уменьшенный кадр
+    shrink = 1.0 + zoom_pct / 100  # zoom_pct < 0 → коэффициент < 1
+    new_w = max(1, int(w * shrink))
+    new_h = max(1, int(h * shrink))
+    background = img.resize((w, h), resample=3).filter(
+        ImageFilter.GaussianBlur(radius=max(w, h) // 50 + 2)
+    )
+    small = img.resize((new_w, new_h), resample=3)
+    background.paste(small, ((w - new_w) // 2, (h - new_h) // 2))
+    return background
 
 
 def _apply_rotate(img, angle_deg: float):
@@ -668,6 +695,45 @@ if __name__ == "__main__":
             f"Тест 12: пресет {p.name!r} → размер {ow}×{oh} < 1×1"
         )
     print("[OK] Тест 12: JPEG 1×1 — не падает, размер ≥ 1×1 для всех пресетов")
+
+    # ── Тест 13: каждый пресет 2..N содержит геометрию И тон ─────────────────
+    for _seed in (1, 7, 42, 99):
+        _ps = build_presets(10, seed=_seed)
+        for _i, _p in enumerate(_ps[1:], start=2):
+            _has_geometry = _p.zoom_pct != 0.0 or _p.rotate_deg != 0.0
+            _has_tone = (
+                _p.brightness != 1.0 or _p.contrast != 1.0
+                or _p.saturation != 1.0 or _p.temp_shift != 0
+            )
+            assert _has_geometry, (
+                f"seed={_seed}, пресет {_i} ({_p.name!r}): нет геометрии "
+                f"(зум/отдаление/поворот)"
+            )
+            assert _has_tone, (
+                f"seed={_seed}, пресет {_i} ({_p.name!r}): нет тона "
+                f"(яркость/контраст/насыщенность/температура)"
+            )
+    print("[OK] Тест 13: пресеты 2..10 всегда содержат геометрию + тон (4 seed)")
+
+    # ── Тест 14: отдаление (zoom_pct < 0) — размер сохранён, байты изменены ──
+    def _make_gradient_jpeg(w: int, h: int) -> bytes:
+        img = Image.new("RGB", (w, h))
+        px = img.load()
+        for x in range(w):
+            for y in range(h):
+                px[x, y] = (x * 255 // max(w - 1, 1), y * 255 // max(h - 1, 1), 90)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=90)
+        return buf.getvalue()
+
+    _grad = _make_gradient_jpeg(120, 90)
+    _zoom_out = Preset(name="тест-отдаление", zoom_pct=-4.0)
+    _res = apply_preset(_grad, _zoom_out)
+    assert _res != _grad, "Отдаление: байты не изменились — операция не применилась"
+    _out = Image.open(io.BytesIO(_res))
+    _out.load()
+    assert _out.size == (120, 90), f"Отдаление: размер {_out.size}, ожидали (120, 90)"
+    print("[OK] Тест 14: отдаление -4% — размер сохранён, изображение изменено")
 
     print("\nВсе самотесты пройдены успешно.")
     sys.exit(0)
