@@ -22,11 +22,13 @@ test("buildPublishFormData uses backend field names for publish form", () => {
     city: "  Москва ",
     address: "  Арбат, 1 ",
     drafts_count: 3,
+    category: "sneakers",
   };
 
   const photos = [new File(["photo"], "photo-1.png", { type: "image/png" })];
   const formData = buildPublishFormData(form, photos);
 
+  assert.equal(formData.get("category"), "sneakers");
   assert.equal(formData.get("title"), "Костюм Hugo Boss");
   assert.equal(formData.get("trade_type"), "Продаю своё");
   assert.equal(formData.get("ad_type"), null);

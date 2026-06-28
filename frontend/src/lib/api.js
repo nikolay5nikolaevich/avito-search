@@ -17,6 +17,11 @@ export async function fetchBootstrap() {
   return readJson(response);
 }
 
+export async function fetchPublishCategories() {
+  const response = await fetch("/api/publish/categories");
+  return readJson(response);
+}
+
 export async function startSearch(payload) {
   const response = await fetch("/api/search", {
     method: "POST",

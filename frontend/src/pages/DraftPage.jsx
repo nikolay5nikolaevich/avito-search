@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  fetchPublishCategories,
   fetchPublishResult,
   fetchPublishStatus,
   getPrepareResult,
@@ -19,9 +20,11 @@ import ProgressBar from "../components/ProgressBar";
 import SiteFooter from "../components/SiteFooter";
 import Topbar from "../components/Topbar";
 
-// ─── Справочники (значения — ровно те строки, что шлём на бэкенд) ────────────
-// Зеркало ключей словарей backend/avito_publish_selectors.py
-// (TRADE_TYPE_OPTIONS, CONDITION_OPTIONS, SIZE_OPTIONS, COLOR_OPTIONS) —
+// ─── Справочники-фолбэк (значения — ровно те строки, что шлём на бэкенд) ──────
+// Списки полей теперь приходят с бэкенда (GET /api/publish/categories) и зависят
+// от выбранной категории. Эти константы — фолбэк под категорию «Пиджаки и
+// костюмы» (jackets): форма рисуется всегда, даже если запрос категорий не
+// прошёл. Зеркало словарей backend (TRADE_TYPE/CONDITION/SIZE/COLOR_OPTIONS) —
 // при изменении синхронизировать, сами значения не менять.
 
 const AD_TYPES = [
@@ -49,6 +52,29 @@ const COLORS = [
   "Бордовый", "Красный", "Розовый", "Оранжевый", "Жёлтый", "Зелёный",
   "Голубой", "Фиолетовый", "Серебряный", "Золотой", "Разноцветный",
 ];
+
+// Категория по умолчанию (совпадает с DEFAULT_CATEGORY на бэкенде)
+const DEFAULT_CATEGORY = "jackets";
+
+// Профиль-фолбэк под jackets: используется до загрузки категорий с бэкенда
+// и при ошибке запроса — форма должна рисоваться всегда.
+const FALLBACK_PROFILE = {
+  key: DEFAULT_CATEGORY,
+  label: "Пиджаки и костюмы",
+  trade_types: AD_TYPES,
+  conditions: CONDITIONS,
+  sizes: SIZES,
+  colors: COLORS,
+};
+
+// Возвращает профиль текущей категории из загруженного списка (или фолбэк)
+function resolveProfile(categories, categoryKey) {
+  if (Array.isArray(categories)) {
+    const found = categories.find((c) => c.key === categoryKey);
+    if (found) return found;
+  }
+  return FALLBACK_PROFILE;
+}
 
 // Шаги сценария (для экрана прогресса) —
 // зеркало backend/publisher.py STEPS, синхронизировать при изменении
@@ -91,6 +117,7 @@ function formatFileSize(bytes) {
 // Имена полей — серверные (совпадают с параметрами /api/publish/start)
 function buildInitialForm() {
   return {
+    category: DEFAULT_CATEGORY,
     title: "",
     trade_type: "Продаю своё",
     condition: "Отличное",
@@ -105,13 +132,20 @@ function buildInitialForm() {
   };
 }
 
-function validate(form, photos) {
+function validate(form, photos, profile) {
   const errors = {};
 
   if (!form.title.trim()) errors.title = "Укажите название";
   if (!form.trade_type) errors.trade_type = "Выберите вид объявления";
   if (!form.condition) errors.condition = "Выберите состояние";
-  if (!form.size) errors.size = "Выберите размер";
+  if (!form.size) {
+    errors.size = "Выберите размер";
+  } else if (
+    // Размеры у категорий разные — если список загружен, значение должно в него входить
+    Array.isArray(profile?.sizes) && !profile.sizes.includes(form.size)
+  ) {
+    errors.size = "Выберите размер из списка категории";
+  }
   if (!form.brand.trim()) errors.brand = "Укажите бренд";
   if (!form.color) errors.color = "Выберите цвет";
   if (!form.description.trim()) errors.description = "Добавьте описание";
@@ -148,7 +182,32 @@ function DraftForm({ onStarted, onPrepared }) {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isPreparing, setIsPreparing] = useState(false);
   const [generalError, setGeneralError] = useState("");
+  // Профили категорий с бэкенда; null до загрузки/при ошибке — тогда фолбэк
+  const [categories, setCategories] = useState(null);
   const fileInputRef = useRef(null);
+
+  // Подтягиваем списки полей по категориям. При ошибке остаёмся на фолбэке
+  // (FALLBACK_PROFILE) — форма должна рисоваться всегда.
+  useEffect(() => {
+    let cancelled = false;
+    fetchPublishCategories()
+      .then((data) => {
+        if (!cancelled && Array.isArray(data?.categories)) {
+          setCategories(data.categories);
+        }
+      })
+      .catch(() => {
+        // Молча остаёмся на фолбэке — категория одна, форма работает
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  // Текущий профиль = выбранная категория из загруженного списка (или фолбэк)
+  const profile = resolveProfile(categories, form.category);
+  const adTypes = profile.trade_types ?? AD_TYPES;
+  const conditions = profile.conditions ?? CONDITIONS;
+  const sizes = profile.sizes ?? SIZES;
+  const colors = profile.colors ?? COLORS;
 
   // Сбрасывает ошибку поля после того, как пользователь его поправил
   function clearError(field) {
@@ -159,6 +218,15 @@ function DraftForm({ onStarted, onPrepared }) {
     const { name, value } = e.target;
     setForm((prev) => ({ ...prev, [name]: value }));
     clearError(name);
+  }
+
+  // Смена категории: списки размеров у категорий разные — сбрасываем size,
+  // чтобы не остался невалидный для новой категории
+  function handleCategoryChange(e) {
+    const value = e.target.value;
+    setForm((prev) => ({ ...prev, category: value, size: "" }));
+    clearError("category");
+    clearError("size");
   }
 
   function handleFilesChange(e) {
@@ -179,7 +247,7 @@ function DraftForm({ onStarted, onPrepared }) {
     e.preventDefault();
     setGeneralError("");
 
-    const validationErrors = validate(form, photos);
+    const validationErrors = validate(form, photos, profile);
     if (Object.keys(validationErrors).length > 0) {
       setErrors(validationErrors);
       // Прокручиваем к первой ошибке
@@ -219,7 +287,7 @@ function DraftForm({ onStarted, onPrepared }) {
     e.preventDefault();
     setGeneralError("");
 
-    const validationErrors = validate(form, photos);
+    const validationErrors = validate(form, photos, profile);
     if (Object.keys(validationErrors).length > 0) {
       setErrors(validationErrors);
       const firstKey = Object.keys(validationErrors)[0];
@@ -258,12 +326,28 @@ function DraftForm({ onStarted, onPrepared }) {
       className="workspace-panel draft-form space-y-5"
       onSubmit={showPrepareButton ? handlePrepare : handleSubmit}
     >
+      {/* Выбор категории */}
+      <div data-field="category">
+        <FieldShell label="Категория" error={errors.category}>
+          <select
+            className="field-input draft-select"
+            name="category"
+            value={form.category}
+            onChange={handleCategoryChange}
+          >
+            {(categories ?? [FALLBACK_PROFILE]).map((c) => (
+              <option key={c.key} value={c.key}>{c.label}</option>
+            ))}
+          </select>
+        </FieldShell>
+      </div>
+
       {/* Предупреждение о категории */}
       <div className="draft-category-notice">
         <span className="section-kicker">Категория</span>
         <p className="draft-category-text">
-          Работает только категория{" "}
-          <strong>«Пиджаки и костюмы»</strong> (мужская одежда).
+          Работает категория{" "}
+          <strong>«{profile.label}»</strong>.
           Перед запуском убедитесь, что в вашем Chrome на avito.ru/additem открыта именно эта категория.
         </p>
       </div>
@@ -300,7 +384,7 @@ function DraftForm({ onStarted, onPrepared }) {
             value={form.trade_type}
             onChange={updateField}
           >
-            {AD_TYPES.map((t) => (
+            {adTypes.map((t) => (
               <option key={t} value={t}>{t}</option>
             ))}
           </select>
@@ -311,7 +395,7 @@ function DraftForm({ onStarted, onPrepared }) {
       <div data-field="condition">
         <FieldShell label="Состояние" error={errors.condition}>
           <div className="draft-radio-group">
-            {CONDITIONS.map((c) => (
+            {conditions.map((c) => (
               <label
                 key={c}
                 className={`draft-pill draft-radio-chip${form.condition === c ? " draft-radio-chip-active" : ""}`}
@@ -387,7 +471,7 @@ function DraftForm({ onStarted, onPrepared }) {
               onChange={updateField}
             >
               <option value="">— Выберите размер —</option>
-              {SIZES.map((s) => (
+              {sizes.map((s) => (
                 <option key={s} value={s}>{s}</option>
               ))}
             </select>
@@ -418,7 +502,7 @@ function DraftForm({ onStarted, onPrepared }) {
             onChange={updateField}
           >
             <option value="">— Выберите цвет —</option>
-            {COLORS.map((c) => (
+            {colors.map((c) => (
               <option key={c} value={c}>{c}</option>
             ))}
           </select>

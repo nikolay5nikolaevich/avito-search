@@ -4,6 +4,7 @@
 
 // Поля формы черновика (без фото) — серверные имена /api/publish/start
 const PUBLISH_FIELD_NAMES = [
+  "category",
   "title",
   "trade_type",
   "condition",
