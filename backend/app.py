@@ -28,6 +28,7 @@ from fastapi.responses import (
 
 import analytics
 import cache as cache_mod
+import category_profiles
 import parser as avito_parser
 import photo_variation
 import preparation
@@ -764,6 +765,7 @@ async def api_publish_start(
     address: str = Form(""),
     drafts_count: str = Form(""),
     prep_id: str = Form(""),
+    category: str = Form("jackets"),
     photos: list[UploadFile] = File([]),
 ) -> JSONResponse:
     """
@@ -811,7 +813,11 @@ async def api_publish_start(
         upload.file.seek(0)
         photo_meta.append((upload.filename or "", upload.content_type, size))
 
-    errors = publisher.validate_publish_form(fields, photo_meta)
+    # Профиль категории: из формы (по умолчанию «Пиджаки и костюмы»);
+    # неизвестный ключ → дефолтная категория (category_profiles.get_profile).
+    profile = category_profiles.get_profile(category)
+
+    errors = publisher.validate_publish_form(fields, photo_meta, profile)
     if errors:
         logger.info("Publish: форма не прошла валидацию (%d ошибок)", len(errors))
         return JSONResponse({"errors": errors}, status_code=422)
@@ -859,7 +865,7 @@ async def api_publish_start(
             status_code=500,
         )
 
-    draft = publisher.build_draft_data(fields, photo_paths)
+    draft = publisher.build_draft_data(fields, photo_paths, category=profile.key)
 
     PUBLISH_JOBS[job_id] = {
         "status": "queued",

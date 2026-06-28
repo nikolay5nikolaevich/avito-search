@@ -42,6 +42,8 @@ from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable, Optional
 
 import avito_publish_selectors as psel
+import category_profiles
+from category_profiles import CategoryProfile
 
 # ---------------------------------------------------------------------------
 # Константы сценария
@@ -166,16 +168,17 @@ class DraftData:
     """Нормализованные данные черновика, прошедшие валидацию."""
 
     title: str
-    trade_type: str        # ключ psel.TRADE_TYPE_OPTIONS
-    condition: str         # ключ psel.CONDITION_OPTIONS
-    size: str              # ключ psel.SIZE_OPTIONS
+    trade_type: str        # ключ profile.trade_type_options
+    condition: str         # ключ profile.condition_options
+    size: str              # ключ profile.size_options
     brand: str
-    color: str             # ключ psel.COLOR_OPTIONS
+    color: str             # ключ profile.color_options
     description: str
     price: int             # рубли, целое > 0
     city: str
     address: str
     photo_paths: tuple[str, ...]
+    category: str = "jackets"  # ключ профиля категории (category_profiles)
 
     def full_address(self) -> str:
         """Строка для гео-саджеста Авито: «Город, адрес»."""
@@ -194,6 +197,7 @@ class DraftData:
             "price": self.price,
             "city": self.city,
             "address": self.address,
+            "category": self.category,
             "photos_count": len(self.photo_paths),
         }
 
@@ -222,6 +226,7 @@ def parse_drafts_count(raw: Any) -> Optional[int]:
 def validate_publish_form(
     fields: dict[str, Any],
     photos: list[tuple[str, Optional[str], int]],
+    profile: CategoryProfile,
 ) -> list[dict[str, str]]:
     """
     Серверная валидация формы черновика (ТЗ §8). Backend не доверяет фронту.
@@ -233,6 +238,9 @@ def validate_publish_form(
                 drafts_count (необязательное, 1–10, дефолт 1 — ТЗ §16).
         photos: метаданные файлов — список кортежей
                 (имя_файла, content_type или None, размер_в_байтах).
+        profile: профиль категории (category_profiles.CategoryProfile) —
+                 источник словарей допустимых значений size/color/
+                 trade_type/condition для выбранной категории.
 
     Возвращает список ошибок [{"field": ..., "error": ...}];
     пустой список = форма валидна. Никогда не бросает исключений.
@@ -269,12 +277,12 @@ def validate_publish_form(
             "error": f"Сколько черновиков: целое число от {DRAFTS_MIN} до {DRAFTS_MAX}",
         })
 
-    # --- Select/radio: только ключи словарей из avito_publish_selectors ---
+    # --- Select/radio: только ключи словарей профиля категории ---
     for field_name, options, label in (
-        ("trade_type", psel.TRADE_TYPE_OPTIONS, "Вид объявления"),
-        ("condition", psel.CONDITION_OPTIONS, "Состояние"),
-        ("size", psel.SIZE_OPTIONS, "Размер"),
-        ("color", psel.COLOR_OPTIONS, "Цвет"),
+        ("trade_type", profile.trade_type_options, "Вид объявления"),
+        ("condition", profile.condition_options, "Состояние"),
+        ("size", profile.size_options, "Размер"),
+        ("color", profile.color_options, "Цвет"),
     ):
         value = _text(field_name)
         if value not in options:
@@ -309,7 +317,11 @@ def validate_publish_form(
     return errors
 
 
-def build_draft_data(fields: dict[str, Any], photo_paths: list[str]) -> DraftData:
+def build_draft_data(
+    fields: dict[str, Any],
+    photo_paths: list[str],
+    category: str = "jackets",
+) -> DraftData:
     """Собирает DraftData из ПРОВАЛИДИРОВАННЫХ полей формы."""
     return DraftData(
         title=str(fields["title"]).strip(),
@@ -323,6 +335,7 @@ def build_draft_data(fields: dict[str, Any], photo_paths: list[str]) -> DraftDat
         city=str(fields["city"]).strip(),
         address=str(fields["address"]).strip(),
         photo_paths=tuple(photo_paths),
+        category=str(category or "jackets").strip(),
     )
 
 
@@ -472,20 +485,29 @@ async def _click_wizard_button(page: Any, name: str) -> bool:
     return True
 
 
-async def _category_is_target(page: Any) -> bool:
-    """True, если hidden-поля категории == 27/748/754 (целевая «Пиджаки и костюмы»)."""
-    for name, expected in psel.EXPECTED_CATEGORY.items():
+async def _category_is_target(page: Any, profile: CategoryProfile) -> bool:
+    """
+    True, если hidden-поля категории совпали с profile.expected_category.
+
+    Пустой profile.expected_category (например, у кроссовок до разведки
+    hidden-ID) → возвращаем False: форсируем досверливание мастера, а
+    финальный контроль выполняет _step_check_category по тексту крошки.
+    """
+    if not profile.expected_category:
+        return False  # без hidden-ID полагаемся на крошку в _step_check_category
+    for name, expected in profile.expected_category.items():
         selector = f"{psel.CATEGORY_HIDDEN_INPUTS}[name='{name}']"
         if (await _hidden_value(page, selector)) != expected:
             return False
     return True
 
 
-def _manual_category_instruction(prefix: str) -> str:
+def _manual_category_instruction(prefix: str, profile: CategoryProfile) -> str:
     """Единая инструкция пользователю для ручного выбора категории."""
+    path_tail = " → ".join(profile.full_path[2:])  # «Мужская обувь → Кроссовки»
     return (
         f"{prefix} Открой avito.ru/additem в своём Chrome, выбери категорию "
-        "«Пиджаки и костюмы» (Мужская одежда) вручную и перезапусти задачу."
+        f"«{profile.category_title_text}» ({path_tail}) вручную и перезапусти задачу."
     )
 
 
@@ -550,22 +572,24 @@ async def _wait_additem_state(page: Any, timeout_ms: int) -> str:
     return state
 
 
-async def _wait_category_target(page: Any, timeout_ms: int) -> bool:
-    """True, если за timeout_ms hidden-поля категории стали 27/748/754."""
+async def _wait_category_target(
+    page: Any, profile: CategoryProfile, timeout_ms: int
+) -> bool:
+    """True, если за timeout_ms hidden-поля категории совпали с профилем."""
     return await _wait_until(
-        lambda: _category_is_target(page),
+        lambda: _category_is_target(page, profile),
         timeout_s=timeout_ms / 1000, interval_s=0.5,
     )
 
 
-async def _drill_category_path(page: Any) -> None:
+async def _drill_category_path(page: Any, profile: CategoryProfile) -> None:
     """
-    Досверливает миллер-мастер по CATEGORY_FULL_PATH кликами по
+    Досверливает миллер-мастер по profile.full_path кликами по
     category-wizard/button. Правило (разведка): НЕ кликать уровень, чей
     подуровень уже виден — повторный клик по выбранному пункту его схлопывает.
-    Последний пункт («Пиджаки и костюмы») кликаем всегда — он грузит форму.
+    Последний пункт (целевая категория) кликаем всегда — он грузит форму.
     """
-    path = psel.CATEGORY_FULL_PATH
+    path = profile.full_path
     for idx, name in enumerate(path):
         is_last = idx == len(path) - 1
         if not is_last and await _wizard_button_visible(page, path[idx + 1]):
@@ -574,12 +598,13 @@ async def _drill_category_path(page: Any) -> None:
             continue
         if not await _click_wizard_button(page, name):
             raise UserActionRequired(_manual_category_instruction(
-                f"Не нашёл пункт категории «{name}» в мастере."
+                f"Не нашёл пункт категории «{name}» в мастере.", profile
             ))
         # Ждём появления следующего уровня (или целевой формы для последнего)
         if is_last:
             await _wait_until(
-                lambda: _category_is_target(page), attempts=20, interval_s=0.4
+                lambda: _category_is_target(page, profile),
+                attempts=20, interval_s=0.4,
             )
         else:
             next_name = path[idx + 1]
@@ -909,7 +934,7 @@ async def _guard_against_reopened_draft(
 # Реализация шагов
 # ---------------------------------------------------------------------------
 
-async def _step_open_form(page: Any) -> str:
+async def _step_open_form(page: Any, profile: CategoryProfile) -> str:
     """Шаг open_form: goto /additem и распознавание состояния экрана (ТЗ §6)."""
     await page.goto(ADDITEM_URL, wait_until="domcontentloaded", timeout=WAIT_FORM_TIMEOUT_MS)
     state = await _wait_additem_state(page, WAIT_FORM_TIMEOUT_MS)
@@ -923,41 +948,45 @@ async def _step_open_form(page: Any) -> str:
         WAIT_FORM_TIMEOUT_MS, psel.CATEGORY_TITLE, psel.CATEGORY_WIZARD_BUTTON,
     )
     raise UserActionRequired(_manual_category_instruction(
-        "Форма объявления не открылась в ожидаемом виде (возможно, капча или другой экран)."
+        "Форма объявления не открылась в ожидаемом виде (возможно, капча или другой экран).",
+        profile,
     ))
 
 
-async def _step_select_category(page: Any, form_state: str) -> None:
+async def _step_select_category(
+    page: Any, form_state: str, profile: CategoryProfile
+) -> None:
     """
-    Шаг select_category: доводит форму до категории «Пиджаки и костюмы»
+    Шаг select_category: доводит форму до целевой категории профиля
     (ТЗ §6, алгоритм подтверждён live-разведкой 2026-06-10, debug/recon_full.py).
 
-    1. Если категория уже целевая (27/748/754) — выходим (черновик переоткрыт).
+    1. Если категория уже целевая (profile.expected_category) — выходим
+       (черновик переоткрыт). Пустой expected_category → всегда досверливаем.
     2. Если picker (полноэкранный выбор) — клик по верхнему разделу
-       «Личные вещи» уводит на форму с крошками.
+       (profile.full_path[0]) уводит на форму с крошками.
     3. Клик по крошкам category-title раскрывает миллер-мастер.
     4. Досверливаем полный путь (_drill_category_path).
     5. Ждём появления целевой категории; иначе needs_user_action.
     """
     # 1) Уже на целевой форме?
-    if await _category_is_target(page):
-        logger.info("Категория уже целевая (27/748/754) — выбор не нужен")
+    if await _category_is_target(page, profile):
+        logger.info("Категория уже целевая (%s) — выбор не нужен", profile.label)
         return
 
     # 2) Полноэкранный picker: выбрать верхний раздел, дождаться формы с крошками
     if form_state == "picker":
         logger.info("Экран выбора категории (picker) — выбираю верхний раздел %r",
-                    psel.CATEGORY_FULL_PATH[0])
-        if not await _click_wizard_button(page, psel.CATEGORY_FULL_PATH[0]):
+                    profile.full_path[0])
+        if not await _click_wizard_button(page, profile.full_path[0]):
             raise UserActionRequired(_manual_category_instruction(
-                "Не нашёл верхний раздел категории на экране выбора."
+                "Не нашёл верхний раздел категории на экране выбора.", profile
             ))
         if not await _selector_visible(page, psel.CATEGORY_TITLE, WAIT_FORM_TIMEOUT_MS):
             raise UserActionRequired(_manual_category_instruction(
-                "После выбора раздела форма с категорией не открылась."
+                "После выбора раздела форма с категорией не открылась.", profile
             ))
         await _pause()
-        if await _category_is_target(page):
+        if await _category_is_target(page, profile):
             logger.info("После выбора верхнего раздела категория уже целевая")
             return
 
@@ -967,53 +996,61 @@ async def _step_select_category(page: Any, form_state: str) -> None:
     except Exception as exc:
         logger.error("SELECTOR_MISS: крошки %s не кликабельны: %s", psel.CATEGORY_TITLE, exc)
         raise UserActionRequired(_manual_category_instruction(
-            "Не удалось открыть мастер выбора категории (клик по крошкам)."
+            "Не удалось открыть мастер выбора категории (клик по крошкам).", profile
         )) from exc
     await asyncio.sleep(1.0)
     if not await _selector_now_visible(page, psel.CATEGORY_WIZARD_BUTTON):
         raise UserActionRequired(_manual_category_instruction(
-            "Мастер выбора категории не раскрылся."
+            "Мастер выбора категории не раскрылся.", profile
         ))
 
-    # 4) Досверливаем путь до «Пиджаки и костюмы»
-    await _drill_category_path(page)
+    # 4) Досверливаем путь до целевой категории
+    await _drill_category_path(page, profile)
 
     # 5) Контроль достижения цели
-    if await _wait_category_target(page, WAIT_FORM_TIMEOUT_MS):
-        logger.info("Категория «Пиджаки и костюмы» выбрана через мастер")
+    if await _wait_category_target(page, profile, WAIT_FORM_TIMEOUT_MS):
+        logger.info("Категория «%s» выбрана через мастер", profile.category_title_text)
         return
     raise UserActionRequired(_manual_category_instruction(
-        "Автовыбор категории не довёл до «Пиджаки и костюмы»."
+        f"Автовыбор категории не довёл до «{profile.category_title_text}».", profile
     ))
 
 
-async def _step_check_category(page: Any) -> None:
-    """Шаг check_category: контроль 27/748/754 либо текста хлебных крошек."""
-    hidden_ok = True
-    for name, expected in psel.EXPECTED_CATEGORY.items():
-        selector = f"{psel.CATEGORY_HIDDEN_INPUTS}[name='{name}']"
-        actual = await _hidden_value(page, selector)
-        if actual != expected:
-            logger.warning(
-                "Категория: hidden %s = %r, ожидалось %r", name, actual, expected
-            )
-            hidden_ok = False
+async def _step_check_category(page: Any, profile: CategoryProfile) -> None:
+    """
+    Шаг check_category: контроль hidden-ID профиля либо текста хлебных крошек.
 
-    if hidden_ok:
-        logger.info("Категория подтверждена hidden-полями (27/748/754)")
-        return
+    Пустой profile.expected_category (нет точных hidden-ID, например у
+    кроссовок до разведки) → hidden-проверку пропускаем и подтверждаем
+    категорию только по тексту крошки (profile.category_title_text).
+    """
+    if profile.expected_category:
+        hidden_ok = True
+        for name, expected in profile.expected_category.items():
+            selector = f"{psel.CATEGORY_HIDDEN_INPUTS}[name='{name}']"
+            actual = await _hidden_value(page, selector)
+            if actual != expected:
+                logger.warning(
+                    "Категория: hidden %s = %r, ожидалось %r", name, actual, expected
+                )
+                hidden_ok = False
 
-    # Дублирующий контроль — текст хлебных крошек
+        if hidden_ok:
+            logger.info("Категория подтверждена hidden-полями профиля %s", profile.key)
+            return
+
+    # Дублирующий контроль (или единственный при пустом expected_category) —
+    # текст хлебных крошек.
     try:
         crumbs = await page.locator(psel.CATEGORY_TITLE).first.inner_text(timeout=5_000)
     except Exception:
         crumbs = ""
-    if psel.CATEGORY_TITLE_EXPECTED_TEXT in crumbs:
+    if profile.category_title_text in crumbs:
         logger.info("Категория подтверждена хлебными крошками: %r", crumbs)
         return
 
     raise UserActionRequired(_manual_category_instruction(
-        "На форме выбрана другая категория."
+        "На форме выбрана другая категория.", profile
     ))
 
 
@@ -1396,19 +1433,19 @@ async def _click_suggest_option(
     return text or "(пункт без текста)"
 
 
-async def _step_fill_fields(page: Any, data: DraftData) -> None:
+async def _step_fill_fields(
+    page: Any, data: DraftData, profile: CategoryProfile
+) -> None:
     """Шаг fill_fields: вид объявления, состояние, размер, бренд, цвет."""
     # Вид объявления — комбобокс
     await _select_combobox(
-        page, psel.TRADE_TYPE_PREFIX, data.trade_type,
-        psel.TRADE_TYPE_OPTIONS[data.trade_type],
+        page, profile.trade_type_prefix, data.trade_type,
+        profile.trade_type_options[data.trade_type],
     )
     await _pause()
 
     # Состояние — радио, кликаем по label
-    radio_sel = psel.CONDITION_RADIO_TMPL.format(
-        option_id=psel.CONDITION_OPTIONS[data.condition]
-    )
+    radio_sel = profile.condition_radio(profile.condition_options[data.condition])
     try:
         await page.click(radio_sel, timeout=WAIT_SELECTOR_TIMEOUT_MS)
         logger.info("Состояние: выбрано %r", data.condition)
@@ -1419,15 +1456,15 @@ async def _step_fill_fields(page: Any, data: DraftData) -> None:
 
     # Размер — комбобокс
     await _select_combobox(
-        page, psel.SIZE_PREFIX, data.size, psel.SIZE_OPTIONS[data.size]
+        page, profile.size_prefix, data.size, profile.size_options[data.size]
     )
     await _pause()
 
     # Бренд — автокомплит. ВАЖНО (разведка 2026-06-28): бренд сохраняется ТОЛЬКО
     # при клике пункта подсказки; Escape ОЧИЩАЕТ поле — поэтому его НЕ жмём, а
-    # выбираем пункт BRAND_OPTION (совпадающий по тексту, иначе первый).
-    await _clear_and_type(page, psel.BRAND_INPUT, data.brand)
-    chosen_brand = await _click_suggest_option(page, psel.BRAND_OPTION, prefer_text=data.brand)
+    # выбираем пункт brand_option (совпадающий по тексту, иначе первый).
+    await _clear_and_type(page, profile.brand_input, data.brand)
+    chosen_brand = await _click_suggest_option(page, profile.brand_option, prefer_text=data.brand)
     if chosen_brand is not None:
         logger.info("Бренд: выбран пункт подсказки %r", chosen_brand)
     else:
@@ -1439,7 +1476,7 @@ async def _step_fill_fields(page: Any, data: DraftData) -> None:
 
     # Цвет — комбобокс
     await _select_combobox(
-        page, psel.COLOR_PREFIX, data.color, psel.COLOR_OPTIONS[data.color]
+        page, profile.color_prefix, data.color, profile.color_options[data.color]
     )
 
 
@@ -1624,27 +1661,30 @@ async def _run_single_draft(
     data: DraftData,
     draft_index: int,
     drafts_total: int,
+    profile: CategoryProfile,
 ) -> str:
     """
     Полный цикл шагов open_form → save_draft для ОДНОГО черновика (ТЗ §9, §16).
 
-    step/step_label/done в job описывают текущий черновик. Возвращает конечный
-    URL после «Сохранить и выйти». Исключения шагов уходят наверх —
-    их обрабатывает run_publish_job.
+    step/step_label/done в job описывают текущий черновик. profile —
+    профиль категории (category_profiles): источник категорийных данных
+    (путь/крошка/hidden-ID, словари полей, префиксы комбобоксов, бренд).
+    Возвращает конечный URL после «Сохранить и выйти». Исключения шагов
+    уходят наверх — их обрабатывает run_publish_job.
     """
     # ── Шаг 2: open_form (заново для каждого черновика, §16) ─────────────
     _set_step(job, "open_form")
-    form_state = await _step_open_form(page)
+    form_state = await _step_open_form(page, profile)
     await _pause()
 
     # ── Шаг 3: select_category ────────────────────────────────────────────
     _set_step(job, "select_category")
-    await _step_select_category(page, form_state)
+    await _step_select_category(page, form_state, profile)
     await _pause()
 
     # ── Шаг 4: check_category ─────────────────────────────────────────────
     _set_step(job, "check_category")
-    await _step_check_category(page)
+    await _step_check_category(page, profile)
     await _pause()
 
     # ── Шаг 5: fill_title (+ защита от перезаписи для i>1, ТЗ §16) ───────
@@ -1660,7 +1700,7 @@ async def _run_single_draft(
 
     # ── Шаг 7: fill_fields ────────────────────────────────────────────────
     _set_step(job, "fill_fields")
-    await _step_fill_fields(page, data)
+    await _step_fill_fields(page, data, profile)
     await _pause()
 
     # ── Шаг 8: fill_description ───────────────────────────────────────────
@@ -1779,6 +1819,10 @@ async def run_publish_job(
         drafts_total = DRAFTS_DEFAULT
     drafts_total = max(DRAFTS_MIN, min(DRAFTS_MAX, drafts_total))
 
+    # Профиль категории: из data.category; неизвестный/пустой ключ → JACKETS
+    profile = category_profiles.get_profile(getattr(data, "category", None))
+    logger.info("Категория задачи: %s (%s)", profile.key, profile.label)
+
     job["status"] = "running"
     job["total"] = TOTAL_STEPS
     job["drafts_total"] = drafts_total
@@ -1848,7 +1892,7 @@ async def run_publish_job(
                     )
 
                 final_url = await _run_single_draft(
-                    page, job, data_i, draft_index, drafts_total
+                    page, job, data_i, draft_index, drafts_total, profile
                 )
                 job["drafts_saved"] = draft_index
                 job["saved_urls"].append(final_url)
@@ -1933,15 +1977,17 @@ if __name__ == "__main__":
         "address": "ул. Арбат, 1",
     }
     _GOOD_PHOTO = ("suit.jpg", "image/jpeg", 1024 * 1024)
+    # Профиль по умолчанию для базовых тестов валидации — «Пиджаки и костюмы»
+    _PROFILE = category_profiles.JACKETS
 
     # ── Тест 1: валидная форма → ошибок нет ──────────────────────────────────
-    errs = validate_publish_form(_GOOD_FIELDS, [_GOOD_PHOTO])
+    errs = validate_publish_form(_GOOD_FIELDS, [_GOOD_PHOTO], _PROFILE)
     assert errs == [], f"Валидная форма не должна давать ошибок: {errs}"
     print("[OK] Тест 1: валидная форма проходит")
 
     # ── Тест 2: пустые название/описание/бренд/город/адрес ──────────────────
     empty = dict(_GOOD_FIELDS, title="", description="  ", brand="", city="", address="")
-    errs = validate_publish_form(empty, [_GOOD_PHOTO])
+    errs = validate_publish_form(empty, [_GOOD_PHOTO], _PROFILE)
     bad_fields = {e["field"] for e in errs}
     for f in ("title", "description", "brand", "city", "address"):
         assert f in bad_fields, f"Нет ошибки для пустого поля {f}: {errs}"
@@ -1949,7 +1995,7 @@ if __name__ == "__main__":
 
     # ── Тест 3: цена 0 / отрицательная / нечисловая ──────────────────────────
     for bad_price in ("0", "-100", "abc", ""):
-        errs = validate_publish_form(dict(_GOOD_FIELDS, price=bad_price), [_GOOD_PHOTO])
+        errs = validate_publish_form(dict(_GOOD_FIELDS, price=bad_price), [_GOOD_PHOTO], _PROFILE)
         assert any(e["field"] == "price" for e in errs), (
             f"Цена {bad_price!r} должна быть отклонена: {errs}"
         )
@@ -1962,28 +2008,28 @@ if __name__ == "__main__":
         ("size", "99 (XXXXL)"),
         ("color", "Хаки"),
     ):
-        errs = validate_publish_form(dict(_GOOD_FIELDS, **{field_name: bad_value}), [_GOOD_PHOTO])
+        errs = validate_publish_form(dict(_GOOD_FIELDS, **{field_name: bad_value}), [_GOOD_PHOTO], _PROFILE)
         assert any(e["field"] == field_name for e in errs), (
             f"{field_name}={bad_value!r} должно быть отклонено: {errs}"
         )
     print("[OK] Тест 4: значения вне словарей отклоняются")
 
     # ── Тест 5: 0 фото и 11 фото ─────────────────────────────────────────────
-    errs = validate_publish_form(_GOOD_FIELDS, [])
+    errs = validate_publish_form(_GOOD_FIELDS, [], _PROFILE)
     assert any(e["field"] == "photos" for e in errs), "0 фото должно быть отклонено"
-    errs = validate_publish_form(_GOOD_FIELDS, [_GOOD_PHOTO] * 11)
+    errs = validate_publish_form(_GOOD_FIELDS, [_GOOD_PHOTO] * 11, _PROFILE)
     assert any(e["field"] == "photos" for e in errs), "11 фото должно быть отклонено"
     print("[OK] Тест 5: 0 и 11 фото отклоняются")
 
     # ── Тест 6: недопустимый формат и превышение 25 МБ ───────────────────────
-    errs = validate_publish_form(_GOOD_FIELDS, [("doc.pdf", "application/pdf", 1000)])
+    errs = validate_publish_form(_GOOD_FIELDS, [("doc.pdf", "application/pdf", 1000)], _PROFILE)
     assert any(e["field"] == "photos" for e in errs), "PDF должен быть отклонён"
     errs = validate_publish_form(
-        _GOOD_FIELDS, [("big.jpg", "image/jpeg", 26 * 1024 * 1024)]
+        _GOOD_FIELDS, [("big.jpg", "image/jpeg", 26 * 1024 * 1024)], _PROFILE
     )
     assert any(e["field"] == "photos" for e in errs), ">25 МБ должно быть отклонено"
     # heic допустим
-    errs = validate_publish_form(_GOOD_FIELDS, [("photo.heic", "image/heic", 1000)])
+    errs = validate_publish_form(_GOOD_FIELDS, [("photo.heic", "image/heic", 1000)], _PROFILE)
     assert errs == [], f"heic должен проходить: {errs}"
     print("[OK] Тест 6: форматы и размер фото проверяются")
 
@@ -1991,9 +2037,14 @@ if __name__ == "__main__":
     draft = build_draft_data(_GOOD_FIELDS, ["tmp/publish/x/suit.jpg"])
     assert draft.price == 15000
     assert draft.full_address() == "Москва, ул. Арбат, 1"
+    assert draft.category == "jackets", draft.category  # дефолт категории
     assert draft.summary()["photos_count"] == 1
+    assert draft.summary()["category"] == "jackets", draft.summary()
     assert "photo_paths" not in draft.summary(), "В сводке не должно быть путей к фото"
-    print("[OK] Тест 7: build_draft_data / full_address / summary")
+    # Явная категория переносится в DraftData
+    draft_sn = build_draft_data(_GOOD_FIELDS, ["x.jpg"], category="sneakers")
+    assert draft_sn.category == "sneakers", draft_sn.category
+    print("[OK] Тест 7: build_draft_data / full_address / summary / category")
 
     # ── Тест 8: стейт-машина — 12 шагов, метки по-русски ─────────────────────
     assert TOTAL_STEPS == 12, f"Шагов должно быть 12, есть {TOTAL_STEPS}"
@@ -2007,17 +2058,17 @@ if __name__ == "__main__":
     # 0 и 11 — вне диапазона [1, 10] → ошибка поля drafts_count
     for bad_count in ("0", "11", "-1", "abc", "1.5"):
         errs = validate_publish_form(
-            dict(_GOOD_FIELDS, drafts_count=bad_count), [_GOOD_PHOTO]
+            dict(_GOOD_FIELDS, drafts_count=bad_count), [_GOOD_PHOTO], _PROFILE
         )
         assert any(e["field"] == "drafts_count" for e in errs), (
             f"drafts_count={bad_count!r} должно быть отклонено: {errs}"
         )
     # «3» строкой → ок, парсится в 3
-    errs = validate_publish_form(dict(_GOOD_FIELDS, drafts_count="3"), [_GOOD_PHOTO])
+    errs = validate_publish_form(dict(_GOOD_FIELDS, drafts_count="3"), [_GOOD_PHOTO], _PROFILE)
     assert errs == [], f"drafts_count='3' должно проходить: {errs}"
     assert parse_drafts_count("3") == 3
     # Отсутствие поля → ок, дефолт 1 (обратная совместимость)
-    errs = validate_publish_form(_GOOD_FIELDS, [_GOOD_PHOTO])
+    errs = validate_publish_form(_GOOD_FIELDS, [_GOOD_PHOTO], _PROFILE)
     assert errs == [], f"Форма без drafts_count должна проходить: {errs}"
     assert parse_drafts_count(None) == 1
     assert parse_drafts_count("") == 1
@@ -2193,5 +2244,20 @@ if __name__ == "__main__":
         f"Лог publisher пишется в {_log_path}, ожидали {_expected}"
     )
     print("[OK] Тест: logs/publisher.log в корне проекта независимо от cwd")
+
+    # ── Тест 13: validate_publish_form учитывает профиль категории ──────────
+    import category_profiles as cp
+    # size пиджаков валиден для jackets, но не для sneakers (другой словарь обуви)
+    base = {
+        "title": "t", "trade_type": "Продаю своё", "condition": "Отличное",
+        "size": "48 (M)", "brand": "b", "color": "Чёрный",
+        "description": "d", "price": "100", "city": "Москва", "address": "ул. 1",
+    }
+    photos = [("a.jpg", "image/jpeg", 1000)]
+    assert validate_publish_form(base, photos, cp.JACKETS) == []
+    # тот же размер «48 (M)» не из словаря кроссовок → ошибка по полю size
+    errs = validate_publish_form(base, photos, cp.SNEAKERS)
+    assert any(e["field"] == "size" for e in errs), errs
+    print("[OK] validate_publish_form учитывает профиль категории")
 
     print("\n=== Все самотесты publisher.py пройдены ===")
