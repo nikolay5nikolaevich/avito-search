@@ -751,6 +751,23 @@ async def _run_publish_and_cleanup(
     logger.info("Prep %s удалён после успешной заливки (задача %s)", prep_id, job_id)
 
 
+@app.get("/api/publish/categories")
+async def api_publish_categories() -> JSONResponse:
+    """Списки полей формы по категориям — единый источник правды для фронта."""
+    cats = []
+    for p in category_profiles.PROFILES.values():
+        cats.append({
+            "key": p.key,
+            "label": p.label,
+            "path": list(p.full_path),
+            "sizes": list(p.size_options.keys()),
+            "colors": list(p.color_options.keys()),
+            "conditions": list(p.condition_options.keys()),
+            "trade_types": list(p.trade_type_options.keys()),
+        })
+    return JSONResponse({"categories": cats})
+
+
 @app.post("/api/publish/start")
 async def api_publish_start(
     title: str = Form(""),
