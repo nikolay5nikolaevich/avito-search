@@ -4,6 +4,8 @@
 НЕ смешивать с avito_selectors.py — там селекторы ПОИСКОВОЙ выдачи и страниц
 объявлений (аналитика спроса). Здесь — только форма создания черновика.
 
+Категорийные словари (опции, префиксы, контрольные ID) переехали в category_profiles.py.
+
 Все data-marker и ID опций ПОДТВЕРЖДЕНЫ живой разведкой 2026-06-09
 (дамп debug/additem.html, выжимка debug/additem_map.txt, категория
 «Пиджаки и костюмы»). При изменении вёрстки Авито: снять новый дамп,
@@ -18,22 +20,12 @@
 """
 
 # ---------------------------------------------------------------------------
-# Категория «Пиджаки и костюмы» — контрольные значения hidden-полей.
-# Заполнять их НЕ нужно — только сверять перед заполнением формы.
+# Категория — служебные (категория-независимые) элементы
 # ---------------------------------------------------------------------------
-
-# <input data-marker="category-hidden-input" name="..." value="...">
-EXPECTED_CATEGORY: dict[str, str] = {
-    "category_id": "27",     # Товары
-    "params[175]": "748",    # Мужская одежда
-    "params[176]": "754",    # Пиджаки и костюмы
-}
 
 # Хлебные крошки категории. На форме это <a data-marker="category-title" role="button">
 # — КЛИКАБЕЛЬНЫ: клик открывает мастер выбора категории (миллер-колонки).
-# Также служат дублирующим текстовым контролем выбранной категории.
 CATEGORY_TITLE = "[data-marker='category-title']"
-CATEGORY_TITLE_EXPECTED_TEXT = "Пиджаки и костюмы"
 
 # Hidden-поля категории (их три, различаются атрибутом name)
 CATEGORY_HIDDEN_INPUTS = "[data-marker='category-hidden-input']"
@@ -55,13 +47,6 @@ CATEGORY_HIDDEN_INPUTS = "[data-marker='category-hidden-input']"
 #   4) после «Пиджаки и костюмы» грузится костюмная форма (hidden 27/748/754).
 # ---------------------------------------------------------------------------
 CATEGORY_WIZARD_BUTTON = "button[data-marker='category-wizard/button']"
-# Заголовок полноэкранного picker: «Новое объявление».
-CATEGORY_FULL_PATH: tuple[str, ...] = (
-    "Личные вещи",
-    "Одежда, обувь, аксессуары",
-    "Мужская одежда",
-    "Пиджаки и костюмы",
-)
 
 # ---------------------------------------------------------------------------
 # Поля формы
@@ -74,14 +59,6 @@ TITLE_INPUT = "input[name='title']"
 # Фотографии: <input type=file multiple> — заливать через set_input_files,
 # кликов не нужно. accept: gif/png/jpeg/pjpeg/heic. Лимит формы: 10.
 PHOTO_INPUT = "[data-marker='add/input']"
-
-# Бренд: текстовый input с автокомплитом.
-# ВАЖНО (живая разведка 2026-06-28): просто текста НЕДОСТАТОЧНО — бренд сохраняется
-# только при КЛИКЕ пункта подсказки. Клавиша Escape ОЧИЩАЕТ поле (проверено), поэтому
-# закрывать список через Escape нельзя — нужно выбрать пункт BRAND_OPTION ниже.
-BRAND_INPUT = "[data-marker='params[115634]/input']"
-# Пункты выпадашки бренда — <p data-marker='params[115634]/option'> (текст = название бренда).
-BRAND_OPTION = "[data-marker='params[115634]/option']"
 
 # Описание: rich-editor (contenteditable). НЕ .fill() — кликнуть и вводить
 # с клавиатуры. Контроль: hidden input[name='description_html'] непустой.
@@ -118,20 +95,13 @@ LOCATION_ID_HIDDEN = "input[name='locationId']"
 #   1) клик по КОНТЕЙНЕРУ "[data-marker='{prefix}']" (role=combobox) — раскрыть;
 #   2) клик по ВИДИМОМУ элементу с точным текстом опции (по лейблу, не по ID);
 #   3) верификация: нативный <select> получил value == ID опции.
+# Префиксы конкретных полей (тип сделки, размер, цвет) и шаблон радио-состояния
+# хранятся в CategoryProfile (category_profiles.py).
 # ---------------------------------------------------------------------------
 
 COMBOBOX_CONTAINER_TMPL = "[data-marker='{prefix}']"            # триггер (открыть)
 COMBOBOX_SELECT_TMPL = "[data-marker='{prefix}/select']"        # нативный select (верификация)
 COMBOBOX_SEARCH_TMPL = "[data-marker='{prefix}/search-input']"  # поле поиска (фолбэк)
-
-# Префиксы комбобоксов
-TRADE_TYPE_PREFIX = "type_of_trade"   # Вид объявления
-SIZE_PREFIX = "razmer"                # Размер
-COLOR_PREFIX = "cvet"                 # Цвет
-# material_osnovnoi_chasti (Материал) — в v1 НЕ заполняем (поле необязательное)
-
-# Радио «Состояние»: кликать по label с маркером params[110385]/{ID}
-CONDITION_RADIO_TMPL = "[data-marker='params[110385]/{option_id}']"
 
 # ---------------------------------------------------------------------------
 # Ожидание загрузки фото: подтверждённого маркера превью в дампе нет
@@ -164,116 +134,18 @@ SAVE_AND_EXIT_BUTTON = "[data-marker='item-creator/save-and-exit']"
 # Селектор намеренно НЕ объявлен как константа. НЕ добавлять. НЕ кликать.
 
 # ---------------------------------------------------------------------------
-# Словари опций: человекочитаемый лейбл → ID опции Авито.
-# Лейблы — это же допустимые значения полей формы проекта (валидация по ключам).
-# Источник: debug/additem_map.txt (живой дамп 2026-06-09).
-# ---------------------------------------------------------------------------
-
-# Вид объявления (комбобокс type_of_trade) — 3 опции
-TRADE_TYPE_OPTIONS: dict[str, int] = {
-    "Продаю своё": 20029,
-    "Товар приобретён на продажу": 20030,
-    "Товар от производителя": 20031,
-}
-
-# Состояние (радио params[110385]) — 4 опции
-CONDITION_OPTIONS: dict[str, int] = {
-    "Новое с биркой": 2804445,
-    "Отличное": 431223,
-    "Хорошее": 431224,
-    "Удовлетворительное": 2804446,
-}
-
-# Размер (комбобокс razmer) — 24 опции
-SIZE_OPTIONS: dict[str, int] = {
-    "40 (XXS)": 1364250,
-    "42 (XS)": 1364251,
-    "44 (XS/S)": 1364252,
-    "46 (S)": 1364253,
-    "48 (M)": 1364254,
-    "50 (L)": 1364255,
-    "52 (L/XL)": 1364256,
-    "54 (XL)": 1364257,
-    "56 (XXL)": 1364258,
-    "58 (XXL)": 1364259,
-    "60 (3XL)": 1364260,
-    "62 (4XL)": 1364261,
-    "64 (5XL)": 1364262,
-    "66 (6XL)": 1364263,
-    "68 (7XL)": 1364264,
-    "70 (7XL)": 1364265,
-    "72 (8XL)": 1364266,
-    "74 (8XL)": 1364267,
-    "76 (9XL)": 1364268,
-    "78 (10XL)": 1364269,
-    "80 (10XL)": 1364270,
-    "82+ (10XL+)": 1364271,
-    "One size": 3263777,
-    "Без размера": 1364272,
-}
-
-# Цвет (комбобокс cvet) — 17 опций
-COLOR_OPTIONS: dict[str, int] = {
-    "Красный": 754149,
-    "Белый": 754146,
-    "Розовый": 754160,
-    "Бордовый": 2849885,
-    "Синий": 754151,
-    "Жёлтый": 754156,
-    "Голубой": 754158,
-    "Фиолетовый": 754159,
-    "Оранжевый": 754154,
-    "Разноцветный": 754161,
-    "Серый": 754148,
-    "Бежевый": 754150,
-    "Чёрный": 754147,
-    "Коричневый": 754153,
-    "Зелёный": 754157,
-    "Серебряный": 754152,
-    "Золотой": 754155,
-}
-
-
-# ---------------------------------------------------------------------------
 # Самотесты (запуск: python backend/avito_publish_selectors.py)
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Размеры словарей соответствуют живому дампу
-    assert len(TRADE_TYPE_OPTIONS) == 3, f"Вид объявления: 3, есть {len(TRADE_TYPE_OPTIONS)}"
-    assert len(CONDITION_OPTIONS) == 4, f"Состояние: 4, есть {len(CONDITION_OPTIONS)}"
-    assert len(SIZE_OPTIONS) == 24, f"Размер: 24, есть {len(SIZE_OPTIONS)}"
-    assert len(COLOR_OPTIONS) == 17, f"Цвет: 17, есть {len(COLOR_OPTIONS)}"
-    print("[OK] Размеры словарей: 3 / 4 / 24 / 17")
-
-    # ID уникальны внутри каждого словаря
-    for name, options in (
-        ("TRADE_TYPE_OPTIONS", TRADE_TYPE_OPTIONS),
-        ("CONDITION_OPTIONS", CONDITION_OPTIONS),
-        ("SIZE_OPTIONS", SIZE_OPTIONS),
-        ("COLOR_OPTIONS", COLOR_OPTIONS),
-    ):
-        ids = list(options.values())
-        assert len(ids) == len(set(ids)), f"{name}: дублирующиеся ID"
-    print("[OK] ID опций уникальны")
-
-    # Согласованность данных категории (сами значения — разведданные,
-    # их «копии в assert'ах» не держим: правка была бы двойной)
-    assert len(EXPECTED_CATEGORY) == 3 and all(EXPECTED_CATEGORY.values())
-    assert CATEGORY_FULL_PATH and all(CATEGORY_FULL_PATH)
-    assert CATEGORY_FULL_PATH[-1] == CATEGORY_TITLE_EXPECTED_TEXT
-    print("[OK] Мастер выбора категории: путь согласован с контролем заголовка")
-
-    # Шаблоны комбобоксов собираются корректно
-    container = COMBOBOX_CONTAINER_TMPL.format(prefix=COLOR_PREFIX)
-    native = COMBOBOX_SELECT_TMPL.format(prefix=COLOR_PREFIX)
-    search = COMBOBOX_SEARCH_TMPL.format(prefix=COLOR_PREFIX)
+    # Шаблоны комбобоксов собираются корректно (префикс «cvet» — пример)
+    container = COMBOBOX_CONTAINER_TMPL.format(prefix="cvet")
+    native = COMBOBOX_SELECT_TMPL.format(prefix="cvet")
+    search = COMBOBOX_SEARCH_TMPL.format(prefix="cvet")
     assert container == "[data-marker='cvet']", container
     assert native == "[data-marker='cvet/select']", native
     assert search == "[data-marker='cvet/search-input']", search
-    radio = CONDITION_RADIO_TMPL.format(option_id=CONDITION_OPTIONS["Отличное"])
-    assert radio == "[data-marker='params[110385]/431223']", radio
-    print("[OK] Шаблоны селекторов комбобоксов и радио")
+    print("[OK] Шаблоны селекторов комбобоксов")
 
     # Запрещённый селектор не объявлен в модуле как константа
     _module_vars = {k: v for k, v in globals().items() if k.isupper()}
