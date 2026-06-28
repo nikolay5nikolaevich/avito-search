@@ -31,6 +31,8 @@ needs_user_action — ТЕРМИНАЛЬНЫЙ (v1 без resume): пользо�
 """
 
 import asyncio
+import datetime
+import json
 import logging
 import pathlib
 import random
@@ -593,6 +595,22 @@ async def _keyboard_clear(page: Any) -> None:
     await page.keyboard.press("Delete")
 
 
+def _typed_value_matches(current: str, expected: str) -> bool:
+    """
+    Проверяет, совпадает ли значение в поле с ожидаемым.
+
+    Нормализует оба аргумента: убирает обычные пробелы (U+0020) и
+    неразрывные пробелы (U+00A0) — Авито форматирует цены с разделителем
+    тысяч и ставит именно такие пробелы («2990» → «2 990» или «2 990»).
+    Без нормализации контроль после ввода всегда давал несовпадение для
+    цен ≥ 1000 и запускал хрупкий повторный ввод.
+    """
+    def _norm(s: str) -> str:
+        return s.replace(" ", "").replace(" ", "").strip()
+
+    return _norm(current) == _norm(expected)
+
+
 async def _clear_and_type(page: Any, selector: str, value: str) -> None:
     """
     Очищает текстовое поле (Ctrl+A → Delete) и вводит значение.
@@ -615,6 +633,7 @@ async def _clear_and_type(page: Any, selector: str, value: str) -> None:
         await locator.fill(value, timeout=WAIT_SELECTOR_TIMEOUT_MS)
     except Exception as exc:
         logger.warning(".fill() не сработал для %s (%s) — печатаю с клавиатуры", selector, exc)
+        await locator.click()  # фокус мог уйти — вернуть перед посимвольным вводом
         await page.keyboard.type(value, delay=random.randint(30, 60))
 
     # Контроль: значение реально применилось
@@ -622,7 +641,7 @@ async def _clear_and_type(page: Any, selector: str, value: str) -> None:
         current = await locator.input_value()
     except Exception:
         current = None
-    if current is not None and current.strip() != value.strip():
+    if current is not None and not _typed_value_matches(current, value):
         logger.warning(
             "Значение %r не применилось к %s (сейчас %r) — повторный клавиатурный ввод",
             value, selector, current,
@@ -998,8 +1017,250 @@ async def _step_check_category(page: Any) -> None:
     ))
 
 
+# ---------------------------------------------------------------------------
+# Диагностическая инструментация загрузки фото (гипотезы A/B)
+# ---------------------------------------------------------------------------
+
+# Эвристика photo_related: ключевые слова URL, типы ресурсов, CDN-хосты
+_DIAG_URL_KEYWORDS: frozenset[str] = frozenset(
+    {"upload", "photo", "image", "img", "file"}
+)
+_DIAG_CDN_HOSTS: frozenset[str] = frozenset(
+    {"avito.st", "avatars.avito", "cdn.avito"}
+)
+
+
+def _diag_is_photo_request(url: str, resource_type: str) -> bool:
+    """True, если запрос, вероятно, относится к загрузке/отдаче фото."""
+    url_l = url.lower()
+    if resource_type == "image":
+        return True
+    kw_hit = any(kw in url_l for kw in _DIAG_URL_KEYWORDS)
+    if kw_hit and ("avito" in url_l or resource_type in ("xhr", "fetch")):
+        return True
+    if any(h in url_l for h in _DIAG_CDN_HOSTS):
+        return True
+    return False
+
+
+def _attach_photo_network_probe(page: Any) -> Optional[dict]:
+    """
+    Навешивает page.on("request") / page.on("response") и возвращает probe-словарь.
+
+    Если page не имеет метода .on (mock в тестах) — тихо возвращает None.
+
+    probe = {
+        "n_files": 0,          # заполняется вызывающим кодом
+        "requests":  [{"ts", "event", "method", "url", "resource_type",
+                        "photo_related"}, ...],
+        "responses": [{"ts", "event", "url", "status", "resource_type",
+                        "photo_related"}, ...]
+    }
+    """
+    if not hasattr(page, "on"):
+        return None
+
+    probe: dict = {"n_files": 0, "requests": [], "responses": []}
+
+    def _on_request(req: Any) -> None:
+        try:
+            url = getattr(req, "url", "") or ""
+            method = getattr(req, "method", "") or ""
+            rtype = getattr(req, "resource_type", "") or ""
+            probe["requests"].append({
+                "ts": datetime.datetime.utcnow().isoformat(),
+                "event": "request",
+                "method": method,
+                "url": url,
+                "resource_type": rtype,
+                "photo_related": _diag_is_photo_request(url, rtype),
+            })
+        except Exception:
+            pass
+
+    def _on_response(resp: Any) -> None:
+        try:
+            url = getattr(resp, "url", "") or ""
+            status = getattr(resp, "status", -1)
+            req = getattr(resp, "request", None)
+            rtype = (getattr(req, "resource_type", "") or "") if req else ""
+            probe["responses"].append({
+                "ts": datetime.datetime.utcnow().isoformat(),
+                "event": "response",
+                "url": url,
+                "status": status,
+                "resource_type": rtype,
+                "photo_related": _diag_is_photo_request(url, rtype),
+            })
+        except Exception:
+            pass
+
+    try:
+        page.on("request", _on_request)
+        page.on("response", _on_response)
+        logger.info("Диагностика фото: сетевые слушатели подключены")
+    except Exception as exc:
+        logger.warning("Диагностика фото: не удалось навесить слушатели: %s", exc)
+        return None
+
+    return probe
+
+
+async def _diag_snap_previews(
+    page: Any, label: str, dst_dir: pathlib.Path
+) -> None:
+    """
+    Фиксирует состояние превью и <img>-тегов, дописывает строку в previews.log.
+    Каждый вызов снабжён UTC-меткой и именем момента (label).
+    Не бросает исключений.
+    """
+    try:
+        ts = datetime.datetime.utcnow().isoformat()
+        lines: list[str] = [f"--- {ts} [{label}] ---"]
+
+        # Счётчик по каждому кандидату-селектору превью
+        for candidate in psel.PHOTO_PREVIEW_CANDIDATES:
+            try:
+                count = await page.locator(candidate).count()
+                lines.append(f"  sel {candidate!r}: {count} эл.")
+            except Exception as exc_sel:
+                lines.append(f"  sel {candidate!r}: ошибка ({exc_sel})")
+
+        # Сканируем все <img>: blob: (кэш браузера) vs CDN avito.st
+        try:
+            img_srcs: list[str] = await page.evaluate(
+                "() => Array.from(document.querySelectorAll('img'))"
+                ".map(i => i.src || i.getAttribute('src') || '')"
+                ".filter(Boolean).slice(0, 60)"
+            )
+            blob_c = sum(1 for s in img_srcs if s.startswith("blob:"))
+            cdn_c = sum(
+                1 for s in img_srcs
+                if "avito" in s.lower() and not s.startswith("blob:")
+            )
+            lines.append(
+                f"  img: всего={len(img_srcs)}, blob={blob_c}, CDN(avito)={cdn_c}"
+            )
+            for src in img_srcs[:25]:
+                if "blob:" in src or "avito" in src.lower():
+                    lines.append(f"    {src[:120]!r}")
+        except Exception as exc_img:
+            lines.append(f"  img-scan ошибка: {exc_img}")
+
+        lines.append("")
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        with (dst_dir / "previews.log").open("a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+    except Exception as exc:
+        logger.warning("Диагностика фото: снапшот [%s] не удался: %s", label, exc)
+
+
+async def _dump_photo_diag(
+    page: Any, probe: dict, label: str, dst_dir: pathlib.Path
+) -> None:
+    """
+    Выгружает network.jsonl и summary.txt в dst_dir.
+    Читает previews.log из того же dst_dir для сводки.
+    Аргумент page зарезервирован для совместимости (скриншоты делаются отдельно).
+    Не бросает исключений.
+    """
+    try:
+        dst_dir.mkdir(parents=True, exist_ok=True)
+
+        # network.jsonl — все перехваченные события в хронологическом порядке
+        all_events = sorted(
+            probe.get("requests", []) + probe.get("responses", []),
+            key=lambda e: e.get("ts", ""),
+        )
+        with (dst_dir / "network.jsonl").open("w", encoding="utf-8") as fh:
+            for ev in all_events:
+                fh.write(json.dumps(ev, ensure_ascii=False) + "\n")
+
+        # Статистика из probe
+        n_files = probe.get("n_files", 0)
+        total_req = len(probe.get("requests", []))
+        total_resp = len(probe.get("responses", []))
+        photo_req = sum(1 for e in probe.get("requests", []) if e.get("photo_related"))
+        photo_resp = sum(1 for e in probe.get("responses", []) if e.get("photo_related"))
+        upload_resps = [
+            e for e in probe.get("responses", [])
+            if e.get("photo_related") and "upload" in e.get("url", "").lower()
+        ]
+        upload_statuses = [e.get("status", -1) for e in upload_resps]
+
+        # Финальный blob/CDN-счёт из последней строки previews.log
+        last_blob = "?"
+        last_cdn = "?"
+        prev_log = dst_dir / "previews.log"
+        if prev_log.exists():
+            try:
+                for line in reversed(prev_log.read_text(encoding="utf-8").splitlines()):
+                    if "blob=" in line and "CDN(avito)=" in line:
+                        # Строка вида: «  img: всего=N, blob=B, CDN(avito)=C»
+                        for part in line.split(","):
+                            p = part.strip()
+                            if p.startswith("blob="):
+                                last_blob = p[len("blob="):]
+                            elif p.startswith("CDN(avito)="):
+                                last_cdn = p[len("CDN(avito)="):]
+                        break
+            except Exception:
+                pass
+
+        (dst_dir / "summary.txt").write_text(
+            f"=== Диагностика загрузки фото ({label}) ===\n"
+            f"Файлов передано: {n_files}\n"
+            f"Сетевых запросов (всего): {total_req}\n"
+            f"Сетевых ответов (всего): {total_resp}\n"
+            f"Запросов photo_related: {photo_req}\n"
+            f"Ответов photo_related: {photo_resp}\n"
+            f"Upload-подобных ответов: {len(upload_resps)}\n"
+            f"  статусы upload: {upload_statuses}\n"
+            f"img на blob: перед сохранением: {last_blob}\n"
+            f"img на CDN (avito.st) перед сохранением: {last_cdn}\n"
+            f"\n"
+            f"--- Интерпретация ---\n"
+            f"Гипотеза A (гонка): upload XHR вернули 200 для ВСЕХ файлов,\n"
+            f"  но img ещё на blob: перед сохранением → финализация на сервере\n"
+            f"  Авито ещё не завершена, кнопка Save нажата слишком рано.\n"
+            f"Гипотеза B (антидубль): upload XHR = 200 для всех {n_files} файлов,\n"
+            f"  но img на CDN меньше {n_files} → Авито молча отбросил похожие фото.\n",
+            encoding="utf-8",
+        )
+        logger.info(
+            "Диагностика фото: дамп в %s (%d событий сети)", dst_dir, len(all_events)
+        )
+    except Exception as exc:
+        logger.warning("Диагностика фото: дамп не удался: %s", exc)
+
+
 async def _step_upload_photos(page: Any, photo_paths: tuple[str, ...]) -> None:
     """Шаг upload_photos: set_input_files + ожидание загрузки на сервер."""
+
+    # ── Диагностика A/B: инициализация ────────────────────────────────────
+    # Создаём папку артефактов и навешиваем сетевые слушатели ДО отправки файлов,
+    # чтобы поймать upload-XHR с первого байта. Ошибки диагностики не роняют шаг.
+    _d_dir: Optional[pathlib.Path] = None
+    _d_probe: Optional[dict] = None
+    try:
+        _d_ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        _d_dir = PROJECT_ROOT / "debug" / f"photo_diag_{_d_ts}"
+        _d_dir.mkdir(parents=True, exist_ok=True)
+        _d_probe = _attach_photo_network_probe(page)
+        if _d_probe is not None:
+            _d_probe["n_files"] = len(photo_paths)
+        # Сохраняем ссылки на page-объекте: _step_save_draft прочитает их
+        try:
+            page._photo_diag_probe = _d_probe   # type: ignore[attr-defined]
+            page._photo_diag_dir = _d_dir        # type: ignore[attr-defined]
+        except Exception:
+            pass
+        logger.info("Диагностика фото: папка %s, зондирование %s",
+                    _d_dir, "активно" if _d_probe else "недоступно (mock)")
+    except Exception as exc:
+        logger.warning("Диагностика фото: инициализация не удалась: %s", exc)
+    # ──────────────────────────────────────────────────────────────────────
+
     try:
         await page.set_input_files(
             psel.PHOTO_INPUT, list(photo_paths), timeout=WAIT_SELECTOR_TIMEOUT_MS
@@ -1007,6 +1268,18 @@ async def _step_upload_photos(page: Any, photo_paths: tuple[str, ...]) -> None:
     except Exception as exc:
         logger.error("SELECTOR_MISS: input фото %s: %s", psel.PHOTO_INPUT, exc)
         raise StepError(f"Не найден input загрузки фото: {psel.PHOTO_INPUT}") from exc
+
+    # ── Диагностика: скриншот + снапшот сразу после set_input_files ───────
+    if _d_dir is not None:
+        try:
+            if hasattr(page, "screenshot"):
+                await page.screenshot(
+                    path=str(_d_dir / "screenshot_after_set_files.png")
+                )
+        except Exception as exc_ss:
+            logger.warning("Диагностика фото: скриншот after_set_files: %s", exc_ss)
+        await _diag_snap_previews(page, "after_set_files", _d_dir)
+    # ──────────────────────────────────────────────────────────────────────
 
     logger.info("Отдано на загрузку %d фото, ждём превью…", len(photo_paths))
 
@@ -1044,6 +1317,7 @@ async def _step_upload_photos(page: Any, photo_paths: tuple[str, ...]) -> None:
     # Ждём, пока число превью достигнет числа файлов (или истечёт таймаут)
     logger.info("Превью фото отслеживаю по селектору %r", working_selector)
     last_count = 0
+    _d_snap_itr = 0  # счётчик итераций для нечастых снапшотов превью (~каждые 3 с)
     while asyncio.get_event_loop().time() < deadline:
         try:
             last_count = await page.locator(working_selector).count()
@@ -1054,12 +1328,72 @@ async def _step_upload_photos(page: Any, photo_paths: tuple[str, ...]) -> None:
             # Небольшой довесок — дать серверной загрузке финализироваться
             await asyncio.sleep(2.0)
             return
+        # ── Диагностика: снапшот превью через итерацию (~каждые 3 с) ─────
+        _d_snap_itr += 1
+        if _d_dir is not None and _d_snap_itr % 2 == 0:
+            await _diag_snap_previews(
+                page, f"waiting_{last_count}of{expected}", _d_dir
+            )
+        # ──────────────────────────────────────────────────────────────────
         await asyncio.sleep(1.5)
 
     logger.warning(
         "За %.0f с появилось %d/%d превью — продолжаю с тем, что есть",
         PHOTO_UPLOAD_TIMEOUT_S, last_count, expected,
     )
+
+
+def _norm_suggest(text: str) -> str:
+    """Нормализует текст пункта подсказки для сравнения: схлопывает пробелы + casefold."""
+    return " ".join(text.split()).casefold()
+
+
+async def _click_suggest_option(
+    page: Any,
+    option_selector: str,
+    prefer_text: Optional[str] = None,
+    timeout_ms: int = GEO_SUGGEST_TIMEOUT_MS,
+) -> Optional[str]:
+    """
+    Ждёт пункты автокомплита по option_selector и кликает подходящий.
+
+    prefer_text задан → кликает пункт с совпадающим (без учёта регистра/пробелов)
+    текстом; если такого нет — первый. Возвращает текст кликнутого пункта или
+    None, если пункты не появились (вызывающий решает, что делать).
+
+    Зачем (живая разведка 2026-06-28): и бренд, и адрес — автокомплиты, значение
+    «прилипает» только при КЛИКЕ пункта. Закрытие списка через Escape очищает поле
+    бренда, а клик по контейнеру гео-саджеста адрес не выбирает.
+    """
+    if not await _selector_visible(page, option_selector, timeout_ms):
+        return None
+    options = page.locator(option_selector)
+    try:
+        count = await options.count()
+    except Exception:
+        count = 0
+    if count == 0:
+        return None
+
+    target_idx = 0
+    if prefer_text:
+        want = _norm_suggest(prefer_text)
+        for i in range(count):
+            try:
+                txt = await options.nth(i).inner_text()
+            except Exception:
+                continue
+            if _norm_suggest(txt) == want:
+                target_idx = i
+                break
+
+    chosen = options.nth(target_idx)
+    try:
+        text = (await chosen.inner_text()).strip()
+    except Exception:
+        text = ""
+    await chosen.click(timeout=5_000)
+    return text or "(пункт без текста)"
 
 
 async def _step_fill_fields(page: Any, data: DraftData) -> None:
@@ -1089,10 +1423,18 @@ async def _step_fill_fields(page: Any, data: DraftData) -> None:
     )
     await _pause()
 
-    # Бренд — текст с автокомплитом (достаточно текста, саджест не обязателен)
+    # Бренд — автокомплит. ВАЖНО (разведка 2026-06-28): бренд сохраняется ТОЛЬКО
+    # при клике пункта подсказки; Escape ОЧИЩАЕТ поле — поэтому его НЕ жмём, а
+    # выбираем пункт BRAND_OPTION (совпадающий по тексту, иначе первый).
     await _clear_and_type(page, psel.BRAND_INPUT, data.brand)
-    # Закрываем возможный саджест бренда, не выбирая ничего
-    await page.keyboard.press("Escape")
+    chosen_brand = await _click_suggest_option(page, psel.BRAND_OPTION, prefer_text=data.brand)
+    if chosen_brand is not None:
+        logger.info("Бренд: выбран пункт подсказки %r", chosen_brand)
+    else:
+        logger.warning(
+            "Бренд: подсказки не появились — оставляю введённый текст %r "
+            "(Escape не жму, он очищает поле)", data.brand,
+        )
     await _pause()
 
     # Цвет — комбобокс
@@ -1183,18 +1525,22 @@ async def _step_fill_address(page: Any, full_address: str) -> None:
         await asyncio.sleep(0.4)
         await page.keyboard.type(full_address, delay=random.randint(80, 140))
 
-        # Ждём появления саджеста
+        # Ждём появления контейнера саджеста
         if not await _selector_visible(page, psel.GEO_SUGGEST, GEO_SUGGEST_TIMEOUT_MS):
             logger.warning("Гео-саджест не появился (попытка %d)", attempt)
             await asyncio.sleep(1.0)
             continue
 
-        # Клик по первому пункту саджеста
-        try:
-            await page.locator(psel.GEO_SUGGEST).first.click(timeout=5_000)
-        except Exception as exc:
-            logger.warning("Клик по пункту саджеста не удался (попытка %d): %s", attempt, exc)
+        # Клик по ПЕРВОМУ реальному пункту-адресу (button custom-option(N)).
+        # ВАЖНО (разведка 2026-06-28): раньше кликали контейнер geo/field/suggest —
+        # это не выбирало адрес, и он терялся при сохранении черновика.
+        chosen_addr = await _click_suggest_option(
+            page, psel.GEO_SUGGEST_OPTION, prefer_text=None, timeout_ms=5_000
+        )
+        if chosen_addr is None:
+            logger.warning("Гео: пункты-адреса (custom-option) не найдены (попытка %d)", attempt)
             continue
+        logger.info("Гео: выбран адрес %r", chosen_addr)
 
         # Контроль: hidden address и locationId непустые (даём React время)
         if await _wait_until(_address_applied, attempts=10, interval_s=0.5):
@@ -1218,6 +1564,28 @@ async def _step_save_draft(page: Any) -> str:
     объявление и списывает деньги — её НЕ кликать НИ ПРИ КАКИХ УСЛОВИЯХ.
     """
     url_before = page.url
+
+    # ── Диагностика: финальный снапшот + дамп ПЕРЕД кликом «Сохранить» ────
+    # Ключевой момент для гипотезы A: видим, сколько img ещё на blob: в момент
+    # нажатия кнопки. Любой сбой — только WARNING, публикация не прерывается.
+    try:
+        _d_dir: Optional[pathlib.Path] = getattr(page, "_photo_diag_dir", None)
+        _d_probe: Optional[dict] = getattr(page, "_photo_diag_probe", None)
+        if _d_dir is not None:
+            await _diag_snap_previews(page, "before_save_click", _d_dir)
+            try:
+                if hasattr(page, "screenshot"):
+                    await page.screenshot(
+                        path=str(_d_dir / "screenshot_before_save.png")
+                    )
+            except Exception as exc_ss:
+                logger.warning("Диагностика фото: скриншот before_save: %s", exc_ss)
+            if _d_probe is not None:
+                await _dump_photo_diag(page, _d_probe, "before_save", _d_dir)
+    except Exception as exc:
+        logger.warning("Диагностика фото: снапшот before_save не удался: %s", exc)
+    # ──────────────────────────────────────────────────────────────────────
+
     # Кнопка «Сохранить и выйти» появляется ТОЛЬКО после ввода данных (разведка
     # 2026-06-10): на пустой форме внизу «Выйти». Форма уже заполнена — ждём кнопку.
     if not await _selector_visible(page, psel.SAVE_AND_EXIT_BUTTON, WAIT_SELECTOR_TIMEOUT_MS):

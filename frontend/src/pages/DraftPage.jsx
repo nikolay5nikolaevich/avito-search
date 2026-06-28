@@ -654,6 +654,16 @@ function DraftPreviewCard({ draft, prepId, isOriginal, onRegenerated }) {
         </div>
       ) : null}
 
+      {/* Предупреждения: вариация фото не применилась — пользователь должен это
+          увидеть, а не получить «клон» под видом варианта (дефект №6 аудита) */}
+      {draft.warnings?.length > 0 ? (
+        <div className="draft-preview-warning" role="alert">
+          {draft.warnings.map((w, wi) => (
+            <p key={wi}>⚠ {w}</p>
+          ))}
+        </div>
+      ) : null}
+
       {/* Название */}
       <p className="draft-preview-title">{draft.title}</p>
 

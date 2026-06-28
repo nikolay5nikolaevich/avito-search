@@ -99,6 +99,45 @@ def _count_draft_dirs(base_dir: Path) -> int:
     )
 
 
+def _photo_for_draft(
+    draft_idx: int,
+    photo_idx: int,
+    raw_bytes: bytes,
+    src_suffix: str,
+    preset,
+) -> tuple[bytes, str, "str | None"]:
+    """Готовит байты одного фото для черновика.
+
+    Вариант №1 — точная копия оригинала с РОДНЫМ расширением (без пересжатия и
+    потери метаданных/ориентации/цвета), КРОМЕ HEIC/HEIF: их браузер предпросмотра
+    и форма Авито не покажут, поэтому №1 для HEIC конвертируется в JPEG нейтральным
+    пресетом (preset для №1 как раз нейтральный). Варианты №2..N — обработка
+    переданным пресетом.
+
+    Возвращает (байты, расширение_с_точкой, предупреждение|None). Предупреждение
+    задаётся ТОЛЬКО для №2..N, если обработка не изменила байты — значит вариация
+    не применилась (apply_preset молча вернул оригинал), и пользователь должен это
+    увидеть в превью, а не получить «клон» под видом варианта.
+    """
+    suffix = (src_suffix or "").lower()
+
+    if draft_idx == 1:
+        if suffix in (".heic", ".heif"):
+            # HEIC нельзя отдать как есть — конвертируем нейтральным пресетом в JPEG
+            converted = apply_preset(raw_bytes, preset)
+            return converted, output_ext_for(suffix), None
+        # JPEG/PNG/GIF/прочее web-совместимое — байт-в-байт копия оригинала
+        return raw_bytes, (suffix or ".jpg"), None
+
+    # Варианты №2..N — осмысленная обработка пресетом
+    processed = apply_preset(raw_bytes, preset)
+    out_ext = output_ext_for(suffix)
+    warning: "str | None" = None
+    if processed == raw_bytes:
+        warning = f"фото {photo_idx}: вариация не применилась — использован оригинал"
+    return processed, out_ext, warning
+
+
 # ---------------------------------------------------------------------------
 # Валидация формы подготовки
 # ---------------------------------------------------------------------------
@@ -287,34 +326,31 @@ async def run_prep_job(
             (d_dir / "title.txt").write_text(tv.title, encoding="utf-8")
             (d_dir / "text.txt").write_text(tv.description, encoding="utf-8")
 
-            # Применяем пресет ко всем фото черновика
-            notes_parts: list[str] = [tv.notes] if tv.notes else []
+            # Фото: №1 — точная копия оригинала, №2..N — обработка пресетом.
+            # Заметки текста (notes) и предупреждения о сбоях фото (warnings)
+            # храним раздельно: warnings выводятся отдельным заметным блоком в UI.
+            notes = tv.notes or ""
+            warnings: list[str] = []
             for j, (raw_bytes, src_photo) in enumerate(
                 zip(source_photo_bytes, copied_source_photos), start=1
             ):
-                ext = output_ext_for(src_photo.suffix)
-                out_path = d_photos_dir / f"photo_{j:02d}{ext}"
-                processed = apply_preset(raw_bytes, preset)
-                # Если apply_preset вернул оригинал (ошибка была), фиксируем в заметках
-                if processed == raw_bytes and draft_idx > 1:
-                    notes_parts.append(
-                        f"фото {j}: обработка не применилась — использован оригинал"
-                    )
+                out_bytes, out_ext, warn = _photo_for_draft(
+                    draft_idx, j, raw_bytes, src_photo.suffix, preset
+                )
+                if warn:
+                    warnings.append(warn)
                     logger.warning(
-                        "Подготовка %s, черновик %d, фото %d: "
-                        "apply_preset вернул оригинал (пресет %r)",
-                        prep_id,
-                        draft_idx,
-                        j,
-                        preset.name,
+                        "Подготовка %s, черновик %d: %s (пресет %r)",
+                        prep_id, draft_idx, warn, preset.name,
                     )
-                out_path.write_bytes(processed)
+                (d_photos_dir / f"photo_{j:02d}{out_ext}").write_bytes(out_bytes)
 
             # meta.json
             meta = {
                 "preset": preset.name,
                 "seed": seed,
-                "notes": "; ".join(notes_parts),
+                "notes": notes,
+                "warnings": warnings,
             }
             (d_dir / "meta.json").write_text(
                 json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -418,31 +454,28 @@ def regenerate_draft(prep_dir: Path, draft_index: int) -> dict:
     (d_dir / "title.txt").write_text(tv.title, encoding="utf-8")
     (d_dir / "text.txt").write_text(tv.description, encoding="utf-8")
 
-    # Перезаписываем фото
-    notes_parts: list[str] = [tv.notes] if tv.notes else []
+    # Перезаписываем фото (draft_index всегда >= 2 — обработка пресетом)
+    notes = tv.notes or ""
+    warnings: list[str] = []
     for j, src_photo in enumerate(source_photo_paths, start=1):
         raw_bytes = src_photo.read_bytes()
-        ext = output_ext_for(src_photo.suffix)
-        out_path = d_photos_dir / f"photo_{j:02d}{ext}"
-        processed = apply_preset(raw_bytes, preset)
-        if processed == raw_bytes:
-            notes_parts.append(
-                f"фото {j}: обработка не применилась — использован оригинал"
-            )
+        out_bytes, out_ext, warn = _photo_for_draft(
+            draft_index, j, raw_bytes, src_photo.suffix, preset
+        )
+        if warn:
+            warnings.append(warn)
             logger.warning(
-                "Перегенерация черновика %d, фото %d: "
-                "apply_preset вернул оригинал (пресет %r)",
-                draft_index,
-                j,
-                preset.name,
+                "Перегенерация черновика %d: %s (пресет %r)",
+                draft_index, warn, preset.name,
             )
-        out_path.write_bytes(processed)
+        (d_photos_dir / f"photo_{j:02d}{out_ext}").write_bytes(out_bytes)
 
     # Перезаписываем meta.json
     meta = {
         "preset": preset.name,
         "seed": new_seed,
-        "notes": "; ".join(notes_parts),
+        "notes": notes,
+        "warnings": warnings,
     }
     (d_dir / "meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -506,6 +539,10 @@ def _build_card(prep_id: str, draft_index: int, d_dir: Path) -> dict:
         for j in range(1, len(photo_files) + 1)
     ]
 
+    warnings = meta.get("warnings", [])
+    if not isinstance(warnings, list):
+        warnings = []
+
     return {
         "index": draft_index,
         "title": title,
@@ -513,6 +550,7 @@ def _build_card(prep_id: str, draft_index: int, d_dir: Path) -> dict:
         "preset_name": meta.get("preset", ""),
         "photo_urls": photo_urls,
         "notes": meta.get("notes", ""),
+        "warnings": warnings,
     }
 
 
@@ -660,7 +698,24 @@ if __name__ == "__main__":
             f"Карточка 1 description изменилась"
         )
 
-        print("[OK] Тест 6: run_prep_job + build_result — структура и содержимое верны")
+        # Все карточки несут поле warnings (список, обычно пустой)
+        for _c in _cards:
+            assert "warnings" in _c, f"Карточка без поля warnings: {_c}"
+            assert isinstance(_c["warnings"], list), f"warnings не список: {_c}"
+
+        # Фото варианта №1 — точная байт-в-байт копия исходника (дефект №1)
+        _src_photo1 = sorted((_base / "source" / "photos").iterdir())[0].read_bytes()
+        _draft1_photo1 = sorted((_base / "draft_01" / "photos").iterdir())[0].read_bytes()
+        assert _draft1_photo1 == _src_photo1, (
+            "Фото варианта №1 не равно исходнику — №1 должен быть точной копией"
+        )
+        # Фото варианта №2 — обработано, отличается от исходника
+        _draft2_photo1 = sorted((_base / "draft_02" / "photos").iterdir())[0].read_bytes()
+        assert _draft2_photo1 != _src_photo1, (
+            "Фото варианта №2 совпало с исходником — вариация не применилась"
+        )
+
+        print("[OK] Тест 6: run_prep_job + build_result — структура, копия №1, warnings")
 
         # ── Тест 7: regenerate_draft — изменение черновика 2 ─────────────────
         # Запоминаем байты до перегенерации
@@ -761,6 +816,42 @@ if __name__ == "__main__":
     finally:
         _pv._HEIF_REGISTERED = _saved_flag
     print("[OK] Тест 10: HEIC без pillow-heif → ошибка валидации с подсказкой")
+
+    # ── Тест 11: сбой обработки фото варианта 2..N → warnings непуст, статус done ──
+    with tempfile.TemporaryDirectory() as _tmpdir3:
+        _base3 = Path(_tmpdir3) / "prep_warn001"
+        _base3.mkdir()
+        _bad_dir = Path(_tmpdir3) / "bad_input"
+        _bad_dir.mkdir()
+        # «Битый» исходник: расширение .jpg, но байты не являются изображением.
+        # apply_preset не сможет открыть → молча вернёт оригинал → для №2 это сбой.
+        _bad_photo = _bad_dir / "broken.jpg"
+        _bad_photo.write_bytes(b"this is definitely not a valid image file")
+
+        _job3: dict = {}
+        asyncio.run(run_prep_job(
+            "warn001",
+            _job3,
+            title="Тест",
+            description="Описание",
+            source_photos=[_bad_photo],
+            drafts_count=2,
+            facts={},
+            base_dir=_base3,
+        ))
+        assert _job3.get("status") == "done", (
+            f"Тест 11: ожидали status=done (graceful), получили {_job3}"
+        )
+        _cards3 = build_result(_base3, 2)
+        # №1 — копия исходника (битые байты копируются как есть), warnings пуст
+        assert _cards3[0]["warnings"] == [], (
+            f"Тест 11: №1 — копия, warnings должен быть пуст: {_cards3[0]['warnings']}"
+        )
+        # №2 — обработка сорвалась на битом файле → warnings непуст
+        assert _cards3[1]["warnings"], (
+            f"Тест 11: №2 на битом фото должен иметь warnings: {_cards3[1]}"
+        )
+    print("[OK] Тест 11: сбой обработки фото варианта 2 → warnings непуст, статус done")
 
     print("\n=== Все самотесты preparation.py пройдены ===")
     sys.exit(0)

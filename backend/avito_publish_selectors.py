@@ -75,8 +75,13 @@ TITLE_INPUT = "input[name='title']"
 # кликов не нужно. accept: gif/png/jpeg/pjpeg/heic. Лимит формы: 10.
 PHOTO_INPUT = "[data-marker='add/input']"
 
-# Бренд: текстовый input с автокомплитом; достаточно ввести текст.
+# Бренд: текстовый input с автокомплитом.
+# ВАЖНО (живая разведка 2026-06-28): просто текста НЕДОСТАТОЧНО — бренд сохраняется
+# только при КЛИКЕ пункта подсказки. Клавиша Escape ОЧИЩАЕТ поле (проверено), поэтому
+# закрывать список через Escape нельзя — нужно выбрать пункт BRAND_OPTION ниже.
 BRAND_INPUT = "[data-marker='params[115634]/input']"
+# Пункты выпадашки бренда — <p data-marker='params[115634]/option'> (текст = название бренда).
+BRAND_OPTION = "[data-marker='params[115634]/option']"
 
 # Описание: rich-editor (contenteditable). НЕ .fill() — кликнуть и вводить
 # с клавиатуры. Контроль: hidden input[name='description_html'] непустой.
@@ -88,9 +93,15 @@ PRICE_INPUT = "input[data-marker='price']"
 PRICE_INPUT_FALLBACK = "[data-marker='price'] input"  # если маркер на обёртке
 
 # Адрес: текстовый input с гео-саджестом. Вводить посимвольно с задержкой,
-# ждать саджест, кликнуть первый пункт. Контроль: hidden address/locationId.
+# ждать саджест, кликнуть первый РЕАЛЬНЫЙ пункт-адрес. Контроль: hidden address/locationId.
 GEO_SEARCH_INPUT = "[data-marker='geo/search-input']"
+# GEO_SUGGEST — это КОНТЕЙНЕР выпадашки (обёртка), кликать его бесполезно:
+# адрес не выберется. Используем для ожидания появления подсказок.
 GEO_SUGGEST = "[data-marker='geo/field/suggest']"
+# Реальные пункты-адреса — кнопки <button data-marker='geo/.../custom-option(N)'>
+# (живая разведка 2026-06-28: 'geo/undefined/custom-option(0)' = «Тверская улица, 7, Москва»).
+# Кликать нужно ИХ, а не контейнер GEO_SUGGEST.
+GEO_SUGGEST_OPTION = "button[data-marker*='/custom-option(']"
 ADDRESS_HIDDEN = "input[name='address']"
 LOCATION_ID_HIDDEN = "input[name='locationId']"
 

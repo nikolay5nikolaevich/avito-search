@@ -14,8 +14,10 @@ mirror/flip в Preset отсутствуют намеренно.
 HEIC: поддерживается через pillow-heif (ленивая регистрация, heif_available());
 без плагина валидация форм отклоняет HEIC заранее.
 
-Каждый пресет (кроме №1-оригинала) гарантированно содержит геометрию
-(зум/отдаление/поворот) + тон (яркость/контраст/насыщенность/температура).
+Каждый пресет (кроме №1-оригинала) гарантированно содержит зум-приближение
+(zoom_pct >= 15.0%, заметно глазом) + тон (яркость/контраст/насыщенность/температура).
+Отдаление в build_presets не используется (оно поддерживается _apply_zoom,
+но недоступно через дефолтный пул).
 """
 
 import io
@@ -55,11 +57,19 @@ def heif_available() -> bool:
 
 
 def output_ext_for(src_ext: str) -> str:
-    """Расширение файла-результата обработки: HEIC/HEIF пересохраняются в JPEG."""
+    """Расширение файла-результата обработки.
+
+    apply_preset сохраняет PNG как PNG, а ВСЁ остальное (JPEG, GIF, HEIC/HEIF,
+    bmp, webp…) — как JPEG. Значит из любого не-PNG формата на выходе всегда
+    .jpg, иначе байты JPEG лягут в файл с чужим расширением (например .gif) и
+    Content-Type по расширению будет врать.
+    """
     ext = (src_ext or "").lower()
-    if ext in (".heic", ".heif"):
-        return ".jpg"
-    return ext or ".jpg"
+    if ext == ".png":
+        return ".png"
+    if ext in (".jpg", ".jpeg"):
+        return ext
+    return ".jpg"
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +88,7 @@ class Preset:
     """
 
     name: str                 # Человекочитаемо, по-русски: "зум 4% + теплее"
-    zoom_pct: float = 0.0     # 0, +2..6 — кроп (приближение); -2..-4 — отдаление
+    zoom_pct: float = 0.0     # 0, +15..25 — кроп (приближение); отрицательные — отдаление
     rotate_deg: float = 0.0   # 0 или ±1..2 — с обрезкой полей (без чёрных углов)
     brightness: float = 1.0   # 0.92..1.08
     contrast: float = 1.0     # 0.92..1.08
@@ -94,7 +104,16 @@ class Preset:
 
 # Возможные значения для выборки (не включают нейтральные «дефолтные» значения,
 # кроме случаев, где нейтральное значение — тоже осмысленный вариант)
-_ZOOM_VALUES: list[float] = [-4.0, -3.0, -2.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+
+# Зум-приближение: шаг 1%, диапазон 15..25 — 11 значений, хватает для N=2..10
+# (нужно n-1 <= 9 попарно различных шагов). Минимум 15% = центральный кроп 7.5%
+# со стороны — приближение видно глазом.
+# ВНИМАНИЕ: кроп берётся строго из центра и НЕ знает, где находится товар. Если
+# предмет/бирка/деталь снят близко к краю кадра, при 15..25% его край будет
+# срезан. Целостность товара алгоритмом НЕ гарантируется — это осознанный размен
+# на заметность приближения (решение пользователя 2026-06-20).
+# (отдаление из дефолтного пула убрано; _apply_zoom его по-прежнему поддерживает)
+_ZOOM_IN_VALUES: list[float] = [15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0, 25.0]
 _ROTATE_VALUES: list[float] = [-2.0, -1.5, -1.0, 1.0, 1.5, 2.0]
 _BRIGHTNESS_VALUES: list[float] = [0.93, 0.95, 0.97, 1.03, 1.05, 1.07]
 _CONTRAST_VALUES: list[float] = [0.93, 0.95, 0.97, 1.03, 1.05, 1.07]
@@ -169,15 +188,10 @@ def build_presets(n: int, seed: Optional[int] = None) -> list[Preset]:
     # Ключ уникальности — кортеж числовых параметров (без name)
     seen_keys: set[tuple] = {_preset_key(presets[0])}
 
-    # Гарантия заметности: каждый пресет обязан содержать минимум одно
-    # ГЕОМЕТРИЧЕСКОЕ семейство (зум/отдаление или поворот) и минимум одно
-    # ТОНАЛЬНОЕ (яркость/контраст/насыщенность/температура); шум и
-    # jpeg-качество — только необязательная добавка. Иначе вариант может
-    # быть визуально неотличим от оригинала.
-    geometry_families = [
-        ("zoom",        "zoom_pct",    _ZOOM_VALUES),
-        ("rotate",      "rotate_deg",  _ROTATE_VALUES),
-    ]
+    # Гарантия заметности: каждый пресет обязан содержать зум-приближение
+    # (из _ZOOM_IN_VALUES, детерминировано по seed) и минимум одно
+    # ТОНАЛЬНОЕ семейство (яркость/контраст/насыщенность/температура).
+    # Поворот, шум, jpeg-качество — опциональные добавки.
     tone_families = [
         ("brightness",  "brightness",  _BRIGHTNESS_VALUES),
         ("contrast",    "contrast",    _CONTRAST_VALUES),
@@ -189,45 +203,64 @@ def build_presets(n: int, seed: Optional[int] = None) -> list[Preset]:
         ("quality",     "jpeg_quality",_QUALITY_VALUES),
     ]
 
+    # --- Распределение шагов зума: перемешиваем пул и берём первые (n-1) значений.
+    # При n-1 <= 13 (n <= 10, пул = 13 значений) шаги гарантированно попарно различны.
+    zoom_pool = list(_ZOOM_IN_VALUES)
+    rng.shuffle(zoom_pool)
+    # zoom_steps[i] — шаг зума для пресета (i+2), i = 0..n-2
+    zoom_steps = zoom_pool[: n - 1]
+
     max_attempts = 200
     attempts = 0
+    preset_index = 0  # индекс в zoom_steps для текущего пресета
 
     while len(presets) < n and attempts < max_attempts:
         attempts += 1
 
-        # 1 геометрическое + 1 тональное (+ иногда 1 добавка) = 2–3 семейства
-        chosen = [rng.choice(geometry_families), rng.choice(tone_families)]
-        if rng.random() < 0.5:
-            chosen.append(rng.choice(extra_families))
+        # Обязательный зум-in берётся детерминированно из перемешанного пула.
+        # Остальные добавки (поворот, тон, extras) — случайные.
+        zoom_val = zoom_steps[preset_index % len(zoom_steps)]
 
-        kwargs: dict = {}
-        name_parts: list[str] = []
+        # 1 обязательное тональное семейство
+        tone_fam = rng.choice(tone_families)
 
-        for fam_name, field_name, values in chosen:
+        # Опциональные добавки
+        extra_fams: list = []
+        # Поворот — иногда добавляем (0/1 штука)
+        if rng.random() < 0.4:
+            extra_fams.append(("rotate", "rotate_deg", _ROTATE_VALUES))
+        # Шум / jpeg-качество — иногда добавляем (0/1 штука)
+        if rng.random() < 0.4:
+            extra_fams.append(rng.choice(extra_families))
+
+        kwargs: dict = {"zoom_pct": zoom_val}
+        name_parts: list[str] = [f"зум {zoom_val:.1f}%"]
+
+        # Тональное семейство
+        tone_name, tone_field, tone_values = tone_fam
+        tone_val = rng.choice(tone_values)
+        kwargs[tone_field] = tone_val
+
+        if tone_field == "brightness":
+            label = "ярче" if tone_val >= 1.0 else "темнее"
+            name_parts.append(f"{label} {abs(tone_val - 1.0) * 100:.0f}%")
+        elif tone_field == "contrast":
+            label = "контраст+" if tone_val >= 1.0 else "контраст-"
+            name_parts.append(f"{label}{abs(tone_val - 1.0) * 100:.0f}%")
+        elif tone_field == "saturation":
+            label = "насыщ+" if tone_val >= 1.0 else "насыщ-"
+            name_parts.append(f"{label}{abs(tone_val - 1.0) * 100:.0f}%")
+        elif tone_field == "temp_shift":
+            label = "теплее" if tone_val > 0 else "холоднее"
+            name_parts.append(f"{label} {abs(tone_val)}")
+
+        # Опциональные добавки
+        for fam_name, field_name, values in extra_fams:
             val = rng.choice(values)
             kwargs[field_name] = val
-
-            # Человекочитаемая часть названия
-            if field_name == "zoom_pct":
-                if val > 0:
-                    name_parts.append(f"зум {int(val)}%")
-                else:
-                    name_parts.append(f"отдаление {int(abs(val))}%")
-            elif field_name == "rotate_deg":
+            if field_name == "rotate_deg":
                 sign = "+" if val > 0 else ""
                 name_parts.append(f"поворот {sign}{val:.1f}°")
-            elif field_name == "brightness":
-                label = "ярче" if val >= 1.0 else "темнее"
-                name_parts.append(f"{label} {abs(val - 1.0) * 100:.0f}%")
-            elif field_name == "contrast":
-                label = "контраст+" if val >= 1.0 else "контраст-"
-                name_parts.append(f"{label}{abs(val - 1.0) * 100:.0f}%")
-            elif field_name == "saturation":
-                label = "насыщ+" if val >= 1.0 else "насыщ-"
-                name_parts.append(f"{label}{abs(val - 1.0) * 100:.0f}%")
-            elif field_name == "temp_shift":
-                label = "теплее" if val > 0 else "холоднее"
-                name_parts.append(f"{label} {abs(val)}")
             elif field_name == "noise_alpha":
                 name_parts.append(f"шум {val:.2f}")
             elif field_name == "jpeg_quality":
@@ -240,6 +273,7 @@ def build_presets(n: int, seed: Optional[int] = None) -> list[Preset]:
         if key not in seen_keys:
             seen_keys.add(key)
             presets.append(preset)
+            preset_index += 1
 
     if len(presets) < n:
         logger.warning(
@@ -298,7 +332,7 @@ def apply_preset(image_bytes: bytes, preset: Preset) -> bytes:
 def _apply_preset_impl(image_bytes: bytes, preset: Preset) -> bytes:
     """Внутренняя реализация apply_preset (может бросать исключения)."""
     heif_available()  # ленивая регистрация HEIF-опенера до Image.open
-    from PIL import Image, ImageEnhance  # импорт внутри — не требуется на уровне модуля
+    from PIL import Image, ImageEnhance, ImageOps  # импорт внутри — не требуется на уровне модуля
 
     # Определяем формат из заголовка байтов
     src_buf = io.BytesIO(image_bytes)
@@ -314,15 +348,29 @@ def _apply_preset_impl(image_bytes: bytes, preset: Preset) -> bytes:
         )
         return image_bytes
 
+    # ICC-профиль (цветовое пространство, напр. Display P3) захватываем СЕЙЧАС:
+    # ниже Image.new(...) стирает img.info, и без переноса цвета «уплыли» бы в sRGB.
+    icc_profile: Optional[bytes] = img.info.get("icc_profile")
+
     fmt = (img.format or "JPEG").upper()
     # Нормируем JPEG-алиасы
     if fmt in ("JPG", "JPEG", "MPO"):
         fmt = "JPEG"
 
+    # EXIF-ориентация: телефоны хранят пиксели горизонтально + тег поворота.
+    # Мы удаляем EXIF ниже, поэтому ориентацию нужно «впечь» в пиксели заранее,
+    # иначе портретные фото окажутся боком. Сбой EXIF не должен ронять вариацию.
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception as exc:
+        logger.warning("apply_preset: не удалось применить EXIF-ориентацию (%s)", exc)
+
     # CMYK → RGB (JPEG может быть CMYK)
     if img.mode == "CMYK":
         logger.debug("apply_preset: конвертируем CMYK → RGB")
         img = img.convert("RGB")
+        # CMYK-профиль описывает другое пространство — на RGB-выход он не годится.
+        icc_profile = None
     elif img.mode == "P":
         # Палитровые изображения: ImageEnhance не поддерживает P-mode.
         # P с прозрачностью (transparency) → RGBA, иначе → RGB.
@@ -367,21 +415,25 @@ def _apply_preset_impl(image_bytes: bytes, preset: Preset) -> bytes:
         img = _apply_noise(img, preset.noise_alpha)
 
     # --- Сохранение в байты ---
+    # icc_profile=None означает «без профиля» — Pillow это принимает, поэтому
+    # передаём безусловно (для CMYK выше уже сброшен в None).
     out_buf = io.BytesIO()
     if fmt == "JPEG":
         # PNG с прозрачностью → нельзя сохранить как JPEG
         if img.mode in ("RGBA", "P"):
             img = img.convert("RGB")
-        img.save(out_buf, format="JPEG", quality=preset.jpeg_quality, exif=b"")
+        img.save(out_buf, format="JPEG", quality=preset.jpeg_quality, exif=b"",
+                 icc_profile=icc_profile)
     elif fmt == "PNG":
         if img.mode == "P":
             img = img.convert("RGBA")
-        img.save(out_buf, format="PNG", optimize=True)
+        img.save(out_buf, format="PNG", optimize=True, icc_profile=icc_profile)
     else:
         # Для прочих форматов — сохраняем как JPEG
         if img.mode in ("RGBA", "P"):
             img = img.convert("RGB")
-        img.save(out_buf, format="JPEG", quality=preset.jpeg_quality, exif=b"")
+        img.save(out_buf, format="JPEG", quality=preset.jpeg_quality, exif=b"",
+                 icc_profile=icc_profile)
 
     return out_buf.getvalue()
 
@@ -733,26 +785,35 @@ if __name__ == "__main__":
         )
     print("[OK] Тест 12: JPEG 1×1 — не падает, размер ≥ 1×1 для всех пресетов")
 
-    # ── Тест 13: каждый пресет 2..N содержит геометрию И тон ─────────────────
+    # ── Тест 13: каждый пресет 2..N содержит зум-приближение (>=15%) И тон ────
     for _seed in (1, 7, 42, 99):
         _ps = build_presets(10, seed=_seed)
         for _i, _p in enumerate(_ps[1:], start=2):
-            _has_geometry = _p.zoom_pct != 0.0 or _p.rotate_deg != 0.0
+            assert _p.zoom_pct >= 15.0, (
+                f"seed={_seed}, пресет {_i} ({_p.name!r}): зум {_p.zoom_pct} < 15.0 "
+                f"— нет заметного приближения"
+            )
             _has_tone = (
                 _p.brightness != 1.0 or _p.contrast != 1.0
                 or _p.saturation != 1.0 or _p.temp_shift != 0
-            )
-            assert _has_geometry, (
-                f"seed={_seed}, пресет {_i} ({_p.name!r}): нет геометрии "
-                f"(зум/отдаление/поворот)"
             )
             assert _has_tone, (
                 f"seed={_seed}, пресет {_i} ({_p.name!r}): нет тона "
                 f"(яркость/контраст/насыщенность/температура)"
             )
-    print("[OK] Тест 13: пресеты 2..10 всегда содержат геометрию + тон (4 seed)")
+    print("[OK] Тест 13: пресеты 2..10 всегда zoom_pct >= 15.0 + тон (4 seed)")
 
-    # ── Тест 14: отдаление (zoom_pct < 0) — размер сохранён, байты изменены ──
+    # ── Тест 13б: шаги зума у пресетов 2..N попарно различны (n=2..10) ───────
+    for _n in range(2, 11):
+        for _seed in (1, 7, 42, 99):
+            _ps = build_presets(_n, seed=_seed)
+            _zooms = [_p.zoom_pct for _p in _ps[1:]]
+            assert len(_zooms) == len(set(_zooms)), (
+                f"build_presets({_n}, seed={_seed}): шаги зума не попарно различны: {_zooms}"
+            )
+    print("[OK] Тест 13б: шаги зума у пресетов 2..N попарно различны (n=2..10, 4 seed)")
+
+    # ── Тест 14: unit-тест _apply_zoom с отдалением (-4%) — код работает ──────
     def _make_gradient_jpeg(w: int, h: int) -> bytes:
         img = Image.new("RGB", (w, h))
         px = img.load()
@@ -770,7 +831,7 @@ if __name__ == "__main__":
     _out = Image.open(io.BytesIO(_res))
     _out.load()
     assert _out.size == (120, 90), f"Отдаление: размер {_out.size}, ожидали (120, 90)"
-    print("[OK] Тест 14: отдаление -4% — размер сохранён, изображение изменено")
+    print("[OK] Тест 14: _apply_zoom(-4%) — код отдаления работает, размер сохранён")
 
     # ── Тест 15: HEIC через pillow-heif (если установлен) ────────────────────
     if heif_available():
@@ -792,6 +853,64 @@ if __name__ == "__main__":
         print("[OK] Тест 15: HEIC открывается, выход JPEG, output_ext_for верен")
     else:
         print("[SKIP] Тест 15: pillow-heif не установлен — HEIC отклоняется валидацией")
+
+    # ── Тест 16: output_ext_for — gif/прочее → .jpg, png/jpeg сохраняются ─────
+    assert output_ext_for(".gif") == ".jpg", "output_ext_for('.gif') должно быть '.jpg'"
+    assert output_ext_for(".GIF") == ".jpg", "output_ext_for('.GIF') должно быть '.jpg'"
+    assert output_ext_for(".bmp") == ".jpg", "output_ext_for('.bmp') должно быть '.jpg'"
+    assert output_ext_for(".webp") == ".jpg", "output_ext_for('.webp') должно быть '.jpg'"
+    assert output_ext_for(".png") == ".png", "output_ext_for('.png') должно быть '.png'"
+    assert output_ext_for(".jpg") == ".jpg", "output_ext_for('.jpg') должно быть '.jpg'"
+    assert output_ext_for(".jpeg") == ".jpeg", "output_ext_for('.jpeg') должно быть '.jpeg'"
+    print("[OK] Тест 16: output_ext_for — gif/bmp/webp → .jpg, png/jpeg сохраняются")
+
+    # ── Тест 17: EXIF Orientation применяется (портретное фото не ляжет боком) ─
+    # Готовим «широкий» кадр 100×40 и помечаем его EXIF Orientation=6 (поворот
+    # на 90° по часовой). При корректной обработке пиксели повернутся → выход
+    # станет «портретным» (высота > ширины), размеры поменяются местами.
+    _land = Image.new("RGB", (100, 40), color=(70, 130, 180))
+    _exif = Image.Exif()
+    _exif[0x0112] = 6  # тег Orientation = 6
+    _exif_buf = io.BytesIO()
+    _land.save(_exif_buf, format="JPEG", quality=92, exif=_exif)
+    _exif_bytes = _exif_buf.getvalue()
+    # Подтверждаем, что входной кадр действительно «широкий» и с тегом
+    _in17 = Image.open(io.BytesIO(_exif_bytes))
+    assert _in17.size == (100, 40), f"Тест 17: входной размер {_in17.size}, ожидали (100, 40)"
+    _res17 = apply_preset(_exif_bytes, Preset(name="нейтральный"))
+    _out17 = Image.open(io.BytesIO(_res17))
+    _out17.load()
+    assert _out17.size == (40, 100), (
+        f"Тест 17: после применения ориентации ожидали (40, 100), получили {_out17.size} "
+        f"— exif_transpose не сработал, портретные фото лягут боком"
+    )
+    print("[OK] Тест 17: EXIF Orientation применяется — кадр повёрнут (100×40 → 40×100)")
+
+    # ── Тест 18: ICC-профиль сохраняется (цвета не уплывают) ──────────────────
+    # Берём произвольный непустой ICC и кладём в JPEG. После обработки профиль
+    # должен присутствовать в info результата.
+    try:
+        from PIL import ImageCms
+        _srgb = ImageCms.createProfile("sRGB")
+        _icc_bytes = ImageCms.ImageCmsProfile(_srgb).tobytes()
+    except Exception:
+        _icc_bytes = None
+
+    if _icc_bytes:
+        _icc_src = Image.new("RGB", (80, 60), color=(120, 90, 60))
+        _icc_buf = io.BytesIO()
+        _icc_src.save(_icc_buf, format="JPEG", quality=92, icc_profile=_icc_bytes)
+        _icc_in = _icc_buf.getvalue()
+        # Профиль с зумом — самый «опасный» путь (пересоздание через Image.new)
+        _res18 = apply_preset(_icc_in, Preset(name="зум+тон", zoom_pct=16.0, brightness=1.05))
+        _out18 = Image.open(io.BytesIO(_res18))
+        _out18.load()
+        assert _out18.info.get("icc_profile"), (
+            "Тест 18: ICC-профиль потерян после обработки — цвета Display P3 уплывут в sRGB"
+        )
+        print("[OK] Тест 18: ICC-профиль сохраняется после обработки (зум+тон)")
+    else:
+        print("[SKIP] Тест 18: ImageCms недоступен — пропускаем проверку ICC")
 
     print("\nВсе самотесты пройдены успешно.")
     sys.exit(0)

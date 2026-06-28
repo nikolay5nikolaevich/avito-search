@@ -2215,3 +2215,25 @@ button {
   border-top: 1px solid var(--hairline-soft);
   padding-top: 0.6rem;
 }
+
+/* Предупреждение: вариация фото не применилась (использован оригинал) */
+.draft-preview-warning {
+  margin-top: 0.75rem;
+  border: 1px solid rgba(255, 178, 90, 0.32);
+  border-radius: 1.1rem;
+  background: rgba(40, 26, 6, 0.55);
+  padding: 0.75rem 1rem;
+}
+
+.draft-preview-warning p {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  letter-spacing: 0.03em;
+  line-height: 1.5;
+  color: rgba(255, 206, 140, 0.95);
+}
+
+.draft-preview-warning p + p {
+  margin-top: 0.3rem;
+}

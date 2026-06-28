@@ -253,7 +253,7 @@ def run_prepare_smoke_test() -> None:
 
     # ── Проверка 4: каждый черновик имеет обязательные ключи и 2 photo_urls ──
     print("Шаг 4: структура карточек черновиков")
-    required_keys = {"title", "description", "preset_name", "notes", "photo_urls"}
+    required_keys = {"title", "description", "preset_name", "notes", "photo_urls", "warnings"}
     for i, draft in enumerate(drafts, start=1):
         missing = required_keys - set(draft.keys())
         assert not missing, (
@@ -310,8 +310,13 @@ def run_prepare_smoke_test() -> None:
         f"Content-Type фото должен начинаться с 'image/', получили: {ct!r}"
     )
     assert len(photo_bytes) > 0, "Тело фото пустое"
+    # Фото варианта №1 — точная копия загруженного оригинала (дефект №1 аудита)
+    assert photo_bytes == png1, (
+        "Фото черновика №1 не равно загруженному оригиналу — №1 должен быть точной "
+        f"копией (исходник {len(png1)} байт, получено {len(photo_bytes)} байт)"
+    )
     checks_passed += 1
-    print(f"  Проверка 7 PASS: GET фото → 200, Content-Type={ct!r}, {len(photo_bytes)} байт")
+    print(f"  Проверка 7 PASS: GET фото → 200, Content-Type={ct!r}, {len(photo_bytes)} байт, №1 == оригинал")
 
     # ── Проверка 8: POST regenerate (draft 2) → описание И/ИЛИ байты фото изменились ──
     print("Шаг 8: POST regenerate (черновик 2)")
