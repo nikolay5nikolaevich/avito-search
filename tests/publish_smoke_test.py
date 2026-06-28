@@ -302,6 +302,7 @@ NEGATIVE_CASES: list[tuple[str, dict[str, str], int, str]] = [
     ("drafts_count=0", {"drafts_count": "0"}, 1, "drafts_count"),
     ("drafts_count=11", {"drafts_count": "11"}, 1, "drafts_count"),
     ("drafts_count='abc'", {"drafts_count": "abc"}, 1, "drafts_count"),
+    ("размер одежды при category=sneakers", {"category": "sneakers"}, 1, "size"),
 ]
 
 
@@ -894,6 +895,19 @@ def run_publish_smoke_test() -> None:
     app_module.PUBLISH_JOBS.pop(auto2_job_id, None)
     checks_passed += 1
     print("  Проверка 26 PASS: авто-подготовка очищена после успешной заливки")
+
+    # ── Шаг 23: GET /api/publish/categories → 200, обе категории ─────────────
+    print("Шаг 23: GET /api/publish/categories → 200, обе категории с непустыми sizes")
+    sc, body, _ = _get("/api/publish/categories")
+    assert sc == 200, f"/api/publish/categories вернул {sc}"
+    cats = {c["key"]: c for c in json.loads(body)["categories"]}
+    assert {"jackets", "sneakers"} <= set(cats), cats
+    assert cats["jackets"]["sizes"] and cats["sneakers"]["sizes"], (
+        f"sizes не должны быть пустыми: jackets={cats['jackets']['sizes']!r}, "
+        f"sneakers={cats['sneakers']['sizes']!r}"
+    )
+    checks_passed += 1
+    print("[OK] /api/publish/categories: обе категории")
 
     print(f"\n=== PUBLISH SMOKE TEST: OK: {checks_passed} проверок ===")
 
