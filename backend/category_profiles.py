@@ -125,11 +125,17 @@ JACKETS = CategoryProfile(
 )
 
 # --- «Кроссовки» (Мужская обувь) ---
-# ПЛЕЙСХОЛДЕРЫ до разведки (Task 1/8). Реальные option_id — из debug/sneakers_map.txt.
-SNEAKERS_VERIFIED = False
+# Значения подтверждены разведкой HTML-дампа 2026-06-29.
+# Вид объявления, Состояние, Цвет, Бренд — те же ID, что у пиджаков; общие словари.
+SNEAKERS_VERIFIED = True
 _SNEAKERS_SIZE_OPTIONS: dict[str, int] = {
-    # TODO(recon): заменить на реальные пары «размер → option_id» из sneakers_map.txt
-    "41": -41, "42": -42, "43": -43, "44": -44, "45": -45, "46": -46,
+    "36": 1211551, "36,5": 1211552, "37": 1211553, "37,5": 1211554,
+    "38": 1211555, "38,5": 1211556, "39": 1211557, "39,5": 1211558,
+    "40": 1211559, "40,5": 1211560, "41": 1211561, "41,5": 1211562,
+    "42": 1211563, "42,5": 1211564, "43": 1211565, "43,5": 1211566,
+    "44": 1211567, "44,5": 1211568, "45": 1211569, "45,5": 1211570,
+    "46": 1211571, "46,5": 1211572, "47": 1211573, "47,5": 1211574,
+    "48+": 1211575,
 }
 
 SNEAKERS = CategoryProfile(
@@ -137,12 +143,12 @@ SNEAKERS = CategoryProfile(
     label="Кроссовки",
     full_path=("Личные вещи", "Одежда, обувь, аксессуары", "Мужская обувь", "Кроссовки"),
     category_title_text="Кроссовки",
-    expected_category={},  # TODO(recon): hidden-ID из sneakers_map.txt; пусто → проверка по крошке
+    expected_category={"category_id": "27", "params[175]": "2804317", "params[118631]": "2262814"},
     size_options=_SNEAKERS_SIZE_OPTIONS,
     color_options=_COLOR_OPTIONS,
     trade_type_options=_TRADE_TYPE_OPTIONS,
     condition_options=_CONDITION_OPTIONS,
-    size_prefix="razmer",  # TODO(recon): подтвердить префикс комбобокса размера обуви
+    size_prefix="razmer_muzhskaya_obuv",
     color_prefix="cvet",
     trade_type_prefix="type_of_trade",
     condition_param=_CONDITION_PARAM,
@@ -185,9 +191,13 @@ if __name__ == "__main__":
     assert JACKETS.brand_option == "[data-marker='params[115634]/option']"
     print("[OK] JACKETS: исторические значения сохранены")
 
-    # SNEAKERS: путь и крошка известны; пометка о неподтверждённости
+    # SNEAKERS: путь, категория и размеры подтверждены разведкой 2026-06-29
     assert SNEAKERS.full_path[-1] == "Кроссовки" == SNEAKERS.category_title_text
-    assert SNEAKERS_VERIFIED is False  # снимется в Task 8 после разведки
-    print("[OK] SNEAKERS: путь известен, помечен как неподтверждённый")
+    assert SNEAKERS_VERIFIED is True
+    assert all(v > 0 for v in SNEAKERS.size_options.values()), "остались плейсхолдеры размеров"
+    assert len(SNEAKERS.size_options) == 25, f"ожидали 25 размеров, получили {len(SNEAKERS.size_options)}"
+    assert SNEAKERS.expected_category, "expected_category у SNEAKERS пусто"
+    assert SNEAKERS.size_prefix == "razmer_muzhskaya_obuv"
+    print("[OK] SNEAKERS: данные разведки вписаны, плейсхолдеров нет")
 
     print("\n=== Все самотесты category_profiles.py пройдены ===")
