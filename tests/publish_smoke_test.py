@@ -28,7 +28,7 @@ queued → running (несколько шагов) → done (или обрыв �
     - 11 фото
     - цвет не из словаря
     - drafts_count=0
-    - drafts_count=11
+    - drafts_count=21
     - drafts_count="abc"
 
 Частичный успех (пакетный режим):
@@ -117,8 +117,9 @@ def _make_fake_job(fail_at: int | None = None) -> Callable[..., Awaitable[None]]
     """
     Возвращает async-заглушку publisher.run_publish_job (без реального браузера).
 
-    Поддерживает пакетный режим (ТЗ §16): читает job["drafts_total"],
-    прогоняет черновики 1..N, обновляет draft_index/drafts_saved/saved_urls.
+    Читает job["items_total"], прогоняет объявления 1..N и обновляет
+    item_index/items_published/published_urls. Старые поля синхронизирует
+    только как алиасы.
 
     fail_at=None — успешный прогон всех черновиков, финальный статус done.
     fail_at=N   — имитация обрыва (StepError/капча) на черновике N:
@@ -135,34 +136,40 @@ def _make_fake_job(fail_at: int | None = None) -> Callable[..., Awaitable[None]]
     ) -> None:
         import publisher as pub_mod
 
-        # Сколько черновиков — из состояния задачи; мусор → дефолт
+        # Сколько объявлений — из нового поля; мусор → дефолт
         try:
-            drafts_total = int(job.get("drafts_total") or pub_mod.DRAFTS_DEFAULT)
+            items_total = int(
+                job.get("items_total")
+                or job.get("drafts_total")
+                or pub_mod.DRAFTS_DEFAULT
+            )
         except (TypeError, ValueError):
-            drafts_total = pub_mod.DRAFTS_DEFAULT
-        drafts_total = max(pub_mod.DRAFTS_MIN, min(pub_mod.DRAFTS_MAX, drafts_total))
+            items_total = pub_mod.DRAFTS_DEFAULT
+        items_total = max(pub_mod.DRAFTS_MIN, min(pub_mod.DRAFTS_MAX, items_total))
 
         job["status"] = "running"
         job["total"] = pub_mod.TOTAL_STEPS
-        job["drafts_total"] = drafts_total
-        job["draft_index"] = 0
-        job["drafts_saved"] = 0
-        job["saved_urls"] = []
+        job["items_total"] = items_total
+        job["item_index"] = 0
+        job["items_published"] = 0
+        job["published_urls"] = []
+        pub_mod._sync_legacy_publish_aliases(job)
 
         steps = [s for s, _ in pub_mod.STEPS if s != "done"]
 
-        for draft_index in range(1, drafts_total + 1):
-            job["draft_index"] = draft_index
+        for item_index in range(1, items_total + 1):
+            job["item_index"] = item_index
+            pub_mod._sync_legacy_publish_aliases(job)
 
-            # Имитация ошибки (капча / обрыв) на черновике fail_at
-            if fail_at is not None and draft_index == fail_at:
+            # Имитация ошибки (капча / обрыв) на объявлении fail_at
+            if fail_at is not None and item_index == fail_at:
                 job["step"] = "open_form"
                 job["step_label"] = pub_mod.STEP_LABELS.get("open_form", "Открытие формы Avito")
                 await asyncio.sleep(0)
                 # Сообщение с частичным успехом (как делает _format_partial_error)
-                base_msg = f"Тест: имитация обрыва на черновике {fail_at}."
+                base_msg = f"Тест: имитация обрыва на объявлении {fail_at}."
                 job["error"] = pub_mod._format_partial_error(
-                    base_msg, job["drafts_saved"], drafts_total
+                    base_msg, job["items_published"], items_total
                 )
                 job["status"] = "failed"
                 logger.debug(
@@ -178,11 +185,12 @@ def _make_fake_job(fail_at: int | None = None) -> Callable[..., Awaitable[None]]
                 job["done"] = i
                 await asyncio.sleep(0)  # отдаём event loop
 
-            # Черновик сохранён
-            fake_url = f"https://www.avito.ru/profile/ad/{12345678 + draft_index - 1}"
-            job["drafts_saved"] = draft_index
-            job["saved_urls"].append(fake_url)
+            # Публикация подтверждена
+            fake_url = f"https://www.avito.ru/test_{12345678 + item_index - 1}"
+            job["items_published"] = item_index
+            job["published_urls"].append(fake_url)
             job["result_url"] = fake_url
+            pub_mod._sync_legacy_publish_aliases(job)
 
         # Финальный шаг done
         job["step"] = "done"
@@ -191,7 +199,7 @@ def _make_fake_job(fail_at: int | None = None) -> Callable[..., Awaitable[None]]
         job["status"] = "done"
         logger.debug(
             "Синтетический run_publish_job: задача %s завершена (%d черновиков)",
-            job_id, drafts_total,
+            job_id, items_total,
         )
 
     return _fake_run_publish_job
@@ -276,9 +284,14 @@ def _wait_publish_done(job_id: str, timeout: float = 30.0) -> dict:
 # Вспомогательные поля: валидные значения для позитивного сценария
 # ---------------------------------------------------------------------------
 
-def _valid_fields() -> dict[str, str]:
+def _valid_fields(count: int = 1) -> dict[str, str]:
     """Возвращает набор валидных текстовых полей формы черновика."""
-    return {
+    source_locations = [
+        {"city": "Москва", "address": "ул. Тверская, 1"},
+        {"city": "Одинцово", "address": "ул. Центральная, 7"},
+        {"city": "Тула", "address": "ул. Ленина, 2"},
+    ]
+    fields = {
         "title": "Тестовый мужской пиджак",
         "trade_type": "Продаю своё",
         "condition": "Отличное",
@@ -287,9 +300,12 @@ def _valid_fields() -> dict[str, str]:
         "color": "Чёрный",
         "description": "Тестовое описание объявления для smoke-теста.",
         "price": "5000",
-        "city": "Москва",
-        "address": "ул. Тверская, 1",
+        "view_price_max": "0,5",
+        "locations_json": json.dumps(source_locations[:count], ensure_ascii=False),
     }
+    if count != 1:
+        fields["drafts_count"] = str(count)
+    return fields
 
 
 # Негативные кейсы валидации: один плохой параметр → HTTP 422.
@@ -300,9 +316,50 @@ NEGATIVE_CASES: list[tuple[str, dict[str, str], int, str]] = [
     ("11 фото", {}, 11, "photos"),
     ("цвет 'Хаки' вне словаря", {"color": "Хаки"}, 1, "color"),
     ("drafts_count=0", {"drafts_count": "0"}, 1, "drafts_count"),
-    ("drafts_count=11", {"drafts_count": "11"}, 1, "drafts_count"),
+    ("drafts_count=21", {"drafts_count": "21"}, 1, "drafts_count"),
     ("drafts_count='abc'", {"drafts_count": "abc"}, 1, "drafts_count"),
     ("размер одежды при category=sneakers", {"category": "sneakers"}, 1, "size"),
+    ("пустой потолок стоимости просмотра", {"view_price_max": ""}, 1, "view_price_max"),
+    ("нулевой потолок стоимости просмотра", {"view_price_max": "0"}, 1, "view_price_max"),
+    ("отрицательный потолок стоимости просмотра", {"view_price_max": "-1"}, 1, "view_price_max"),
+    ("мусорный потолок стоимости просмотра", {"view_price_max": "abc"}, 1, "view_price_max"),
+    ("геолокации не JSON", {"locations_json": "{"}, 1, "locations"),
+    (
+        "геолокации не массив",
+        {"locations_json": json.dumps({"city": "Москва"}, ensure_ascii=False)},
+        1,
+        "locations",
+    ),
+    (
+        "неверное количество геолокаций",
+        {"drafts_count": "2"},
+        1,
+        "locations",
+    ),
+    (
+        "пустой город второго объявления",
+        {
+            "drafts_count": "2",
+            "locations_json": json.dumps([
+                {"city": "Москва", "address": "ул. Тверская, 1"},
+                {"city": "", "address": "ул. Центральная, 7"},
+            ], ensure_ascii=False),
+        },
+        1,
+        "locations.2.city",
+    ),
+    (
+        "пустой адрес второго объявления",
+        {
+            "drafts_count": "2",
+            "locations_json": json.dumps([
+                {"city": "Москва", "address": "ул. Тверская, 1"},
+                {"city": "Одинцово", "address": ""},
+            ], ensure_ascii=False),
+        },
+        1,
+        "locations.2.address",
+    ),
 ]
 
 
@@ -389,7 +446,9 @@ def run_publish_smoke_test() -> None:
         assert final_status["done"] == final_status["total"], (
             f"done={final_status['done']} != total={final_status['total']}"
         )
-        # Обратная совместимость: без drafts_count → drafts_total=1
+        # Без drafts_count публикуется одно объявление; legacy-алиас совпадает.
+        assert final_status.get("items_total") == 1
+        assert final_status.get("items_published") == 1
         assert final_status.get("drafts_total") == 1, (
             f"Без drafts_count drafts_total должен быть 1, получили: "
             f"{final_status.get('drafts_total')}"
@@ -419,6 +478,10 @@ def run_publish_smoke_test() -> None:
         assert summary.get("price") == int(fields["price"]), (
             f"Сводка содержит неверную цену: {summary.get('price')!r}"
         )
+        assert summary.get("view_price_max") == "0.5", summary
+        assert summary.get("locations") == [
+            {"city": "Москва", "address": "ул. Тверская, 1"},
+        ], summary
         assert "photo_paths" not in summary, (
             "В сводке не должно быть путей к фото (персональные данные)"
         )
@@ -433,6 +496,12 @@ def run_publish_smoke_test() -> None:
             print(f"Шаг {step_no}: негативный кейс — {case_name} → 422")
             bad_fields = dict(_valid_fields(), **overrides)
             photos = [("photos", f"photo_{i:02d}.png", png1) for i in range(n_photos)]
+            jobs_before = set(app_module.PUBLISH_JOBS)
+            tmp_before = (
+                {path.name for path in app_module.TMP_PUBLISH_DIR.iterdir()}
+                if app_module.TMP_PUBLISH_DIR.exists()
+                else set()
+            )
             sc, body, _ = _post_multipart("/api/publish/start", bad_fields, photos)
             assert sc == 422, (
                 f"Кейс «{case_name}»: ожидали 422, получили {sc}. Тело: {body[:300]}"
@@ -443,12 +512,23 @@ def run_publish_smoke_test() -> None:
                 f"Кейс «{case_name}»: в 422-ответе нет ошибки поля "
                 f"{expected_field!r}: {resp_data}"
             )
+            assert set(app_module.PUBLISH_JOBS) == jobs_before, (
+                f"Кейс «{case_name}» создал publish-задачу до завершения валидации"
+            )
+            tmp_after = (
+                {path.name for path in app_module.TMP_PUBLISH_DIR.iterdir()}
+                if app_module.TMP_PUBLISH_DIR.exists()
+                else set()
+            )
+            assert tmp_after == tmp_before, (
+                f"Кейс «{case_name}» создал временные файлы до завершения валидации"
+            )
             checks_passed += 1
             print(f"  Проверка {step_no + 1} PASS: {case_name} → 422, поля={error_fields}")
 
         # ── Шаг 13: пакетный режим — drafts_count=3 → done, 3 черновика ──
         print("Шаг 13: пакетный режим — drafts_count=3 → done, drafts_saved=3")
-        batch_fields = dict(_valid_fields(), drafts_count="3")
+        batch_fields = _valid_fields(3)
         sc, body, _ = _post_multipart(
             "/api/publish/start",
             batch_fields,
@@ -471,14 +551,11 @@ def run_publish_smoke_test() -> None:
         assert batch_final.get("status") == "done", (
             f"Пакетная задача: ожидали status='done', получили: {batch_final}"
         )
-        assert batch_final.get("drafts_total") == 3, (
-            f"Пакетная задача: ожидали drafts_total=3, получили: "
-            f"{batch_final.get('drafts_total')}"
-        )
-        assert batch_final.get("drafts_saved") == 3, (
-            f"Пакетная задача: ожидали drafts_saved=3, получили: "
-            f"{batch_final.get('drafts_saved')}"
-        )
+        assert batch_final.get("items_total") == 3
+        assert batch_final.get("item_index") == 3
+        assert batch_final.get("items_published") == 3
+        assert batch_final.get("drafts_total") == batch_final.get("items_total")
+        assert batch_final.get("drafts_saved") == batch_final.get("items_published")
         checks_passed += 1
         print(
             f"  Проверка 15 PASS: пакет done, "
@@ -486,29 +563,30 @@ def run_publish_smoke_test() -> None:
             f"drafts_saved={batch_final.get('drafts_saved')}"
         )
 
-        # Результат пакетной задачи: saved_urls — 3 элемента
-        print(f"Шаг 15: GET /api/publish/result/{batch_job_id[:8]}… → 3 saved_urls")
+        # Результат пакетной задачи: published_urls — 3 элемента
+        print(f"Шаг 15: GET /api/publish/result/{batch_job_id[:8]}… → 3 published_urls")
         sc, body, _ = _get(f"/api/publish/result/{batch_job_id}")
         assert sc == 200, (
             f"GET /api/publish/result (пакет) вернул {sc}: {body[:200]}"
         )
         batch_result = json.loads(body)
-        saved_urls = batch_result.get("saved_urls", [])
-        assert isinstance(saved_urls, list), (
-            f"saved_urls должен быть списком, получили: {type(saved_urls)}"
+        published_urls = batch_result.get("published_urls", [])
+        assert isinstance(published_urls, list), (
+            f"published_urls должен быть списком, получили: {type(published_urls)}"
         )
-        assert len(saved_urls) == 3, (
-            f"Ожидали 3 saved_urls, получили {len(saved_urls)}: {saved_urls}"
+        assert len(published_urls) == 3, (
+            f"Ожидали 3 published_urls, получили {len(published_urls)}: {published_urls}"
         )
+        assert batch_result.get("saved_urls") == published_urls
         # Каждый URL — непустая строка
-        for idx, url in enumerate(saved_urls, start=1):
+        for idx, url in enumerate(published_urls, start=1):
             assert isinstance(url, str) and url.startswith("https://"), (
                 f"saved_urls[{idx}] невалидный URL: {url!r}"
             )
         checks_passed += 1
         print(
-            f"  Проверка 16 PASS: saved_urls содержит 3 элемента "
-            f"({', '.join(u[-8:] for u in saved_urls)}…)"
+            f"  Проверка 16 PASS: published_urls содержит 3 элемента "
+            f"({', '.join(u[-8:] for u in published_urls)}…)"
         )
 
     # ── Шаг 16: частичный успех — обрыв на черновике 2 из 3 ──────────────
@@ -516,7 +594,7 @@ def run_publish_smoke_test() -> None:
     print("Шаг 16: частичный успех — обрыв на черновике 2 из 3")
 
     with mock.patch.object(pub_module, "run_publish_job", _make_fake_job(fail_at=2)):
-        partial_fields = dict(_valid_fields(), drafts_count="3")
+        partial_fields = _valid_fields(3)
         sc, body, _ = _post_multipart(
             "/api/publish/start",
             partial_fields,
@@ -541,13 +619,14 @@ def run_publish_smoke_test() -> None:
             f"статус={partial_final.get('status')!r}"
         )
 
-        # drafts_saved=1, saved_urls из 1 элемента
-        assert partial_final.get("drafts_saved") == 1, (
-            f"Частичный сбой: ожидали drafts_saved=1, "
-            f"получили: {partial_final.get('drafts_saved')}"
+        # items_published=1, published_urls из 1 элемента
+        assert partial_final.get("items_published") == 1, (
+            f"Частичный сбой: ожидали items_published=1, "
+            f"получили: {partial_final.get('items_published')}"
         )
+        assert partial_final.get("item_index") == 2
         checks_passed += 1
-        print(f"  Проверка 18 PASS: drafts_saved=1")
+        print(f"  Проверка 18 PASS: items_published=1")
 
         # Результат: saved_urls из 1 элемента
         sc, body, _ = _get(f"/api/publish/result/{partial_job_id}")
@@ -555,13 +634,14 @@ def run_publish_smoke_test() -> None:
             f"GET /api/publish/result (partial) вернул {sc}: {body[:200]}"
         )
         partial_result = json.loads(body)
-        partial_urls = partial_result.get("saved_urls", [])
+        partial_urls = partial_result.get("published_urls", [])
         assert len(partial_urls) == 1, (
             f"Частичный сбой: ожидали 1 saved_url, получили {len(partial_urls)}: "
             f"{partial_urls}"
         )
         checks_passed += 1
-        print(f"  Проверка 19 PASS: saved_urls содержит 1 элемент ({partial_urls[0][-20:]!r})")
+        assert partial_result.get("saved_urls") == partial_urls
+        print(f"  Проверка 19 PASS: published_urls содержит 1 элемент ({partial_urls[0][-20:]!r})")
 
         # В error упоминается «1 из 3»
         error_text = partial_final.get("error") or ""
@@ -788,7 +868,7 @@ def run_publish_smoke_test() -> None:
         }
 
         with mock.patch.object(pub_module, "run_publish_job", _make_fake_job(fail_at=2)):
-            keep_fields = dict(_valid_fields(), prep_id=_prep_id_keep, drafts_count="3")
+            keep_fields = dict(_valid_fields(3), prep_id=_prep_id_keep)
             sc, body, _ = _post_multipart(
                 "/api/publish/start",
                 keep_fields,
@@ -835,7 +915,7 @@ def run_publish_smoke_test() -> None:
     # можно проверить содержимое draft_01..03.
     print("Шаг 21: start с drafts_count=3 без prep_id → авто-подготовка")
     with mock.patch.object(pub_module, "run_publish_job", _make_fake_job(fail_at=2)):
-        auto_fields = dict(_valid_fields(), drafts_count="3")
+        auto_fields = _valid_fields(3)
         sc, body, _ = _post_multipart(
             "/api/publish/start", auto_fields,
             [("photos", "auto1.png", png1)],
@@ -871,7 +951,7 @@ def run_publish_smoke_test() -> None:
     # ── Шаг 22: успешный авто-publish → prep-папка удалена ───────────────────
     print("Шаг 22: успешный publish с авто-подготовкой → prep-папка удалена")
     with mock.patch.object(pub_module, "run_publish_job", _make_fake_job()):
-        auto2_fields = dict(_valid_fields(), drafts_count="2")
+        auto2_fields = _valid_fields(2)
         sc, body, _ = _post_multipart(
             "/api/publish/start", auto2_fields,
             [("photos", "auto2.png", png2)],
@@ -908,6 +988,78 @@ def run_publish_smoke_test() -> None:
     )
     checks_passed += 1
     print("[OK] /api/publish/categories: обе категории")
+    # Категории без «Вида товара» отдают пустой список — фронт поле не рисует
+    assert cats["jackets"]["item_types"] == [], cats["jackets"]["item_types"]
+    checks_passed += 1
+    print("  Проверка 27 PASS: item_types пуст у категории без «Вида товара»")
+
+    # ── Шаг 24: «Вид товара» — опциональное категорийное поле ────────────────
+    # Профиль «Кофты и футболки» ждёт живой разведки (TSHIRTS_VERIFIED), поэтому
+    # проверяем механизм на синтетическом профиле с таким полем.
+    print("Шаг 24: «Вид товара» — обязателен только у категорий, где поле есть")
+    import category_profiles as _cp
+    from dataclasses import replace as _replace
+
+    _fake = _replace(
+        _cp.JACKETS, key="smoke_item_type", label="Тест: с видом товара",
+        item_type_options={"Футболка": 111, "Худи": 222}, item_type_prefix="vid_tovara",
+    )
+    _cp.PROFILES[_fake.key] = _fake
+    # Свежие валидные поля и одно фото — не полагаемся на состояние прошлых шагов
+    _it_fields = _valid_fields()
+    _it_files = [("photos", "photo_01.png", png1)]
+    try:
+        # Список видов уходит на фронт
+        sc, body, _ = _get("/api/publish/categories")
+        _c = {c["key"]: c for c in json.loads(body)["categories"]}
+        assert _c[_fake.key]["item_types"] == ["Футболка", "Худи"], _c[_fake.key]
+        checks_passed += 1
+        print("  Проверка 28 PASS: item_types категории отдаётся фронту")
+
+        # Без значения → 422 именно по полю item_type
+        sc, body, _ = _post_multipart(
+            "/api/publish/start", {**_it_fields, "category": _fake.key}, _it_files
+        )
+        assert sc == 422, f"ожидали 422 без вида товара, получили {sc}"
+        assert {e["field"] for e in json.loads(body)["errors"]} == {"item_type"}, body
+        checks_passed += 1
+        print("  Проверка 29 PASS: пустой «Вид товара» → 422")
+
+        # Значение не из словаря категории → 422
+        sc, body, _ = _post_multipart(
+            "/api/publish/start",
+            {**_it_fields, "category": _fake.key, "item_type": "Ботинки"}, _it_files,
+        )
+        assert sc == 422 and json.loads(body)["errors"][0]["field"] == "item_type", body
+        checks_passed += 1
+        print("  Проверка 30 PASS: чужое значение «Вида товара» → 422")
+
+        # Валидное значение → задача создана, значение долетело до DraftData
+        sc, body, _ = _post_multipart(
+            "/api/publish/start",
+            {**_it_fields, "category": _fake.key, "item_type": "Худи"}, _it_files,
+        )
+        assert sc == 200, f"валидная форма отклонена: {sc} {body[:200]}"
+        _jid = json.loads(body)["job_id"]
+        _draft = pub_module.build_draft_data(
+            {**_it_fields, "item_type": "Худи"}, ["a.jpg"], category=_fake.key
+        )
+        assert _draft.item_type == "Худи", _draft.item_type
+        assert _draft.summary()["item_type"] == "Худи", _draft.summary()
+        app_module.PUBLISH_JOBS.pop(_jid, None)
+        checks_passed += 1
+        print("  Проверка 31 PASS: валидный «Вид товара» принят и дошёл до DraftData")
+
+        # У категории без поля лишнее значение не мешает
+        sc, _body, _ = _post_multipart(
+            "/api/publish/start",
+            {**_it_fields, "category": "jackets", "item_type": "Чепуха"}, _it_files,
+        )
+        assert sc == 200, f"лишний item_type сломал jackets: {sc}"
+        checks_passed += 1
+        print("  Проверка 32 PASS: у категории без поля лишний item_type игнорируется")
+    finally:
+        _cp.PROFILES.pop(_fake.key, None)
 
     print(f"\n=== PUBLISH SMOKE TEST: OK: {checks_passed} проверок ===")
 

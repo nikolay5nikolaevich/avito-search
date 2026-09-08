@@ -8,9 +8,8 @@ REM   к вкладкам по origin-политике, и Playwright connect_ov
 REM   («<ws connected> ... Timeout 30000ms exceeded»).
 REM --remote-debugging-address=127.0.0.1 фиксирует привязку к IPv4-loopback, чтобы
 REM   Node/Playwright (резолвит localhost в 127.0.0.1) гарантированно достучался.
-REM --disable-features=WebUIOmniboxPopup ОТКЛЮЧАЕТ новую WebUI-выпадашку адресной
-REM   строки Chrome 149 (chrome://omnibox-popup.top-chrome). Она светится в CDP как
-REM   отдельная цель type=browser_ui, на которой Playwright connect_over_cdp виснет
-REM   до таймаута («<ws connected> ... Timeout»). Без флага профиль с историей
-REM   поднимает её уже при старте → подключение к Chrome ломается.
-start "" "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --remote-allow-origins=* --disable-features=WebUIOmniboxPopup --user-data-dir="%USERPROFILE%\avito-chrome-profile"
+REM --disable-features=WebUIOmniboxPopup профилактически отключает новую WebUI-
+REM   выпадашку адресной строки. Chrome 150 может всё равно показать её в CDP как
+REM   type=browser_ui. Backend только диагностирует эту цель и НИКОГДА не вызывает
+REM   для неё /json/close: такой запрос может завершить весь Chrome с вкладками.
+start "" "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --remote-allow-origins=* --disable-features=WebUIOmniboxPopup,WebUIOmniboxAimPopup --user-data-dir="%USERPROFILE%\avito-chrome-profile"

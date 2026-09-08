@@ -1,20 +1,37 @@
 import { useEffect, useRef, useState } from "react";
 import {
   fetchPublishCategories,
+  generateAddresses,
   fetchPublishResult,
   fetchPublishStatus,
   getPrepareResult,
   getPrepareStatus,
   regenerateDraft,
+  resumePublish,
   startPrepare,
   startPublish,
+  updateDraftText,
 } from "../lib/api";
 import {
   buildLaunchFormData,
   buildPublishFormData,
+  canResumePublish,
+  describeResumePlan,
+  MAX_DRAFTS,
+  normalizePublishProgress,
+  normalizeViewPrice,
+  publishButtonLabel,
   replaceDraftCard,
+  resizeLocations,
+  resumeUnavailableMessage,
   TERMINAL_STATUSES,
+  validateLocations,
 } from "../lib/publish";
+import {
+  createDraftStorage,
+  createPersistenceController,
+  createPhotoStorage,
+} from "../lib/draftPersistence";
 import FieldShell from "../components/FieldShell";
 import ProgressBar from "../components/ProgressBar";
 import SiteFooter from "../components/SiteFooter";
@@ -87,17 +104,21 @@ const PUBLISH_STEPS = [
   { key: "upload_photos",    label: "Загрузка фотографий" },
   { key: "fill_fields",      label: "Заполнение характеристик" },
   { key: "fill_description", label: "Описание" },
-  { key: "fill_price",       label: "Цена" },
-  { key: "fill_address",     label: "Адрес" },
-  { key: "save_draft",       label: "Сохранение черновика" },
+  { key: "fill_item_price",  label: "Цена товара" },
+  { key: "fill_address",     label: "Геолокация объявления" },
+  { key: "continue_listing", label: "Переход к публикации" },
+  { key: "fill_view_price",  label: "Стоимость просмотра" },
+  { key: "continue_view_price", label: "Подтверждение стоимости просмотра" },
+  { key: "skip_services",    label: "Отказ от дополнительных услуг" },
+  { key: "open_next_form",   label: "Переход к следующему объявлению" },
 ];
 
 // Заголовок панели прогресса по статусу задачи
-// (done в пакетном режиме считается отдельно — со счётчиком черновиков)
 const PANEL_TITLES = {
-  done: "Черновик сохранён",
+  done: "Объявление отправлено",
   failed: "Произошла ошибка",
   needs_user_action: "Требуется действие",
+  interrupted: "Публикация прервана",
 };
 
 const ACCEPTED_MIME = "image/jpeg,image/png,image/gif,image/heic";
@@ -112,7 +133,7 @@ function formatFileSize(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} МБ`;
 }
 
-// ─── Форма черновика ──────────────────────────────────────────────────────────
+// ─── Форма публикации ─────────────────────────────────────────────────────────
 
 // Имена полей — серверные (совпадают с параметрами /api/publish/start)
 function buildInitialForm() {
@@ -126,9 +147,16 @@ function buildInitialForm() {
     color: "",
     description: "",
     price: "",
-    city: "",
-    address: "",
+    view_price_max: "",
     drafts_count: 1,
+    locations: [{ city: "", address: "" }],
+    // Вид товара (футболка/поло/худи/…) — есть не у всех категорий,
+    // поле рисуется только если бэкенд прислал непустой item_types
+    item_type: "",
+    // Материал основной части / стиль — есть не у всех категорий (напр.
+    // «Жилеты»); persistence подхватит их автоматически — идёт по ключам defaults
+    material: "",
+    style: "",
   };
 }
 
@@ -146,15 +174,50 @@ function validate(form, photos, profile) {
   ) {
     errors.size = "Выберите размер из списка категории";
   }
-  if (!form.brand.trim()) errors.brand = "Укажите бренд";
+  // Вид товара — обязателен только у категорий, где поле есть (зеркало
+  // publisher.validate_publish_form: profile.has_item_type)
+  const itemTypes = profile?.item_types;
+  if (Array.isArray(itemTypes) && itemTypes.length > 0) {
+    if (!form.item_type) {
+      errors.item_type = "Выберите вид товара";
+    } else if (!itemTypes.includes(form.item_type)) {
+      errors.item_type = "Выберите вид товара из списка категории";
+    }
+  }
+  const materials = profile?.materials;
+  if (Array.isArray(materials) && materials.length > 0) {
+    if (!form.material) {
+      errors.material = "Выберите материал";
+    } else if (!materials.includes(form.material)) {
+      errors.material = "Выберите материал из списка категории";
+    }
+  }
+  const styles = profile?.styles;
+  if (Array.isArray(styles) && styles.length > 0) {
+    if (!form.style) {
+      errors.style = "Выберите стиль";
+    } else if (!styles.includes(form.style)) {
+      errors.style = "Выберите стиль из списка категории";
+    }
+  }
   if (!form.color) errors.color = "Выберите цвет";
   if (!form.description.trim()) errors.description = "Добавьте описание";
-  if (!form.city.trim()) errors.city = "Укажите город";
-  if (!form.address.trim()) errors.address = "Укажите адрес";
 
   const priceNum = Number(form.price);
   if (!form.price || !Number.isInteger(priceNum) || priceNum <= 0) {
     errors.price = "Укажите цену — целое число больше 0";
+  }
+
+  const draftsNum = Number(form.drafts_count);
+  if (!Number.isInteger(draftsNum) || draftsNum < 1 || draftsNum > MAX_DRAFTS) {
+    errors.drafts_count = `Укажите число от 1 до ${MAX_DRAFTS}`;
+  } else {
+    Object.assign(errors, validateLocations(form.locations, draftsNum));
+  }
+
+  const viewPriceMax = normalizeViewPrice(form.view_price_max);
+  if (!viewPriceMax) {
+    errors.view_price_max = "Укажите потолок стоимости просмотра — число больше 0";
   }
 
   if (photos.length === 0) errors.photos = "Добавьте хотя бы одно фото";
@@ -167,11 +230,6 @@ function validate(form, photos, profile) {
     }
   }
 
-  const draftsNum = Number(form.drafts_count);
-  if (!Number.isInteger(draftsNum) || draftsNum < 1 || draftsNum > 10) {
-    errors.drafts_count = "Укажите число от 1 до 10";
-  }
-
   return errors;
 }
 
@@ -182,9 +240,119 @@ function DraftForm({ onStarted, onPrepared }) {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isPreparing, setIsPreparing] = useState(false);
   const [generalError, setGeneralError] = useState("");
+  const [isHydrated, setIsHydrated] = useState(false);
+  const [isClearingSaved, setIsClearingSaved] = useState(false);
+  const [saveStatus, setSaveStatus] = useState("Восстанавливаем шаблон…");
+  const [formPersistenceError, setFormPersistenceError] = useState("");
+  const [photosPersistenceError, setPhotosPersistenceError] = useState("");
   // Профили категорий с бэкенда; null до загрузки/при ошибке — тогда фолбэк
   const [categories, setCategories] = useState(null);
+  const [addressGeneration, setAddressGeneration] = useState({ loading: [], error: {}, general: "" });
   const fileInputRef = useRef(null);
+  const mountedRef = useRef(true);
+  const persistenceControllerRef = useRef(null);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
+  // Восстанавливаем значения только один раз. До этого autosave выключен,
+  // чтобы дефолты не затёрли реальный черновик до завершения гидратации.
+  useEffect(() => {
+    let cancelled = false;
+
+    async function hydrateDraft() {
+      const defaults = buildInitialForm();
+      let restoredForm = defaults;
+      let restoredPhotos = [];
+      let formRestoreError = "";
+      let photosRestoreError = "";
+      let draftStorage;
+      let photoStorage;
+
+      try {
+        draftStorage = createDraftStorage(window.localStorage);
+        restoredForm = draftStorage.load(defaults);
+      } catch (error) {
+        formRestoreError = "Не удалось восстановить поля шаблона из локального хранилища.";
+        draftStorage = {
+          save() { throw error; },
+          clear() { throw error; },
+        };
+      }
+
+      try {
+        photoStorage = createPhotoStorage(window.indexedDB);
+        restoredPhotos = await photoStorage.load();
+      } catch (error) {
+        photosRestoreError = "Не удалось восстановить фотографии шаблона.";
+        if (!photoStorage) {
+          photoStorage = {
+            save: async () => { throw error; },
+            clear: async () => { throw error; },
+          };
+        }
+      }
+
+      if (cancelled) return;
+      persistenceControllerRef.current = createPersistenceController({
+        draftStorage,
+        photoStorage,
+      });
+      setForm(restoredForm);
+      setPhotos(restoredPhotos);
+      setFormPersistenceError(formRestoreError);
+      setPhotosPersistenceError(photosRestoreError);
+      setSaveStatus(formRestoreError || photosRestoreError ? "Хранилище недоступно" : "Шаблон восстановлен");
+      setIsHydrated(true);
+    }
+
+    hydrateDraft();
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!isHydrated) return;
+
+    let cancelled = false;
+    setSaveStatus("Сохраняем…");
+    persistenceControllerRef.current.saveForm(form)
+      .then((saved) => {
+        if (!saved || cancelled || !mountedRef.current) return;
+        setFormPersistenceError("");
+        setSaveStatus("Сохранено");
+      })
+      .catch(() => {
+        if (cancelled || !mountedRef.current) return;
+        setFormPersistenceError("Не удалось сохранить поля шаблона. Проверьте свободное место в браузере.");
+        setSaveStatus("Ошибка сохранения");
+      });
+
+    return () => { cancelled = true; };
+  }, [form, isHydrated]);
+
+  useEffect(() => {
+    if (!isHydrated) return undefined;
+
+    let cancelled = false;
+    setSaveStatus("Сохраняем…");
+    persistenceControllerRef.current.savePhotos(photos)
+      .then((saved) => {
+        if (!saved || cancelled || !mountedRef.current) return;
+        setPhotosPersistenceError("");
+        setSaveStatus("Сохранено");
+      })
+      .catch(() => {
+        if (cancelled || !mountedRef.current) return;
+        setPhotosPersistenceError("Не удалось сохранить фотографии. Проверьте свободное место в браузере.");
+        setSaveStatus("Ошибка сохранения");
+      });
+
+    return () => { cancelled = true; };
+  }, [photos, isHydrated]);
+
+  const persistenceError = formPersistenceError || photosPersistenceError;
 
   // Подтягиваем списки полей по категориям. При ошибке остаёмся на фолбэке
   // (FALLBACK_PROFILE) — форма должна рисоваться всегда.
@@ -208,6 +376,10 @@ function DraftForm({ onStarted, onPrepared }) {
   const conditions = profile.conditions ?? CONDITIONS;
   const sizes = profile.sizes ?? SIZES;
   const colors = profile.colors ?? COLORS;
+  // Непустой список = у категории есть «Вид товара» (фолбэк-профиль его не имеет)
+  const itemTypes = Array.isArray(profile.item_types) ? profile.item_types : [];
+  const materials = Array.isArray(profile.materials) ? profile.materials : [];
+  const styles = Array.isArray(profile.styles) ? profile.styles : [];
 
   // Сбрасывает ошибку поля после того, как пользователь его поправил
   function clearError(field) {
@@ -220,13 +392,95 @@ function DraftForm({ onStarted, onPrepared }) {
     clearError(name);
   }
 
+  function handleDraftsCountChange(e) {
+    const value = e.target.value;
+    const count = Number(value);
+    setForm((prev) => ({
+      ...prev,
+      drafts_count: value,
+      locations: resizeLocations(prev.locations, count),
+    }));
+    setErrors((prev) => Object.fromEntries(
+      Object.entries(prev).filter(([key]) => (
+        key !== "drafts_count"
+        && key !== "locations"
+        && !key.startsWith("locations.")
+      )),
+    ));
+  }
+
+  function updateLocation(index, field, value) {
+    setForm((prev) => ({
+      ...prev,
+      locations: prev.locations.map((location, locationIndex) => (
+        locationIndex === index
+          ? { ...location, [field]: value }
+          : location
+      )),
+    }));
+    clearError(`locations.${index + 1}.${field}`);
+    clearError("locations");
+  }
+
+  async function generateLocationAddresses(indices) {
+    const targets = indices.filter((index) => form.locations[index]?.city.trim());
+    const missing = indices.filter((index) => !form.locations[index]?.city.trim());
+    const missingErrors = Object.fromEntries(missing.map((index) => [index, "Сначала укажите город."]));
+    if (missing.length) {
+      setAddressGeneration((prev) => ({
+        ...prev,
+        error: { ...prev.error, ...missingErrors },
+      }));
+    }
+    if (!targets.length) return;
+    const citySnapshot = new Map(targets.map((index) => [index, form.locations[index].city.trim()]));
+    setErrors((prev) => {
+      const next = { ...prev };
+      targets.forEach((index) => { delete next[`locations.${index + 1}.address`]; });
+      return next;
+    });
+    setAddressGeneration({ loading: targets, error: missingErrors, general: missing.length ? "Для части строк сначала укажите город." : "" });
+    try {
+      const data = await generateAddresses(
+        targets.map((index) => form.locations[index].city),
+        form.locations.filter((location) => location.address.trim()).map(({ city, address }) => ({ city, address })),
+      );
+      const nextErrors = { ...missingErrors };
+      setForm((prev) => ({
+        ...prev,
+        locations: prev.locations.map((location, index) => {
+          const position = targets.indexOf(index);
+          if (position < 0) return location;
+          const result = data.results?.[position];
+          if (location.city.trim() !== citySnapshot.get(index)) {
+            nextErrors[index] = "Город изменён во время подбора — адрес не применён.";
+            return location;
+          }
+          if (result?.address) {
+            return { ...location, address: result.address };
+          }
+          nextErrors[index] = result?.error || "Не удалось подобрать адрес. Введите вручную.";
+          return location;
+        }),
+      }));
+      setAddressGeneration({ loading: [], error: nextErrors, general: Object.keys(nextErrors).length ? "Некоторые адреса не удалось подобрать или не указан город." : "" });
+    } catch (err) {
+      setAddressGeneration({ loading: [], error: missingErrors, general: err.message || "Не удалось получить адреса. Введите их вручную." });
+    }
+  }
+
   // Смена категории: списки размеров у категорий разные — сбрасываем size,
   // чтобы не остался невалидный для новой категории
   function handleCategoryChange(e) {
     const value = e.target.value;
-    setForm((prev) => ({ ...prev, category: value, size: "" }));
+    // Размер и вид товара — категорийные словари: старое значение чужой
+    // категории бэкенд отвергнет, поэтому сбрасываем оба
+    setForm((prev) => ({ ...prev, category: value, size: "", item_type: "", material: "", style: "" }));
     clearError("category");
     clearError("size");
+    clearError("item_type");
+    clearError("material");
+    clearError("style");
   }
 
   function handleFilesChange(e) {
@@ -241,6 +495,33 @@ function DraftForm({ onStarted, onPrepared }) {
   function removePhoto(index) {
     setPhotos((prev) => prev.filter((_, i) => i !== index));
     clearError("photos");
+  }
+
+  async function clearSavedDraft() {
+    setIsClearingSaved(true);
+    setFormPersistenceError("");
+    setPhotosPersistenceError("");
+    setSaveStatus("Очищаем сохранённое…");
+
+    try {
+      // Контроллер закрывает очередь для новых autosave, ждёт уже поставленные
+      // записи и только после них очищает оба хранилища.
+      await persistenceControllerRef.current.clear();
+      if (!mountedRef.current) return;
+      setForm(buildInitialForm());
+      setPhotos([]);
+      setErrors({});
+      setGeneralError("");
+      setFormPersistenceError("");
+      setPhotosPersistenceError("");
+      setSaveStatus("Сохранённое удалено");
+    } catch {
+      if (!mountedRef.current) return;
+      setFormPersistenceError("Не удалось полностью очистить сохранённый шаблон. Попробуйте ещё раз.");
+      setSaveStatus("Ошибка очистки");
+    } finally {
+      if (mountedRef.current) setIsClearingSaved(false);
+    }
   }
 
   async function handleSubmit(e) {
@@ -267,7 +548,8 @@ function DraftForm({ onStarted, onPrepared }) {
       onStarted(result.job_id, {
         title: form.title.trim(),
         price: Number(form.price),
-        city: form.city.trim(),
+        locationsCount: form.locations.length,
+        viewPriceMax: normalizeViewPrice(form.view_price_max),
         photosCount: photos.length,
         draftsCount: Number(form.drafts_count),
       });
@@ -306,7 +588,8 @@ function DraftForm({ onStarted, onPrepared }) {
       onPrepared(result.prep_id, form, photos, {
         title: form.title.trim(),
         price: Number(form.price),
-        city: form.city.trim(),
+        locationsCount: form.locations.length,
+        viewPriceMax: normalizeViewPrice(form.view_price_max),
         photosCount: photos.length,
         draftsCount: Number(form.drafts_count),
       });
@@ -326,6 +609,29 @@ function DraftForm({ onStarted, onPrepared }) {
       className="workspace-panel draft-form space-y-5"
       onSubmit={showPrepareButton ? handlePrepare : handleSubmit}
     >
+      <div className="draft-persistence-bar">
+        <div>
+          <p id="draft-persistence-status" className="draft-persistence-status" aria-live="polite">{saveStatus}</p>
+          {persistenceError ? (
+            <p className="draft-persistence-error" role="alert">{persistenceError}</p>
+          ) : null}
+        </div>
+        <button
+          type="button"
+          className="draft-persistence-clear"
+          onClick={clearSavedDraft}
+          disabled={!isHydrated || anyBusy || isClearingSaved}
+        >
+          Очистить сохранённое
+        </button>
+      </div>
+
+      <fieldset
+        className="draft-form-fields"
+        disabled={!isHydrated || isClearingSaved}
+        aria-describedby="draft-persistence-status"
+      >
+
       {/* Выбор категории */}
       <div data-field="category">
         <FieldShell label="Категория" error={errors.category}>
@@ -341,6 +647,26 @@ function DraftForm({ onStarted, onPrepared }) {
           </select>
         </FieldShell>
       </div>
+
+      {/* Вид товара — только у категорий, где Авито просит подтип
+          (напр. «Кофты и футболки»: футболка / поло / худи / …) */}
+      {itemTypes.length > 0 ? (
+        <div data-field="item_type">
+          <FieldShell label="Вид товара" error={errors.item_type}>
+            <select
+              className="field-input draft-select"
+              name="item_type"
+              value={form.item_type}
+              onChange={updateField}
+            >
+              <option value="">— Выберите вид товара —</option>
+              {itemTypes.map((t) => (
+                <option key={t} value={t}>{t}</option>
+              ))}
+            </select>
+          </FieldShell>
+        </div>
+      ) : null}
 
       {/* Предупреждение о категории */}
       <div className="draft-category-notice">
@@ -488,6 +814,9 @@ function DraftForm({ onStarted, onPrepared }) {
               onChange={updateField}
               placeholder="Например: Hugo Boss"
             />
+            <p className="draft-view-price-hint">
+              Если такого бренда нет в подсказках Авито, сервис выберет «Без бренда».
+            </p>
           </FieldShell>
         </div>
       </div>
@@ -508,6 +837,50 @@ function DraftForm({ onStarted, onPrepared }) {
           </select>
         </FieldShell>
       </div>
+
+      {/* Материал основной части — только у категорий, где Авито просит поле (напр. «Жилеты») */}
+      {materials.length > 0 ? (
+        <div data-field="material">
+          <FieldShell label="Материал основной части" error={errors.material}>
+            <select
+              className="field-input draft-select"
+              name="material"
+              value={form.material}
+              onChange={updateField}
+            >
+              <option value="">— Выберите материал —</option>
+              {materials.map((m) => (
+                <option key={m} value={m}>{m}</option>
+              ))}
+            </select>
+          </FieldShell>
+        </div>
+      ) : null}
+
+      {/* Стиль — только у категорий, где Авито просит поле (напр. «Жилеты») */}
+      {styles.length > 0 ? (
+        <div data-field="style">
+          <FieldShell label="Стиль" error={errors.style}>
+            <div className="draft-radio-group">
+              {styles.map((s) => (
+                <label
+                  key={s}
+                  className={`draft-pill draft-radio-chip${form.style === s ? " draft-radio-chip-active" : ""}`}
+                >
+                  <input
+                    type="radio"
+                    name="style"
+                    value={s}
+                    checked={form.style === s}
+                    onChange={updateField}
+                  />
+                  <span>{s}</span>
+                </label>
+              ))}
+            </div>
+          </FieldShell>
+        </div>
+      ) : null}
 
       {/* Описание */}
       <div data-field="description">
@@ -539,65 +912,157 @@ function DraftForm({ onStarted, onPrepared }) {
         </FieldShell>
       </div>
 
-      {/* Город + Адрес */}
-      <div className="draft-two-col">
-        <div data-field="city">
-          <FieldShell label="Город" error={errors.city}>
-            <input
-              className="field-input"
-              type="text"
-              name="city"
-              value={form.city}
-              onChange={updateField}
-              placeholder="Москва"
-            />
-          </FieldShell>
-        </div>
-
-        <div data-field="address">
-          <FieldShell label="Адрес (улица, дом)" error={errors.address}>
-            <input
-              className="field-input"
-              type="text"
-              name="address"
-              value={form.address}
-              onChange={updateField}
-              placeholder="ул. Пушкина, д. 10"
-            />
-          </FieldShell>
-        </div>
-      </div>
-
-      {/* Сколько черновиков */}
+      {/* Количество объявлений */}
       <div data-field="drafts_count">
-        <FieldShell label="Сколько черновиков" error={errors.drafts_count}>
+        <FieldShell label="Количество объявлений" error={errors.drafts_count}>
           <select
             className="field-input draft-select"
             name="drafts_count"
             value={form.drafts_count}
-            onChange={updateField}
+            onChange={handleDraftsCountChange}
           >
-            {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => (
+            {Array.from({ length: MAX_DRAFTS }, (_, index) => index + 1).map((n) => (
               <option key={n} value={n}>{n}</option>
             ))}
           </select>
           <p className="draft-batch-hint">
             {showPrepareButton
               ? "При N ≥ 2 сервис сначала готовит варианты: разные названия и описания, обработанные фото (зум/отдаление, поворот, контраст). Перед заливкой вы увидите превью. Снижает риск блокировки за дублирующийся контент, но не гарантирует защиту."
-              : "Один черновик — название, описание и фото сохраняются как есть."}
+              : "Для одного объявления название, описание и фото сохраняются как есть."}
           </p>
         </FieldShell>
       </div>
 
-      {/* Кнопка запуска: при N ≥ 2 путь всегда через подготовку вариантов —
-          прямое сохранение делало бы N одинаковых черновиков */}
+      {/* Отдельная геолокация для каждого объявления */}
+      <section className="draft-locations-section" data-field="locations">
+        <div className="draft-locations-heading">
+          <div>
+            <p className="section-kicker">Геолокации</p>
+            <h3 className="draft-locations-title">Геолокации объявлений</h3>
+          </div>
+          <span className="draft-locations-count">{form.locations.length}</span>
+        </div>
+        <p className="draft-locations-copy">
+          Каждая строка относится к объявлению с тем же номером. Ручной ввод остаётся доступен; генератор по возможности выбирает разные реальные адреса в одном городе.
+        </p>
+        <div className="draft-location-actions">
+          <button
+            type="button"
+            className="draft-address-generate"
+            onClick={() => generateLocationAddresses(form.locations.map((_, index) => index))}
+            disabled={addressGeneration.loading.length > 0}
+          >
+            {addressGeneration.loading.length > 0 ? "Подбираем адреса…" : "Заполнить все адреса"}
+          </button>
+          <span className="draft-osm-attribution">Адреса: <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">© OpenStreetMap contributors</a></span>
+        </div>
+        {addressGeneration.general ? <p className="field-error" role="alert">{addressGeneration.general}</p> : null}
+        {errors.locations ? (
+          <p className="field-error" role="alert">{errors.locations}</p>
+        ) : null}
+
+        <div className="draft-locations-list">
+          {form.locations.map((location, index) => {
+            const itemNumber = index + 1;
+            const cityField = `locations.${itemNumber}.city`;
+            const addressField = `locations.${itemNumber}.address`;
+            return (
+              <article className="draft-location-card" key={itemNumber}>
+                <div className="draft-location-card-header">
+                  <span className="draft-location-index">{String(itemNumber).padStart(2, "0")}</span>
+                  <h4>Объявление №{itemNumber}</h4>
+                </div>
+                <div className="draft-location-fields">
+                  <div data-field={cityField}>
+                    <FieldShell label="Город" error={errors[cityField]}>
+                      <input
+                        className="field-input"
+                        type="text"
+                        name={cityField}
+                        value={location.city}
+                        onChange={(event) => updateLocation(index, "city", event.target.value)}
+                        placeholder="Москва"
+                      />
+                    </FieldShell>
+                  </div>
+                  <div data-field={addressField}>
+                    <FieldShell label="Улица и дом (дом не обязателен)" error={errors[addressField]}>
+                      <div className="draft-address-input-row">
+                        <input
+                          className="field-input"
+                          type="text"
+                          name={addressField}
+                          value={location.address}
+                          onChange={(event) => updateLocation(index, "address", event.target.value)}
+                          placeholder="ул. Пушкина, д. 10"
+                        />
+                        <button
+                          type="button"
+                          className="draft-address-generate"
+                          onClick={() => generateLocationAddresses([index])}
+                          disabled={addressGeneration.loading.length > 0 || !location.city.trim()}
+                          aria-label={`Сгенерировать адрес для объявления №${itemNumber}`}
+                        >
+                          {addressGeneration.loading.includes(index) ? "Подбираем…" : "Сгенерировать"}
+                        </button>
+                      </div>
+                      {addressGeneration.error[index] ? <p className="field-error" role="alert">{addressGeneration.error[index]}</p> : null}
+                    </FieldShell>
+                  </div>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      </section>
+
+      {/* Единый потолок стоимости просмотра для всего пакета */}
+      <div data-field="view_price_max" className="draft-view-price-field">
+        <FieldShell
+          label="Потолок стоимости просмотра, ₽"
+          error={errors.view_price_max}
+        >
+          <input
+            className="field-input"
+            type="text"
+            inputMode="decimal"
+            name="view_price_max"
+            value={form.view_price_max}
+            onChange={updateField}
+            placeholder="2,0"
+            autoComplete="off"
+          />
+          <p className="draft-view-price-hint">
+            Движок всегда выбирает минимальную цену, которую предлагает Авито.
+            Если минимум окажется выше потолка — публикация остановится, деньги не спишутся.
+          </p>
+        </FieldShell>
+      </div>
+
+      {normalizeViewPrice(form.view_price_max) ? (
+        <div className="draft-view-price-summary" aria-live="polite">
+          <span>Пакет</span>
+          <strong>
+            {form.locations.length}{" "}
+            {form.locations.length === 1
+              ? "объявление"
+              : form.locations.length <= 4
+                ? "объявления"
+                : "объявлений"}
+            {" · "}не дороже {normalizeViewPrice(form.view_price_max)} ₽ за просмотр
+          </strong>
+        </div>
+      ) : null}
+
+      {/* При N ≥ 2 сначала готовим разные тексты и фото, затем публикуем пакет. */}
       <div className="draft-submit-row draft-submit-buttons">
         <button className="submit-button" type="submit" disabled={anyBusy}>
           {showPrepareButton
             ? (isPreparing ? "Готовим варианты..." : "Подготовить варианты")
-            : (isSubmitting ? "Запускаем..." : "Сохранить черновик на Авито")}
+            : (isSubmitting ? "Запускаем..." : publishButtonLabel(draftsNum))}
         </button>
       </div>
+      </fieldset>
     </form>
   );
 }
@@ -686,11 +1151,16 @@ function PrepareProgressPanel({ prepId, onDone, onBack }) {
   );
 }
 
-// ─── Карточка одного черновика в превью ───────────────────────────────────────
+// ─── Карточка одного варианта в превью ────────────────────────────────────────
 
-function DraftPreviewCard({ draft, prepId, isOriginal, onRegenerated }) {
+function DraftPreviewCard({ draft, prepId, onUpdated, onEditingChange }) {
   const [isRegenerating, setIsRegenerating] = useState(false);
   const [regenError, setRegenError] = useState("");
+  const [isEditing, setIsEditing] = useState(false);
+  const [isSavingText, setIsSavingText] = useState(false);
+  const [editTitle, setEditTitle] = useState(draft.title);
+  const [editDescription, setEditDescription] = useState(draft.description);
+  const [editError, setEditError] = useState("");
 
   async function handleRegenerate() {
     setIsRegenerating(true);
@@ -698,7 +1168,7 @@ function DraftPreviewCard({ draft, prepId, isOriginal, onRegenerated }) {
     try {
       // draft.index — 1-based (контракт бэкенда), карточка в ответе с тем же index
       const updated = await regenerateDraft(prepId, draft.index);
-      onRegenerated(updated);
+      onUpdated(updated);
     } catch (err) {
       setRegenError(err.message || "Не удалось перегенерировать вариант");
     } finally {
@@ -706,30 +1176,80 @@ function DraftPreviewCard({ draft, prepId, isOriginal, onRegenerated }) {
     }
   }
 
+  function handleStartEditing() {
+    setEditTitle(draft.title);
+    setEditDescription(draft.description);
+    setEditError("");
+    setIsEditing(true);
+    onEditingChange(draft.index, true);
+  }
+
+  function handleCancelEditing() {
+    setEditTitle(draft.title);
+    setEditDescription(draft.description);
+    setEditError("");
+    setIsEditing(false);
+    onEditingChange(draft.index, false);
+  }
+
+  async function handleSaveText() {
+    const title = editTitle.trim();
+    const description = editDescription.trim();
+    if (!title || !description) {
+      setEditError(!title ? "Название не может быть пустым" : "Описание не может быть пустым");
+      return;
+    }
+
+    setIsSavingText(true);
+    setEditError("");
+    try {
+      const updated = await updateDraftText(
+        prepId,
+        draft.index,
+        title,
+        description,
+      );
+      onUpdated(updated);
+      setIsEditing(false);
+      onEditingChange(draft.index, false);
+    } catch (err) {
+      setEditError(err.message || "Не удалось сохранить текст");
+    } finally {
+      setIsSavingText(false);
+    }
+  }
+
   return (
-    <div className={`draft-preview-card${isOriginal ? " draft-preview-card-original" : ""}`}>
+    <div className="draft-preview-card">
       {/* Заголовок карточки */}
       <div className="draft-preview-card-header">
         <div className="draft-preview-card-meta">
           <span className="draft-preview-index">
-            {isOriginal ? "Вариант 1 — оригинал" : `Вариант ${draft.index}`}
+            {`Вариант ${draft.index}`}
           </span>
           {draft.preset_name ? (
             <span className="draft-preview-preset">{draft.preset_name}</span>
           ) : null}
         </div>
 
-        {/* Перегенерация только для вариантов 2+ */}
-        {!isOriginal ? (
+        <div className="draft-preview-actions">
+          <button
+            type="button"
+            className="secondary-button draft-edit-btn"
+            disabled={isEditing || isRegenerating || isSavingText}
+            onClick={handleStartEditing}
+          >
+            Редактировать текст
+          </button>
           <button
             type="button"
             className="secondary-button draft-regen-btn"
-            disabled={isRegenerating}
+            disabled={isRegenerating || isEditing || isSavingText}
             onClick={handleRegenerate}
           >
             {isRegenerating ? "Обновляем..." : "Перегенерировать"}
           </button>
-        ) : null}
+        </div>
       </div>
 
       {regenError ? (
@@ -748,11 +1268,58 @@ function DraftPreviewCard({ draft, prepId, isOriginal, onRegenerated }) {
         </div>
       ) : null}
 
-      {/* Название */}
-      <p className="draft-preview-title">{draft.title}</p>
+      {isEditing ? (
+        <div className="draft-preview-editor">
+          <label className="draft-preview-edit-field">
+            <span>Название</span>
+            <input
+              className="field-input"
+              type="text"
+              value={editTitle}
+              maxLength={120}
+              aria-label={`Название варианта ${draft.index}`}
+              onChange={(event) => setEditTitle(event.target.value)}
+            />
+          </label>
+          <label className="draft-preview-edit-field">
+            <span>Описание</span>
+            <textarea
+              className="field-input draft-textarea"
+              value={editDescription}
+              rows={7}
+              aria-label={`Описание варианта ${draft.index}`}
+              onChange={(event) => setEditDescription(event.target.value)}
+            />
+          </label>
+          {editError ? <p className="field-error" role="alert">{editError}</p> : null}
+          <div className="draft-preview-editor-actions">
+            <button
+              type="button"
+              className="secondary-button"
+              disabled={isSavingText}
+              onClick={handleCancelEditing}
+            >
+              Отмена
+            </button>
+            <button
+              type="button"
+              className="submit-button draft-save-text-btn"
+              disabled={isSavingText}
+              onClick={handleSaveText}
+            >
+              {isSavingText ? "Сохраняем..." : "Сохранить текст"}
+            </button>
+          </div>
+        </div>
+      ) : (
+        <>
+          {/* Название */}
+          <p className="draft-preview-title">{draft.title}</p>
 
-      {/* Описание */}
-      <p className="draft-preview-description">{draft.description}</p>
+          {/* Описание */}
+          <p className="draft-preview-description">{draft.description}</p>
+        </>
+      )}
 
       {/* Миниатюры фото — бэкенд отдаёт готовые URL в photo_urls */}
       {draft.photo_urls?.length > 0 ? (
@@ -782,10 +1349,19 @@ function PreviewPanel({ prepId, initialDrafts, form, photos, summary, onStartPub
   const [drafts, setDrafts] = useState(initialDrafts);
   const [isLaunching, setIsLaunching] = useState(false);
   const [launchError, setLaunchError] = useState("");
+  const [editingDraftIndexes, setEditingDraftIndexes] = useState([]);
 
   // Карточка из regenerate приходит с тем же 1-based index — замена по нему
-  function handleRegenerated(updatedCard) {
+  function handleUpdated(updatedCard) {
     setDrafts((prev) => replaceDraftCard(prev, updatedCard));
+  }
+
+  function handleEditingChange(draftIndex, isEditing) {
+    setEditingDraftIndexes((prev) => (
+      isEditing
+        ? (prev.includes(draftIndex) ? prev : [...prev, draftIndex])
+        : prev.filter((index) => index !== draftIndex)
+    ));
   }
 
   async function handleLaunch() {
@@ -813,7 +1389,7 @@ function PreviewPanel({ prepId, initialDrafts, form, photos, summary, onStartPub
       <div className="workspace-panel-header">
         <div>
           <p className="section-kicker">Превью</p>
-          <h2 className="workspace-panel-title">Варианты черновиков</h2>
+          <h2 className="workspace-panel-title">Варианты объявлений</h2>
           <p className="workspace-intro-copy" style={{ marginTop: "0.6rem" }}>
             Проверьте варианты. Использование разных текстов и обработанных фото снижает риск
             блокировки за дублирующийся контент — но не гарантирует защиту от антиспам-систем.
@@ -826,13 +1402,13 @@ function PreviewPanel({ prepId, initialDrafts, form, photos, summary, onStartPub
 
       {/* Карточки вариантов */}
       <div className="draft-preview-grid">
-        {drafts.map((draft, i) => (
+        {drafts.map((draft) => (
           <DraftPreviewCard
             key={draft.index}
             draft={draft}
             prepId={prepId}
-            isOriginal={i === 0}
-            onRegenerated={handleRegenerated}
+            onUpdated={handleUpdated}
+            onEditingChange={handleEditingChange}
           />
         ))}
       </div>
@@ -848,10 +1424,10 @@ function PreviewPanel({ prepId, initialDrafts, form, photos, summary, onStartPub
         <button
           className="submit-button"
           type="button"
-          disabled={isLaunching}
+          disabled={isLaunching || editingDraftIndexes.length > 0}
           onClick={handleLaunch}
         >
-          {isLaunching ? "Запускаем..." : `Запустить ${drafts.length} черновик${drafts.length === 1 ? "" : drafts.length < 5 ? "а" : "ов"}`}
+          {isLaunching ? "Запускаем..." : publishButtonLabel(drafts.length)}
         </button>
       </div>
     </section>
@@ -864,6 +1440,8 @@ function PublishProgressPanel({ jobId, summary, onBack }) {
   const [status, setStatus] = useState(null);
   const [result, setResult] = useState(null);
   const [pollError, setPollError] = useState("");
+  const [isResuming, setIsResuming] = useState(false);
+  const [resumeNonce, setResumeNonce] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -894,7 +1472,7 @@ function PublishProgressPanel({ jobId, summary, onBack }) {
 
     poll();
     return () => { cancelled = true; };
-  }, [jobId]);
+  }, [jobId, resumeNonce]);
 
   const currentStep = status?.step ?? null;
   const isTerminal = TERMINAL_STATUSES.has(status?.status);
@@ -902,15 +1480,46 @@ function PublishProgressPanel({ jobId, summary, onBack }) {
   // Определяем индекс текущего шага
   const currentStepIndex = PUBLISH_STEPS.findIndex((s) => s.key === currentStep);
 
-  // Пакетный режим: поля появляются в статусе только если бэкенд их прислал
-  const draftsTotal = status?.drafts_total ?? null;
-  const draftIndex = status?.draft_index ?? null;
-  const draftsSaved = status?.drafts_saved ?? 0;
-  const isBatch = draftsTotal != null && draftsTotal > 1;
+  const {
+    itemsTotal,
+    itemIndex,
+    itemsPublished,
+    appliedViewPrices,
+    addressWarnings,
+    brandSelected,
+    skippedItems,
+  } = normalizePublishProgress(status ?? {});
+  const { publishedUrls } = normalizePublishProgress(result ?? status ?? {});
+  const isBatch = itemsTotal != null && itemsTotal > 1;
+  const canResume = canResumePublish(status);
+  // retry_item (повтор текущего) или skip_item (уже создано на Авито, едем
+  // со следующего) — режимы отличаются и текстом, и тем, что реально произойдёт
+  const resumePlan = describeResumePlan(status ?? {});
+  const resumeUnavailableReason = resumeUnavailableMessage(status ?? {});
+
+  async function handleResume() {
+    setIsResuming(true);
+    setPollError("");
+    try {
+      await resumePublish(jobId);
+      setResult(null);
+      setStatus((current) => ({
+        ...(current ?? {}),
+        status: "queued",
+        error: null,
+        user_action: null,
+      }));
+      setResumeNonce((value) => value + 1);
+    } catch (error) {
+      setPollError(error.message || "Не удалось продолжить публикацию");
+    } finally {
+      setIsResuming(false);
+    }
+  }
 
   const panelTitle = status?.status === "done" && isBatch
-    ? `Сохранено черновиков: ${draftsSaved} из ${draftsTotal}`
-    : PANEL_TITLES[status?.status] ?? "Сохраняем черновик";
+    ? `Отправлено ${itemsPublished} из ${itemsTotal}`
+    : PANEL_TITLES[status?.status] ?? "Отправляем объявления";
 
   // Каталог дампов диагностики: бэкенд шлёт debug_dir, фолбэк — путь по умолчанию
   const debugDir = status?.debug_dir || `debug/publish/${jobId}`;
@@ -922,20 +1531,20 @@ function PublishProgressPanel({ jobId, summary, onBack }) {
         <div>
           <p className="section-kicker">Публикация</p>
           <h2 className="workspace-panel-title">{panelTitle}</h2>
-          {/* Счётчик текущего черновика в пакетном режиме (только во время работы) */}
-          {isBatch && !isTerminal && draftIndex != null ? (
+          {/* Счётчик текущего объявления в пакетном режиме */}
+          {isBatch && !isTerminal && itemIndex != null ? (
             <div className="draft-batch-counter">
               <span className="draft-batch-counter-main">
-                Черновик {draftIndex} из {draftsTotal}
+                Объявление {itemIndex} из {itemsTotal}
               </span>
-              {draftsSaved > 0 ? (
-                <span className="draft-batch-saved-badge">{draftsSaved} сохранено</span>
+              {itemsPublished > 0 ? (
+                <span className="draft-batch-saved-badge">Отправлено {itemsPublished}</span>
               ) : null}
             </div>
           ) : null}
         </div>
         <button type="button" className="secondary-button" onClick={onBack}>
-          Новый черновик
+          Новая публикация
         </button>
       </div>
 
@@ -947,12 +1556,16 @@ function PublishProgressPanel({ jobId, summary, onBack }) {
             <span className="draft-summary-value">{summary.title}</span>
           </span>
           <span className="draft-summary-item">
-            <span className="draft-summary-label">Цена</span>
+            <span className="draft-summary-label">Цена товара</span>
             <span className="draft-summary-value">{summary.price?.toLocaleString("ru-RU")} ₽</span>
           </span>
           <span className="draft-summary-item">
-            <span className="draft-summary-label">Город</span>
-            <span className="draft-summary-value">{summary.city}</span>
+            <span className="draft-summary-label">Геолокаций</span>
+            <span className="draft-summary-value">{summary.locationsCount}</span>
+          </span>
+          <span className="draft-summary-item">
+            <span className="draft-summary-label">Потолок просмотра</span>
+            <span className="draft-summary-value">{summary.viewPriceMax} ₽</span>
           </span>
           {summary.photosCount != null ? (
             <span className="draft-summary-item">
@@ -962,11 +1575,20 @@ function PublishProgressPanel({ jobId, summary, onBack }) {
           ) : null}
           {summary.draftsCount != null && summary.draftsCount > 1 ? (
             <span className="draft-summary-item">
-              <span className="draft-summary-label">Черновиков</span>
+              <span className="draft-summary-label">Объявлений</span>
               <span className="draft-summary-value">{summary.draftsCount}</span>
             </span>
           ) : null}
         </div>
+      ) : null}
+
+      {/* Объявления, пропущенные автоматикой при skip_item-возобновлении:
+          уже созданы на Авито, но не оплачены — их не трогаем, судьба на
+          пользователе */}
+      {skippedItems.length > 0 ? (
+        <p className="workspace-body-copy" style={{ marginTop: "0.5rem" }}>
+          Пропущены и требуют ручной проверки: {skippedItems.map((n) => `№${n}`).join(", ")}
+        </p>
       ) : null}
 
       {/* Список шагов */}
@@ -1018,18 +1640,40 @@ function PublishProgressPanel({ jobId, summary, onBack }) {
         <div className="draft-terminal draft-terminal-done">
           <p className="draft-terminal-title">
             {isBatch
-              ? `Все черновики сохранены: ${draftsSaved} из ${draftsTotal}`
-              : "Черновик сохранён успешно"}
+              ? `Отправлено ${itemsPublished} из ${itemsTotal}`
+              : "Объявление отправлено"}
           </p>
+          {brandSelected ? (
+            <p className="draft-terminal-copy">
+              Бренд в Авито: <strong>{brandSelected}</strong>.
+            </p>
+          ) : null}
+          {appliedViewPrices.length > 0 ? (
+            <p className="draft-terminal-copy">
+              Фактическая стоимость: {appliedViewPrices.map((item) => (
+                `№${item.item_index} — ${item.price} ₽`
+              )).join("; ")}.
+            </p>
+          ) : null}
+          {addressWarnings.length > 0 ? (
+            <div className="draft-terminal-copy draft-terminal-partial">
+              <strong>Авито применил только город:</strong>
+              <ul>
+                {addressWarnings.map((warning) => (
+                  <li key={`${warning.item_index}-${warning.requested}`}>
+                    №{warning.item_index}: {warning.requested} → {warning.applied}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
           <p className="draft-terminal-copy">
-            Откройте Авито → <strong>Мои объявления → Черновики</strong> — там{" "}
-            {isBatch ? "появились новые черновики" : "появился новый черновик"}.
-            Проверьте {isBatch ? "их" : "его"} перед публикацией.
+            Данные переданы Авито. Наличие объявления во вкладке «Активные» не проверялось.
           </p>
-          {/* Список ссылок на сохранённые черновики */}
-          {result?.saved_urls?.length > 0 ? (
+          {/* Ссылки редактирования переданных объявлений по полученным item id */}
+          {publishedUrls.length > 0 ? (
             <ul className="draft-saved-urls-list">
-              {result.saved_urls.map((url, i) => (
+              {publishedUrls.map((url, i) => (
                 <li key={url} className="draft-saved-urls-item">
                   <a
                     href={url}
@@ -1037,7 +1681,7 @@ function PublishProgressPanel({ jobId, summary, onBack }) {
                     rel="noreferrer"
                     className="draft-saved-url-link"
                   >
-                    Черновик {i + 1}
+                    Открыть объявление {i + 1}
                   </a>
                 </li>
               ))}
@@ -1050,24 +1694,44 @@ function PublishProgressPanel({ jobId, summary, onBack }) {
         <div className="draft-terminal draft-terminal-action">
           <p className="draft-terminal-title">Требуется ваше участие</p>
           {/* Частичный успех при пакетном режиме */}
-          {isBatch && draftsSaved > 0 ? (
+          {isBatch && itemsPublished > 0 ? (
             <p className="draft-terminal-copy draft-terminal-partial">
-              Сохранено {draftsSaved} из {draftsTotal} — остальные требуют действия.
+              Отправлено {itemsPublished} из {itemsTotal}. Остальные не запускались.
             </p>
           ) : null}
           <p className="draft-terminal-copy">
-            {status?.error || "Сервис не смог продолжить автоматически."}
+            {status?.user_action?.message || status?.error || "Сервис не смог продолжить автоматически."}
           </p>
+          {/* Обе остановки по цене (минимум выше потолка и отказ Авито) требуют
+              одного и того же действия — поднять потолок. Но советовать
+              «запустите весь пакет заново» можно ТОЛЬКО когда ещё ничего не
+              отправлено: иначе первые объявления уйдут повторно и спишутся
+              второй раз (дубли = двойная оплата). */}
+          {status?.user_action?.type === "view_price_too_low"
+            || status?.user_action?.type === "view_price_cap_exceeded" ? (
+            <p className="draft-terminal-copy" style={{ marginTop: "0.75rem" }}>
+              Объявление №{status.user_action.item_index}: минимум Авито — {status.user_action.minimum_view_price} ₽.
+              {itemsPublished > 0 ? (
+                <>
+                  {" "}Увеличьте потолок стоимости просмотра и запустите ТОЛЬКО оставшиеся{" "}
+                  {itemsTotal - itemsPublished}: повторный запуск всего пакета
+                  отправит первые {itemsPublished} второй раз и спишет за них деньги повторно.
+                </>
+              ) : (
+                <>{" "}Увеличьте потолок стоимости просмотра и запустите пакет заново.</>
+              )}
+            </p>
+          ) : null}
         </div>
       ) : null}
 
       {status?.status === "failed" ? (
         <div className="draft-terminal draft-terminal-error">
-          <p className="draft-terminal-title">Не удалось сохранить черновик</p>
+          <p className="draft-terminal-title">Не удалось завершить публикацию</p>
           {/* Частичный успех при пакетном режиме */}
-          {isBatch && draftsSaved > 0 ? (
+          {isBatch && itemsPublished > 0 ? (
             <p className="draft-terminal-copy draft-terminal-partial">
-              Сохранено {draftsSaved} из {draftsTotal} до возникновения ошибки.
+              Отправлено {itemsPublished} из {itemsTotal}. Остальные не запускались.
             </p>
           ) : null}
           <p className="draft-terminal-copy">
@@ -1078,11 +1742,46 @@ function PublishProgressPanel({ jobId, summary, onBack }) {
           </p>
         </div>
       ) : null}
+
+      {status?.status === "interrupted" ? (
+        <div className="draft-terminal draft-terminal-action">
+          <p className="draft-terminal-title">Сервер был перезапущен</p>
+          <p className="draft-terminal-copy">
+            {status?.error || "Сохранённый прогресс найден. Можно продолжить без повторной отправки уже завершённых объявлений."}
+          </p>
+        </div>
+      ) : null}
+
+      {/* Кнопка возобновления доступна при ЛЮБОМ терминальном статусе (в т.ч.
+          красной «Не удалось завершить» и жёлтой «Требуется участие») — её
+          видимость и смысл целиком определяет resume_plan с бэкенда, а не
+          конкретный status/user_action.type */}
+      {canResume && resumePlan ? (
+        <div style={{ marginTop: "1rem" }}>
+          <p className="draft-terminal-copy">{resumePlan.description}</p>
+          <button
+            className="submit-button"
+            type="button"
+            disabled={isResuming}
+            onClick={handleResume}
+            style={{ marginTop: "0.5rem" }}
+          >
+            {isResuming ? "Продолжаем..." : resumePlan.buttonLabel}
+          </button>
+        </div>
+      ) : null}
+
+      {/* Кнопки нет, но пакет не отправлен целиком — честно объясняем почему */}
+      {!canResume && resumeUnavailableReason ? (
+        <p className="draft-terminal-copy" style={{ marginTop: "1rem" }}>
+          {resumeUnavailableReason}
+        </p>
+      ) : null}
     </section>
   );
 }
 
-// ─── Страница черновика (корень) ──────────────────────────────────────────────
+// ─── Страница публикации (корень) ─────────────────────────────────────────────
 
 // Фазы: "form" | "preparing" | "preview" | "publishing"
 export default function DraftPage() {
@@ -1158,7 +1857,7 @@ export default function DraftPage() {
         {/* Topbar */}
         <header className="workspace-page-header">
           <Topbar
-            ariaLabel="Навигация черновика"
+            ariaLabel="Навигация публикации"
             links={[
               { to: "/workspace", label: "Аналитика" },
               { to: "/", label: "К кейсу" },
@@ -1167,12 +1866,12 @@ export default function DraftPage() {
 
           <div className="workspace-header-shell">
             <div className="workspace-header-copy">
-              <p className="section-kicker">Draft</p>
-              <h1 className="workspace-title">Черновик объявления</h1>
+              <p className="section-kicker">Publish</p>
+              <h1 className="workspace-title">Публикация объявлений</h1>
               {phase === "form" ? (
                 <p className="workspace-intro-copy">
-                  Заполните форму — сервис откроет форму Авито в вашем Chrome и сохранит черновик
-                  кнопкой «Сохранить и выйти». Для работы нужен запущенный{" "}
+                  Заполните форму — сервис последовательно опубликует объявления в вашем Chrome,
+                  задаст стоимость просмотра и откажется от дополнительных услуг. Для работы нужен запущенный{" "}
                   <code style={{ fontFamily: "var(--font-mono)", fontSize: "0.85em" }}>
                     start-chrome.bat
                   </code>{" "}
@@ -1192,7 +1891,7 @@ export default function DraftPage() {
         </header>
 
         {/* Основной контент */}
-        <section className="workspace-main-stack" aria-label="Форма черновика">
+        <section className="workspace-main-stack" aria-label="Форма публикации">
           {phase === "form" ? (
             <DraftForm onStarted={handleStarted} onPrepared={handlePrepared} />
           ) : phase === "preparing" ? (

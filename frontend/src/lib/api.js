@@ -22,6 +22,15 @@ export async function fetchPublishCategories() {
   return readJson(response);
 }
 
+export async function generateAddresses(cities, usedLocations = []) {
+  const response = await fetch("/api/addresses/generate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cities, used_locations: usedLocations }),
+  });
+  return readJson(response);
+}
+
 export async function startSearch(payload) {
   const response = await fetch("/api/search", {
     method: "POST",
@@ -74,6 +83,13 @@ export async function fetchPublishResult(jobId) {
   return readJson(response);
 }
 
+export async function resumePublish(jobId) {
+  const response = await fetch(`/api/publish/resume/${jobId}`, {
+    method: "POST",
+  });
+  return readJson(response);
+}
+
 // ─── Prepare API (фаза превью вариантов) ─────────────────────────────────────
 
 export async function startPrepare(formData) {
@@ -100,6 +116,20 @@ export async function regenerateDraft(prepId, draftIndex) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ prep_id: prepId, draft_index: draftIndex }),
+  });
+  return readJson(response);
+}
+
+export async function updateDraftText(prepId, draftIndex, title, description) {
+  const response = await fetch("/api/publish/prepare/update-text", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      prep_id: prepId,
+      draft_index: draftIndex,
+      title: title.trim(),
+      description: description.trim(),
+    }),
   });
   return readJson(response);
 }

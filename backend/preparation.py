@@ -31,7 +31,12 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from photo_variation import apply_preset, build_presets, heif_available, output_ext_for
+from photo_variation import (
+    apply_preset,
+    build_modified_presets,
+    heif_available,
+    output_ext_for,
+)
 from publisher import (
     ALLOWED_PHOTO_EXTENSIONS,
     ALLOWED_PHOTO_MIME,
@@ -42,7 +47,7 @@ from publisher import (
     MIN_PHOTOS,
     parse_drafts_count,
 )
-from text_variation import vary_listing
+from text_variation import normalize_title_key, vary_listing
 
 logger = logging.getLogger(__name__)
 
@@ -108,28 +113,15 @@ def _photo_for_draft(
 ) -> tuple[bytes, str, "str | None"]:
     """Готовит байты одного фото для черновика.
 
-    Вариант №1 — точная копия оригинала с РОДНЫМ расширением (без пересжатия и
-    потери метаданных/ориентации/цвета), КРОМЕ HEIC/HEIF: их браузер предпросмотра
-    и форма Авито не покажут, поэтому №1 для HEIC конвертируется в JPEG нейтральным
-    пресетом (preset для №1 как раз нейтральный). Варианты №2..N — обработка
-    переданным пресетом.
+    Каждый вариант, включая №1, обрабатывается переданным пресетом.
 
     Возвращает (байты, расширение_с_точкой, предупреждение|None). Предупреждение
-    задаётся ТОЛЬКО для №2..N, если обработка не изменила байты — значит вариация
+    задаётся, если обработка не изменила байты — значит вариация
     не применилась (apply_preset молча вернул оригинал), и пользователь должен это
     увидеть в превью, а не получить «клон» под видом варианта.
     """
     suffix = (src_suffix or "").lower()
 
-    if draft_idx == 1:
-        if suffix in (".heic", ".heif"):
-            # HEIC нельзя отдать как есть — конвертируем нейтральным пресетом в JPEG
-            converted = apply_preset(raw_bytes, preset)
-            return converted, output_ext_for(suffix), None
-        # JPEG/PNG/GIF/прочее web-совместимое — байт-в-байт копия оригинала
-        return raw_bytes, (suffix or ".jpg"), None
-
-    # Варианты №2..N — осмысленная обработка пресетом
     processed = apply_preset(raw_bytes, preset)
     out_ext = output_ext_for(suffix)
     warning: "str | None" = None
@@ -240,8 +232,8 @@ async def run_prep_job(
 
     Алгоритм:
         1. status=running, шаг vary_texts: один вызов vary_listing на все N,
-           seed случайный, вариант №1 — нетронутый оригинал.
-        2. Шаг vary_photos: build_presets(n, seed), для черновика i — все фото
+           seed случайный; изменяются все варианты, включая №1.
+        2. Шаг vary_photos: build_modified_presets(n, seed), для черновика i — все фото
            через пресет i (одна технология на черновик); ошибки apply_preset
            глотает сам, заметку пишем в notes если байты не изменились.
         3. Раскладка по папкам.
@@ -300,7 +292,7 @@ async def run_prep_job(
         # ── Шаг 2: vary_photos ───────────────────────────────────────────────
         _set_prep_step(job, "vary_photos")
 
-        presets = build_presets(drafts_count, seed=seed)
+        presets = build_modified_presets(drafts_count, seed=seed)
         logger.info(
             "Подготовка %s: построено %d пресетов фото",
             prep_id,
@@ -326,7 +318,7 @@ async def run_prep_job(
             (d_dir / "title.txt").write_text(tv.title, encoding="utf-8")
             (d_dir / "text.txt").write_text(tv.description, encoding="utf-8")
 
-            # Фото: №1 — точная копия оригинала, №2..N — обработка пресетом.
+            # Фото каждого варианта обрабатываются своим пресетом.
             # Заметки текста (notes) и предупреждения о сбоях фото (warnings)
             # храним раздельно: warnings выводятся отдельным заметным блоком в UI.
             notes = tv.notes or ""
@@ -391,17 +383,14 @@ def regenerate_draft(prep_dir: Path, draft_index: int) -> dict:
     Источники читает из prep_dir/source/. Перезаписывает файлы
     draft_{NN}/title.txt, draft_{NN}/text.txt, draft_{NN}/photos/*, meta.json.
 
-    Ограничение: draft_index >= 2 (вариант №1 — оригинал, не перегенерируется).
+    Допустим любой существующий вариант, включая №1.
     Число вариантов n берётся из числа существующих папок draft_* в prep_dir.
 
     Возвращает обновлённую карточку (как в build_result) для этого черновика.
-    Бросает ValueError при draft_index < 2.
+    Бросает ValueError при draft_index < 1.
     """
-    if draft_index < 2:
-        raise ValueError(
-            f"Вариант №1 — оригинал, перегенерация запрещена. "
-            f"Переданный draft_index={draft_index}"
-        )
+    if draft_index < 1:
+        raise ValueError(f"draft_index должен быть >= 1, получено: {draft_index}")
 
     src_dir = _source_dir(prep_dir)
 
@@ -430,14 +419,26 @@ def regenerate_draft(prep_dir: Path, draft_index: int) -> dict:
         new_seed,
     )
 
-    # Текстовые варианты: генерируем все n, берём вариант с индексом draft_index-1
+    # Текстовые варианты: не разрешаем новому заголовку совпасть с любым другим
+    # уже подготовленным черновиком пакета.
+    reserved_titles = {
+        (_draft_dir(prep_dir, index) / "title.txt").read_text(encoding="utf-8")
+        for index in range(1, n + 1)
+        if index != draft_index
+        and (_draft_dir(prep_dir, index) / "title.txt").exists()
+    }
     text_variants = vary_listing(
-        title, description, n, seed=new_seed, facts=facts
+        title,
+        description,
+        n,
+        seed=new_seed,
+        facts=facts,
+        reserved_titles=reserved_titles,
     )
     tv = text_variants[draft_index - 1]
 
     # Фото-пресеты: генерируем все n, берём пресет с индексом draft_index-1
-    presets = build_presets(n, seed=new_seed)
+    presets = build_modified_presets(n, seed=new_seed)
     preset = presets[draft_index - 1]
 
     # Исходные фото
@@ -454,7 +455,7 @@ def regenerate_draft(prep_dir: Path, draft_index: int) -> dict:
     (d_dir / "title.txt").write_text(tv.title, encoding="utf-8")
     (d_dir / "text.txt").write_text(tv.description, encoding="utf-8")
 
-    # Перезаписываем фото (draft_index всегда >= 2 — обработка пресетом)
+    # Перезаписываем фото выбранного варианта.
     notes = tv.notes or ""
     warnings: list[str] = []
     for j, src_photo in enumerate(source_photo_paths, start=1):
@@ -488,6 +489,62 @@ def regenerate_draft(prep_dir: Path, draft_index: int) -> dict:
     )
 
     # Собираем карточку
+    prep_id = prep_dir.name.removeprefix("prep_")
+    return _build_card(prep_id, draft_index, d_dir)
+
+
+def update_draft_text(
+    prep_dir: Path,
+    draft_index: int,
+    title: str,
+    description: str,
+) -> dict:
+    """Сохраняет ручную правку названия и описания одного варианта.
+
+    Фотографии, preset, notes и warnings не меняются. Возвращает карточку в
+    том же формате, что `build_result` и `regenerate_draft`.
+    """
+    n_drafts = _count_draft_dirs(prep_dir)
+    if draft_index < 1 or draft_index > n_drafts:
+        raise ValueError(
+            f"Черновик с индексом {draft_index} не существует "
+            f"(всего черновиков: {n_drafts})"
+        )
+
+    normalized_title = str(title).strip()
+    normalized_description = str(description).strip()
+    if not normalized_title:
+        raise ValueError("Название: поле не заполнено")
+    if not normalized_description:
+        raise ValueError("Описание: поле не заполнено")
+
+    title_key = normalize_title_key(normalized_title)
+    for index in range(1, n_drafts + 1):
+        if index == draft_index:
+            continue
+        other_title_path = _draft_dir(prep_dir, index) / "title.txt"
+        if (
+            other_title_path.exists()
+            and normalize_title_key(
+                other_title_path.read_text(encoding="utf-8")
+            ) == title_key
+        ):
+            raise ValueError(
+                "Название должно отличаться от остальных вариантов пакета"
+            )
+
+    d_dir = _draft_dir(prep_dir, draft_index)
+    if not d_dir.is_dir():
+        raise ValueError(f"Папка варианта не найдена: {d_dir}")
+
+    (d_dir / "title.txt").write_text(normalized_title, encoding="utf-8")
+    (d_dir / "text.txt").write_text(normalized_description, encoding="utf-8")
+
+    logger.info(
+        "Ручная правка текста черновика %d/%d сохранена",
+        draft_index,
+        n_drafts,
+    )
     prep_id = prep_dir.name.removeprefix("prep_")
     return _build_card(prep_id, draft_index, d_dir)
 
@@ -607,8 +664,8 @@ if __name__ == "__main__":
     )
     print("[OK] Тест 3: 0 фото и 11 фото → ошибка photos")
 
-    # ── Тест 4: validate_prepare_form — drafts_count "0"/"11"/"abc" ──────────
-    for bad_dc in ("0", "11", "abc"):
+    # ── Тест 4: validate_prepare_form — drafts_count "0"/"21"/"abc" ──────────
+    for bad_dc in ("0", "21", "abc"):
         errs = validate_prepare_form(
             {"title": "Название", "description": "Описание", "drafts_count": bad_dc},
             [("p.jpg", "image/jpeg", 1024)],
@@ -616,7 +673,7 @@ if __name__ == "__main__":
         assert any(e["field"] == "drafts_count" for e in errs), (
             f"drafts_count={bad_dc!r} должно отклоняться: {errs}"
         )
-    print("[OK] Тест 4: drafts_count '0'/'11'/'abc' → ошибка drafts_count")
+    print("[OK] Тест 4: drafts_count '0'/'21'/'abc' → ошибка drafts_count")
 
     # ── Тест 5: validate_prepare_form — валидная форма → пустой список ────────
     errs = validate_prepare_form(
@@ -688,14 +745,14 @@ if __name__ == "__main__":
                 f"Ожидали 2 photo_urls, получили {len(_c['photo_urls'])}: {_c}"
             )
 
-        # Карточка 1 — оригинал (title и description совпадают с исходными)
+        # Карточка 1 — полноценный изменённый вариант.
         _orig_title = "Пиджак Hugo Boss"
         _orig_desc = "Отличный пиджак, без дефектов. Размер 48."
-        assert _cards[0]["title"] == _orig_title, (
-            f"Карточка 1 title={_cards[0]['title']!r}, ожидалось {_orig_title!r}"
+        assert _cards[0]["title"] != _orig_title, (
+            f"Карточка 1 сохранила исходное название: {_orig_title!r}"
         )
-        assert _cards[0]["description"] == _orig_desc, (
-            f"Карточка 1 description изменилась"
+        assert _cards[0]["description"] != _orig_desc, (
+            "Карточка 1 сохранила исходное описание"
         )
 
         # Все карточки несут поле warnings (список, обычно пустой)
@@ -703,11 +760,11 @@ if __name__ == "__main__":
             assert "warnings" in _c, f"Карточка без поля warnings: {_c}"
             assert isinstance(_c["warnings"], list), f"warnings не список: {_c}"
 
-        # Фото варианта №1 — точная байт-в-байт копия исходника (дефект №1)
+        # Фото каждого варианта, включая №1, обработано.
         _src_photo1 = sorted((_base / "source" / "photos").iterdir())[0].read_bytes()
         _draft1_photo1 = sorted((_base / "draft_01" / "photos").iterdir())[0].read_bytes()
-        assert _draft1_photo1 == _src_photo1, (
-            "Фото варианта №1 не равно исходнику — №1 должен быть точной копией"
+        assert _draft1_photo1 != _src_photo1, (
+            "Фото варианта №1 совпало с исходником — вариация не применилась"
         )
         # Фото варианта №2 — обработано, отличается от исходника
         _draft2_photo1 = sorted((_base / "draft_02" / "photos").iterdir())[0].read_bytes()
@@ -715,7 +772,7 @@ if __name__ == "__main__":
             "Фото варианта №2 совпало с исходником — вариация не применилась"
         )
 
-        print("[OK] Тест 6: run_prep_job + build_result — структура, копия №1, warnings")
+        print("[OK] Тест 6: run_prep_job + build_result — все варианты изменены, warnings")
 
         # ── Тест 7: regenerate_draft — изменение черновика 2 ─────────────────
         # Запоминаем байты до перегенерации
@@ -757,14 +814,12 @@ if __name__ == "__main__":
 
         print("[OK] Тест 7: regenerate_draft(2) — изменены title/фото черновика 2, draft_01 и draft_03 не тронуты")
 
-        # ── Тест 8: regenerate_draft(1) → ValueError ──────────────────────────
-        _raised = False
-        try:
-            regenerate_draft(_base, 1)
-        except ValueError:
-            _raised = True
-        assert _raised, "regenerate_draft(1) должен бросать ValueError"
-        print("[OK] Тест 8: regenerate_draft(1) → ValueError")
+        # ── Тест 8: regenerate_draft(1) разрешён ─────────────────────────────
+        _card1 = regenerate_draft(_base, 1)
+        assert _card1["index"] == 1, _card1
+        assert _card1["title"].strip() and _card1["description"].strip(), _card1
+        assert "оригинал" not in _card1["preset_name"].lower(), _card1
+        print("[OK] Тест 8: regenerate_draft(1) → обновлённый вариант")
 
     # ── Тест 9: ошибка задачи — несуществующая папка исходников ──────────────
     with tempfile.TemporaryDirectory() as _tmpdir2:
@@ -817,7 +872,7 @@ if __name__ == "__main__":
         _pv._HEIF_REGISTERED = _saved_flag
     print("[OK] Тест 10: HEIC без pillow-heif → ошибка валидации с подсказкой")
 
-    # ── Тест 11: сбой обработки фото варианта 2..N → warnings непуст, статус done ──
+    # ── Тест 11: сбой обработки фото любого варианта → warnings, status done ─
     with tempfile.TemporaryDirectory() as _tmpdir3:
         _base3 = Path(_tmpdir3) / "prep_warn001"
         _base3.mkdir()
@@ -843,15 +898,14 @@ if __name__ == "__main__":
             f"Тест 11: ожидали status=done (graceful), получили {_job3}"
         )
         _cards3 = build_result(_base3, 2)
-        # №1 — копия исходника (битые байты копируются как есть), warnings пуст
-        assert _cards3[0]["warnings"] == [], (
-            f"Тест 11: №1 — копия, warnings должен быть пуст: {_cards3[0]['warnings']}"
+        assert _cards3[0]["warnings"], (
+            f"Тест 11: №1 на битом фото должен иметь warnings: {_cards3[0]}"
         )
         # №2 — обработка сорвалась на битом файле → warnings непуст
         assert _cards3[1]["warnings"], (
             f"Тест 11: №2 на битом фото должен иметь warnings: {_cards3[1]}"
         )
-    print("[OK] Тест 11: сбой обработки фото варианта 2 → warnings непуст, статус done")
+    print("[OK] Тест 11: сбой обработки фото всех вариантов → warnings, статус done")
 
     print("\n=== Все самотесты preparation.py пройдены ===")
     sys.exit(0)

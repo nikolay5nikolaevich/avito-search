@@ -1787,6 +1787,250 @@ button {
   gap: 1rem;
 }
 
+.draft-form-fields {
+  display: contents;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.draft-form-fields:disabled {
+  cursor: wait;
+}
+
+.draft-persistence-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding-bottom: 0.2rem;
+}
+
+.draft-persistence-status,
+.draft-persistence-error {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  line-height: 1.45;
+}
+
+.draft-persistence-status {
+  color: var(--bone-faint);
+}
+
+.draft-persistence-error {
+  margin-top: 0.25rem;
+  color: rgba(255, 150, 150, 0.95);
+}
+
+.draft-persistence-clear {
+  flex-shrink: 0;
+  padding: 0.35rem 0;
+  border: 0;
+  background: transparent;
+  color: var(--bone-faint);
+  font: inherit;
+  font-size: 0.78rem;
+  text-decoration: underline;
+  text-underline-offset: 0.2rem;
+  cursor: pointer;
+}
+
+.draft-persistence-clear:hover:not(:disabled) {
+  color: var(--bone);
+}
+
+.draft-persistence-clear:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Геолокации пакета: нумерованный реестр, а не набор несвязанных полей */
+.draft-locations-section {
+  display: grid;
+  gap: 0.9rem;
+  padding: 1.15rem;
+  border: 1px solid var(--hairline);
+  border-radius: 1.1rem;
+  background-color: rgba(255, 255, 255, 0.018);
+}
+
+.draft-locations-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.draft-locations-title {
+  margin: 0.3rem 0 0;
+  color: var(--bone);
+  font-family: var(--font-serif);
+  font-size: clamp(1.15rem, 2vw, 1.45rem);
+  font-weight: 500;
+  letter-spacing: -0.025em;
+}
+
+.draft-locations-count {
+  display: grid;
+  place-items: center;
+  min-width: 2.35rem;
+  height: 2.35rem;
+  padding: 0 0.55rem;
+  border: 1px solid var(--hairline);
+  border-radius: 999px;
+  color: var(--bone);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+}
+
+.draft-locations-copy {
+  max-width: 44rem;
+  margin: 0;
+  color: var(--bone-faint);
+  font-size: 0.82rem;
+  line-height: 1.55;
+}
+
+.draft-locations-list {
+  display: grid;
+  gap: 0.7rem;
+}
+
+.draft-location-card {
+  display: grid;
+  grid-template-columns: minmax(8.5rem, 0.32fr) minmax(0, 1fr);
+  gap: 1rem;
+  padding: 1rem;
+  border-top: 1px solid var(--hairline);
+  background-color: var(--ink-700);
+}
+
+.draft-location-card:last-child {
+  border-bottom: 1px solid var(--hairline);
+}
+
+.draft-location-card-header {
+  display: flex;
+  align-items: baseline;
+  gap: 0.7rem;
+  padding-top: 0.15rem;
+}
+
+.draft-location-card-header h4 {
+  margin: 0;
+  color: var(--bone-dim);
+  font-size: 0.88rem;
+  font-weight: 600;
+}
+
+.draft-location-index {
+  color: var(--bone-faint);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+}
+
+.draft-location-fields {
+  display: grid;
+  grid-template-columns: minmax(10rem, 0.72fr) minmax(14rem, 1.28fr);
+  gap: 0.8rem;
+  min-width: 0;
+}
+
+.draft-location-actions,
+.draft-address-input-row {
+  display: flex;
+  gap: 0.65rem;
+  align-items: center;
+}
+
+.draft-location-actions {
+  justify-content: space-between;
+  margin: 0.75rem 0;
+}
+
+.draft-address-input-row .field-input { min-width: 0; flex: 1; }
+
+.draft-address-generate {
+  border: 1px solid var(--line, rgba(255,255,255,.18));
+  background: transparent;
+  color: inherit;
+  border-radius: 0.55rem;
+  padding: 0.58rem 0.78rem;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.draft-address-generate:disabled { opacity: .55; cursor: wait; }
+.draft-osm-attribution { font-size: .78rem; opacity: .72; }
+.draft-osm-attribution a { color: inherit; }
+
+.draft-view-price-field {
+  padding: 1rem 1.1rem;
+  border-left: 2px solid var(--bone-faint);
+  background-color: rgba(255, 255, 255, 0.025);
+}
+
+.draft-view-price-hint {
+  max-width: 48rem;
+  margin: 0.65rem 0 0;
+  color: var(--bone-faint);
+  font-size: 0.78rem;
+  line-height: 1.55;
+}
+
+.draft-view-price-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.8rem 1rem;
+  border-top: 1px solid var(--hairline);
+  border-bottom: 1px solid var(--hairline);
+  color: var(--bone-dim);
+}
+
+.draft-view-price-summary span {
+  color: var(--bone-faint);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.draft-view-price-summary strong {
+  font-size: 0.84rem;
+  font-weight: 600;
+  text-align: right;
+}
+
+@media (max-width: 760px) {
+  .draft-location-card {
+    grid-template-columns: 1fr;
+  }
+
+  .draft-location-fields {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 520px) {
+  .draft-locations-section {
+    padding: 0.9rem;
+  }
+
+  .draft-view-price-summary {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .draft-view-price-summary strong {
+    text-align: left;
+  }
+}
+
 /* ─── Прогресс публикации ─────────────────────────────────────────────────── */
 
 .draft-progress-panel {
@@ -2161,12 +2405,55 @@ button {
   color: var(--bone-faint);
 }
 
-/* Кнопка «Перегенерировать» */
-.draft-regen-btn {
+/* Действия карточки: ручная правка текста и перегенерация */
+.draft-preview-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+
+.draft-regen-btn,
+.draft-edit-btn {
   flex-shrink: 0;
   min-height: 2.4rem;
   padding: 0.5rem 0.95rem;
   font-size: 0.82rem;
+}
+
+.draft-preview-editor {
+  display: grid;
+  gap: 0.85rem;
+  padding: 0.9rem;
+  border: 1px solid rgba(159, 210, 255, 0.2);
+  border-radius: 0.85rem;
+  background-color: rgba(0, 0, 0, 0.14);
+}
+
+.draft-preview-edit-field {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.draft-preview-edit-field > span {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--bone-faint);
+}
+
+.draft-preview-editor-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.65rem;
+  flex-wrap: wrap;
+}
+
+.draft-save-text-btn {
+  width: auto;
+  min-height: 2.7rem;
+  padding: 0.65rem 1.1rem;
 }
 
 /* Название черновика */

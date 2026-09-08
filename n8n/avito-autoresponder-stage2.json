@@ -1,0 +1,1069 @@
+{
+  "name": "Авито — автоответчик и квалификатор лидов (Этап 2)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "trigger-1",
+      "name": "Каждую минуту",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -720,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f0",
+              "name": "avito_client_id",
+              "value": "ВСТАВЬ_CLIENT_ID",
+              "type": "string"
+            },
+            {
+              "id": "f1",
+              "name": "avito_client_secret",
+              "value": "ВСТАВЬ_CLIENT_SECRET",
+              "type": "string"
+            },
+            {
+              "id": "f2",
+              "name": "telegram_bot_token",
+              "value": "ВСТАВЬ_ТОКЕН_ОТ_BOTFATHER",
+              "type": "string"
+            },
+            {
+              "id": "f3",
+              "name": "telegram_chat_id",
+              "value": "ВСТАВЬ_СВОЙ_CHAT_ID",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "Конфиг",
+      "name": "Конфиг",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -500,
+        300
+      ],
+      "notes": "Единственное место, где нужно что-то заполнить руками."
+    },
+    {
+      "parameters": {
+        "url": "https://api.avito.ru/token",
+        "options": {},
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "grant_type",
+              "value": "client_credentials"
+            },
+            {
+              "name": "client_id",
+              "value": "={{ $json.avito_client_id }}"
+            },
+            {
+              "name": "client_secret",
+              "value": "={{ $json.avito_client_secret }}"
+            }
+          ]
+        }
+      },
+      "id": "Токен Авито",
+      "name": "Токен Авито",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -280,
+        300
+      ],
+      "notes": "OAuth2 client_credentials. Токен живёт около 24 часов."
+    },
+    {
+      "parameters": {
+        "url": "https://api.avito.ru/core/v1/accounts/self",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $json.access_token }}"
+            }
+          ]
+        }
+      },
+      "id": "Кто я",
+      "name": "Кто я",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -60,
+        300
+      ],
+      "notes": "Свой user_id — на нём держится работа с мессенджером."
+    },
+    {
+      "parameters": {
+        "url": "=https://api.avito.ru/messenger/v2/accounts/{{ $json.id }}/chats?unread_only=true&limit=50",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $('Токен Авито').first().json.access_token }}"
+            }
+          ]
+        }
+      },
+      "id": "Непрочитанные чаты",
+      "name": "Непрочитанные чаты",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        160,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Отсеиваем чаты, про которые уже писали.\n// staticData — память между запусками, живёт только у активного воркфлоу.\nconst store = $getWorkflowStaticData('global');\nconst seen = store.seen || {};\n\nconst myId = $('Кто я').first().json.id;\nconst chats = $input.first().json.chats || [];\nconst out = [];\n\nfor (const chat of chats) {\n  const lastId = chat.last_message && chat.last_message.id;\n  if (!chat.id || !lastId) continue;\n  if (seen[chat.id] === lastId) continue;\n\n  // Своё же сообщение обрабатывать не надо.\n  if (chat.last_message.author_id === myId) {\n    seen[chat.id] = lastId;\n    continue;\n  }\n  seen[chat.id] = lastId;\n\n  const ctx = (chat.context && chat.context.value) || {};\n  const buyer = (chat.users || []).find(u => u.id !== myId) || {};\n\n  out.push({ json: {\n    chat_id: chat.id,\n    item_id: ctx.id || '',\n    item_title: ctx.title || 'без названия',\n    item_price: ctx.price_string || 'не указана',\n    item_url: ctx.url || '',\n    buyer_name: buyer.name || 'аноним',\n    message_text: (chat.last_message.content && chat.last_message.content.text) || '(нетекстовое сообщение)'\n  }});\n}\n\nstore.seen = seen;\nreturn out;"
+      },
+      "id": "Только новые",
+      "name": "Только новые",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        380,
+        300
+      ],
+      "notes": "Дедупликация: один вопрос не обрабатываем дважды."
+    },
+    {
+      "parameters": {
+        "url": "=https://api.avito.ru/core/v1/items/{{ $json.item_id }}/",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $('Токен Авито').first().json.access_token }}"
+            }
+          ]
+        }
+      },
+      "id": "Карточка объявления",
+      "name": "Карточка объявления",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        600,
+        300
+      ],
+      "notes": "Характеристики берём из карточки, чтобы бот ничего не выдумывал."
+    },
+    {
+      "parameters": {
+        "url": "=https://api.avito.ru/messenger/v3/accounts/{{ $('Кто я').first().json.id }}/chats/{{ $json.chat_id }}/messages/?limit=20",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $('Токен Авито').first().json.access_token }}"
+            }
+          ]
+        }
+      },
+      "id": "История диалога",
+      "name": "История диалога",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        820,
+        300
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "manual-1",
+      "name": "Демо-прогон",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -720,
+        700
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f0",
+              "name": "chat_id",
+              "value": "demo-chat-001",
+              "type": "string"
+            },
+            {
+              "id": "f1",
+              "name": "buyer_name",
+              "value": "Алексей",
+              "type": "string"
+            },
+            {
+              "id": "f2",
+              "name": "item_title",
+              "value": "Пиджак шерстяной, размер 48",
+              "type": "string"
+            },
+            {
+              "id": "f3",
+              "name": "item_price",
+              "value": "4 500 руб.",
+              "type": "string"
+            },
+            {
+              "id": "f4",
+              "name": "item_url",
+              "value": "https://www.avito.ru/moskva/odezhda/pidzhak",
+              "type": "string"
+            },
+            {
+              "id": "f5",
+              "name": "item_description",
+              "value": "Шерсть 100%, состояние отличное, плечи 46 см, длина 74 см",
+              "type": "string"
+            },
+            {
+              "id": "f6",
+              "name": "min_price",
+              "value": "3 800",
+              "type": "string"
+            },
+            {
+              "id": "f7",
+              "name": "message_text",
+              "value": "Здравствуйте! Пиджак ещё актуален? И какой размер по плечам?",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "Тестовый диалог",
+      "name": "Тестовый диалог",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -500,
+        700
+      ],
+      "notes": "Демо-режим: диалог реальной формы без обращения к Авито."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f0",
+              "name": "chat_id",
+              "value": "={{ $json.chat_id }}",
+              "type": "string"
+            },
+            {
+              "id": "f1",
+              "name": "buyer_name",
+              "value": "={{ $json.buyer_name }}",
+              "type": "string"
+            },
+            {
+              "id": "f2",
+              "name": "item_title",
+              "value": "={{ $json.item_title }}",
+              "type": "string"
+            },
+            {
+              "id": "f3",
+              "name": "item_price",
+              "value": "={{ $json.item_price }}",
+              "type": "string"
+            },
+            {
+              "id": "f4",
+              "name": "item_url",
+              "value": "={{ $json.item_url || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "f5",
+              "name": "item_description",
+              "value": "={{ $json.item_description || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "f6",
+              "name": "min_price",
+              "value": "={{ $json.min_price || 'не задана' }}",
+              "type": "string"
+            },
+            {
+              "id": "f7",
+              "name": "message_text",
+              "value": "={{ $json.message_text }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "Правила ответов",
+      "name": "Правила ответов",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1060,
+        480
+      ],
+      "notes": "База знаний диалога: карточка товара и минимальная цена."
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Объявление: {{ $json.item_title }}\nЦена в объявлении: {{ $json.item_price }}\nМинимальная цена (НЕ раскрывать покупателю): {{ $json.min_price }}\nОписание: {{ $json.item_description }}\n\nПокупатель {{ $json.buyer_name }} пишет:\n{{ $json.message_text }}",
+        "options": {
+          "systemMessage": "Ты — помощник продавца одежды на Авито. Отвечаешь от его лица.\n\nТОН: на «вы», коротко, по-человечески, без канцелярита и восклицаний.\nОдно-два предложения. Не повторяй формулировки дословно из раза в раз.\n\nЧТО МОЖНО: подтвердить наличие, назвать размер, состояние, замеры,\nсостав, условия самовывоза — строго по карточке объявления.\n\nКРАСНЫЕ ЛИНИИ — не отвечай сам, ставь класс «hot»:\n— любая цена ниже указанной в объявлении;\n— предоплата, реквизиты, споры по Авито Доставке;\n— адрес, время встречи, номер телефона;\n— всё, чего нет в карточке: характеристики не выдумывать;\n— если не уверен в классе — тоже hot.\n\nКЛАССИФИКАЦИЯ:\ntypical — типовой вопрос, ответ есть в карточке;\nhot — торг, покупка, доставка, встреча: нужен человек;\nspam — реклама услуг, продвижение, «куплю всё за 500».\n\nОТВЕТ СТРОГО В JSON, без markdown:\n{\"class\":\"typical|hot|spam\",\"reply\":\"текст ответа\",\"reason\":\"почему такой класс\"}"
+        }
+      },
+      "id": "agent-1",
+      "name": "Классификатор и черновик",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        1300,
+        480
+      ],
+      "notes": "Классифицирует вопрос и пишет черновик ответа."
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "lm-1",
+      "name": "Claude",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.2,
+      "position": [
+        1220,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $json.chat_id }}",
+        "contextWindowLength": 20
+      },
+      "id": "mem-1",
+      "name": "Память диалога",
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [
+        1400,
+        720
+      ],
+      "notes": "Помнит переписку по каждому покупателю отдельно."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Агент возвращает JSON строкой. Разбираем и подстраховываемся:\n// не разобралось — считаем «горячим», то есть отдаём человеку.\nconst raw = $json.output || $json.text || '';\nlet parsed;\n\ntry {\n  const clean = String(raw).replace(/```json|```/g, '').trim();\n  parsed = JSON.parse(clean);\n} catch (e) {\n  parsed = { class: 'hot', reply: '', reason: 'ответ модели не разобран: ' + e.message };\n}\n\nif (!['typical', 'hot', 'spam'].includes(parsed.class)) parsed.class = 'hot';\n\nconst src = $('Правила ответов').first().json;\n\nreturn [{ json: {\n  class: parsed.class,\n  reply: parsed.reply || '',\n  reason: parsed.reason || '',\n  chat_id: src.chat_id,\n  buyer_name: src.buyer_name,\n  item_title: src.item_title,\n  item_price: src.item_price,\n  item_url: src.item_url || '',\n  message_text: src.message_text\n}}];"
+      },
+      "id": "Разбор ответа",
+      "name": "Разбор ответа",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        480
+      ],
+      "notes": "Не разобрали ответ модели — отдаём человеку. Не угадываем."
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r1",
+                    "leftValue": "={{ $json.class }}",
+                    "rightValue": "typical",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Типовой"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r2",
+                    "leftValue": "={{ $json.class }}",
+                    "rightValue": "hot",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Горячий"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r3",
+                    "leftValue": "={{ $json.class }}",
+                    "rightValue": "spam",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Мусор"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "switch-1",
+      "name": "Куда направить",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1780,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.avito.ru/messenger/v1/accounts/{{ $('Кто я').first().json.id }}/chats/{{ $json.chat_id }}/messages",
+        "options": {},
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $('Токен Авито').first().json.access_token }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "type",
+              "value": "text"
+            },
+            {
+              "name": "message",
+              "value": "={{ $json.reply }}"
+            }
+          ]
+        }
+      },
+      "id": "Ответить покупателю",
+      "name": "Ответить покупателю",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2040,
+        300
+      ],
+      "notes": "Этап 3. Выключена: на Этапе 2 всё уходит только через кнопку.",
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "url": "=https://api.telegram.org/bot{{ $('Конфиг').first().json.telegram_bot_token }}/sendMessage",
+        "options": {},
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "chat_id",
+              "value": "={{ $('Конфиг').first().json.telegram_chat_id }}"
+            },
+            {
+              "name": "text",
+              "value": "=Горячий лид\n\nОбъявление: {{ $json.item_title }}\nЦена: {{ $json.item_price }}\nПокупатель: {{ $json.buyer_name }}\n\nПишет: {{ $json.message_text }}\n\nПочему не отвечаю сам: {{ $json.reason }}\n\nЧерновик ответа:\n{{ $json.reply }}"
+            },
+            {
+              "name": "reply_markup",
+              "value": "={{ JSON.stringify({ inline_keyboard: [[ { text: \"Отправить\", callback_data: \"send:\" + $json.chat_id }, { text: \"Отвечу сам\", callback_data: \"skip:\" + $json.chat_id } ]] }) }}"
+            },
+            {
+              "name": "disable_web_page_preview",
+              "value": "true"
+            }
+          ]
+        }
+      },
+      "id": "Черновик в Telegram",
+      "name": "Черновик в Telegram",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2040,
+        480
+      ],
+      "notes": "Кнопки «Отправить» и «Отвечу сам». Без нажатия не уходит ничего."
+    },
+    {
+      "parameters": {},
+      "id": "noop-1",
+      "name": "Мусор — молча в лог",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2040,
+        660
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Журнал: что пришло, как классифицировали, что ответили.\n// Без него нельзя разобрать инцидент постфактум.\nconst store = $getWorkflowStaticData('global');\nstore.journal = store.journal || [];\n\nconst rec = {\n  ts: $now.toISO(),\n  chat_id: $json.chat_id,\n  item: $json.item_title,\n  buyer: $json.buyer_name,\n  question: $json.message_text,\n  class: $json.class,\n  reply: $json.reply,\n  reason: $json.reason\n};\n\nstore.journal.push(rec);\nif (store.journal.length > 500) store.journal.shift();\n\nreturn [{ json: rec }];"
+      },
+      "id": "Журнал диалогов",
+      "name": "Журнал диалогов",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2300,
+        480
+      ],
+      "notes": "Аудит: когда, что спросили, как классифицировали, что ответили."
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "avito-approve",
+        "options": {}
+      },
+      "id": "hook-1",
+      "name": "Нажатие кнопки",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        1780,
+        900
+      ],
+      "webhookId": "avito-approve"
+    },
+    {
+      "parameters": {
+        "jsCode": "// callback_data приходит как \"send:<chat_id>\" или \"skip:<chat_id>\".\nconst cb = $json.body && $json.body.callback_query;\nif (!cb) return [];\n\nconst parts = String(cb.data || '').split(':');\nreturn [{ json: { action: parts[0], chat_id: parts[1], approved: parts[0] === 'send' } }];"
+      },
+      "id": "Разбор нажатия",
+      "name": "Разбор нажатия",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2040,
+        900
+      ],
+      "notes": ""
+    },
+    {
+      "parameters": {
+        "url": "=https://api.avito.ru/messenger/v1/accounts/{{ $('Кто я').first().json.id }}/chats/{{ $json.chat_id }}/messages",
+        "options": {},
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $('Токен Авито').first().json.access_token }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "type",
+              "value": "text"
+            },
+            {
+              "name": "message",
+              "value": "={{ $json.reply }}"
+            }
+          ]
+        }
+      },
+      "id": "Отправить подтверждённое",
+      "name": "Отправить подтверждённое",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2300,
+        900
+      ],
+      "notes": "Единственный путь сообщения к покупателю на Этапе 2."
+    },
+    {
+      "parameters": {},
+      "id": "err-1",
+      "name": "Сбой в воркфлоу",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        -720,
+        1080
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.telegram.org/bot{{ $('Конфиг').first().json.telegram_bot_token }}/sendMessage",
+        "options": {},
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "chat_id",
+              "value": "={{ $('Конфиг').first().json.telegram_chat_id }}"
+            },
+            {
+              "name": "text",
+              "value": "=Автоответчик упал\n\nНода: {{ $json.execution.lastNodeExecuted }}\nОшибка: {{ $json.execution.error.message }}"
+            }
+          ]
+        }
+      },
+      "id": "Алерт о сбое",
+      "name": "Алерт о сбое",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -460,
+        1080
+      ],
+      "notes": "Молча падать нельзя — о сбое узнаём сразу."
+    },
+    {
+      "parameters": {
+        "content": "## Авито — автоответчик и квалификатор лидов\n\n**Этап 2: черновики с подтверждением.**\nПокупателю ничего не уходит без нажатия кнопки в Telegram.\n\nДва входа: расписание (боевой режим) и ручной запуск\n(демо на тестовых данных).",
+        "height": 200,
+        "width": 700,
+        "color": 4
+      },
+      "id": "Заголовок",
+      "name": "Заголовок",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -760,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 1. Сбор контекста\n\nOAuth2 → свой user_id → непрочитанные чаты →\nдедупликация → карточка товара → история переписки.\n\nДедупликация через staticData: повторный запуск\nне обработает один вопрос дважды.",
+        "height": 200,
+        "width": 620,
+        "color": 7
+      },
+      "id": "Пояснение — сбор",
+      "name": "Пояснение — сбор",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -300,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 2. Классификация и черновик\n\nАгент получает карточку товара, минимальную цену\nи историю диалога. Память отдельная на каждого\nпокупателя, ключ — chat_id.\n\n**Красные линии** в системном промпте: цена ниже\nобъявленной, предоплата, адрес, телефон —\nвсегда человек. Не уверен — тоже человек.",
+        "height": 280,
+        "width": 520,
+        "color": 3
+      },
+      "id": "Пояснение — ИИ",
+      "name": "Пояснение — ИИ",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1180,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 3. Три исхода\n\n**Типовой** — ответ по карточке (Этап 3, пока выключен).\n**Горячий** — черновик человеку с кнопками.\n**Мусор** — молча в журнал.\n\nЖурнал пишет каждое решение: аудит и разбор инцидентов.",
+        "height": 220,
+        "width": 560,
+        "color": 7
+      },
+      "id": "Пояснение — ветвление",
+      "name": "Пояснение — ветвление",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1960,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 4. Человек в контуре\n\nWebhook принимает нажатие кнопки из Telegram\nи только тогда отправляет ответ в Авито.",
+        "height": 160,
+        "width": 520,
+        "color": 5
+      },
+      "id": "Пояснение — человек в контуре",
+      "name": "Пояснение — человек в контуре",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1740,
+        1080
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 5. Обработка сбоев\n\nError Trigger ловит падение любой ноды\nи шлёт уведомление в Telegram.\n\nМолчаливое падение — худший сценарий:\nлиды теряются, а никто не знает.",
+        "height": 200,
+        "width": 520,
+        "color": 2
+      },
+      "id": "Пояснение — сбои",
+      "name": "Пояснение — сбои",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -760,
+        1260
+      ]
+    }
+  ],
+  "connections": {
+    "Каждую минуту": {
+      "main": [
+        [
+          {
+            "node": "Конфиг",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Конфиг": {
+      "main": [
+        [
+          {
+            "node": "Токен Авито",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Токен Авито": {
+      "main": [
+        [
+          {
+            "node": "Кто я",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Кто я": {
+      "main": [
+        [
+          {
+            "node": "Непрочитанные чаты",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Непрочитанные чаты": {
+      "main": [
+        [
+          {
+            "node": "Только новые",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Только новые": {
+      "main": [
+        [
+          {
+            "node": "Карточка объявления",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Карточка объявления": {
+      "main": [
+        [
+          {
+            "node": "История диалога",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "История диалога": {
+      "main": [
+        [
+          {
+            "node": "Правила ответов",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Демо-прогон": {
+      "main": [
+        [
+          {
+            "node": "Тестовый диалог",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Тестовый диалог": {
+      "main": [
+        [
+          {
+            "node": "Правила ответов",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Правила ответов": {
+      "main": [
+        [
+          {
+            "node": "Классификатор и черновик",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Классификатор и черновик",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Память диалога": {
+      "ai_memory": [
+        [
+          {
+            "node": "Классификатор и черновик",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Классификатор и черновик": {
+      "main": [
+        [
+          {
+            "node": "Разбор ответа",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Разбор ответа": {
+      "main": [
+        [
+          {
+            "node": "Куда направить",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Куда направить": {
+      "main": [
+        [
+          {
+            "node": "Ответить покупателю",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Черновик в Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Мусор — молча в лог",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ответить покупателю": {
+      "main": [
+        [
+          {
+            "node": "Журнал диалогов",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Черновик в Telegram": {
+      "main": [
+        [
+          {
+            "node": "Журнал диалогов",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Мусор — молча в лог": {
+      "main": [
+        [
+          {
+            "node": "Журнал диалогов",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Нажатие кнопки": {
+      "main": [
+        [
+          {
+            "node": "Разбор нажатия",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Разбор нажатия": {
+      "main": [
+        [
+          {
+            "node": "Отправить подтверждённое",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Сбой в воркфлоу": {
+      "main": [
+        [
+          {
+            "node": "Алерт о сбое",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

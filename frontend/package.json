@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "test": "node --test src/lib/*.test.mjs tests/*.mjs",
     "build": "vite build"
   },
   "dependencies": {

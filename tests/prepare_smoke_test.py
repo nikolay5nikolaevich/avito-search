@@ -7,20 +7,22 @@ Smoke-тест веб-слоя фазы подготовки вариантов 
     GET  /api/publish/prepare/result/{prep_id} → список карточек
     GET  /api/publish/prepare/photo/{prep_id}/{draft_index}/{photo_index}
     POST /api/publish/prepare/regenerate → обновлённая карточка
+    POST /api/publish/prepare/update-text → ручное сохранение названия/описания
 
 Позитивный сценарий:
     - 2 синтетических PNG (Pillow из памяти)
     - 3 черновика (drafts_count=3)
-    - черновик №1 == оригинал (title/description не изменяются)
-    - черновики №2 и №3 отличаются от оригинала и друг от друга
+    - каждый черновик, включая №1, отличается от исходника
+    - названия и описания всех черновиков различаются
     - фото доступны по /photo/ URL, Content-Type image/*
     - regenerate черновика №2 → описание и/или байты фото изменились
+    - название и описание любого варианта можно вручную изменить без изменения фото
 
 Негативные кейсы:
     - пустое описание → 422 (поле description)
-    - drafts_count=11  → 422 (поле drafts_count)
+    - drafts_count=21  → 422 (поле drafts_count)
     - 0 фото           → 422 (поле photos)
-    - regenerate draft_index=1 → 422 (поле draft_index)
+    - regenerate draft_index=1 → обновлённая карточка
     - status неизвестного prep_id → 404
 
 Запуск:
@@ -265,38 +267,28 @@ def run_prepare_smoke_test() -> None:
     checks_passed += 1
     print(f"  Проверка 4 PASS: структура карточек корректна (ключи + 2 photo_urls у каждого)")
 
-    # ── Проверка 5: черновик №1 == оригинал ──────────────────────────────────
-    print("Шаг 5: черновик №1 — оригинал (title и description совпадают)")
+    # ── Проверка 5: черновик №1 — такой же изменённый вариант ────────────────
+    print("Шаг 5: черновик №1 отличается от исходника")
     draft1 = drafts[0]
-    assert draft1["title"] == orig_title, (
-        f"Черновик 1 title={draft1['title']!r}, ожидалось {orig_title!r}"
+    assert draft1["title"] != orig_title, (
+        f"Черновик 1 сохранил исходное название: {draft1['title']!r}"
     )
-    assert draft1["description"] == orig_description, (
-        f"Черновик 1 description изменился:\n"
-        f"  ожидалось: {orig_description!r}\n"
-        f"  получили:  {draft1['description']!r}"
+    assert draft1["description"] != orig_description, (
+        f"Черновик 1 сохранил исходное описание: {draft1['description']!r}"
     )
+    assert "артикул" in draft1.get("notes", ""), draft1
     checks_passed += 1
-    print(f"  Проверка 5 PASS: черновик №1 — оригинал (title={draft1['title']!r})")
+    print(f"  Проверка 5 PASS: черновик №1 изменён (title={draft1['title']!r})")
 
-    # ── Проверка 6: описания черновиков 2 и 3 отличаются от оригинала и друг от друга ──
-    print("Шаг 6: описания черновиков 2 и 3 — вариации")
+    # ── Проверка 6: все названия и описания попарно различны ─────────────────
+    print("Шаг 6: все тексты — отдельные варианты")
     desc1 = drafts[0]["description"]
     desc2 = drafts[1]["description"]
     desc3 = drafts[2]["description"]
-    assert desc2 != desc1, (
-        f"Описание черновика 2 совпадает с оригиналом: {desc2!r}"
-    )
-    assert desc3 != desc1, (
-        f"Описание черновика 3 совпадает с оригиналом: {desc3!r}"
-    )
-    assert desc2 != desc3, (
-        f"Описания черновиков 2 и 3 совпадают: {desc2!r}"
-    )
+    assert len({desc1, desc2, desc3}) == 3, [desc1, desc2, desc3]
+    assert len({draft["title"] for draft in drafts}) == 3, drafts
     checks_passed += 1
-    print(
-        f"  Проверка 6 PASS: описания 2 и 3 отличаются от оригинала и друг от друга"
-    )
+    print("  Проверка 6 PASS: названия и описания попарно различны")
 
     # ── Проверка 7: GET фото черновика 1, фото 1 → 200, Content-Type image/* ─
     print("Шаг 7: GET фото черновика 1, фото 1")
@@ -310,13 +302,13 @@ def run_prepare_smoke_test() -> None:
         f"Content-Type фото должен начинаться с 'image/', получили: {ct!r}"
     )
     assert len(photo_bytes) > 0, "Тело фото пустое"
-    # Фото варианта №1 — точная копия загруженного оригинала (дефект №1 аудита)
-    assert photo_bytes == png1, (
-        "Фото черновика №1 не равно загруженному оригиналу — №1 должен быть точной "
-        f"копией (исходник {len(png1)} байт, получено {len(photo_bytes)} байт)"
+    assert photo_bytes != png1, (
+        "Фото черновика №1 осталось точной копией исходника — вариация не применилась "
+        f"(исходник {len(png1)} байт, получено {len(photo_bytes)} байт)"
     )
+    assert "оригинал" not in draft1.get("preset_name", "").lower(), draft1
     checks_passed += 1
-    print(f"  Проверка 7 PASS: GET фото → 200, Content-Type={ct!r}, {len(photo_bytes)} байт, №1 == оригинал")
+    print(f"  Проверка 7 PASS: GET фото → 200, Content-Type={ct!r}, {len(photo_bytes)} байт, №1 изменён")
 
     # ── Проверка 8: POST regenerate (draft 2) → описание И/ИЛИ байты фото изменились ──
     print("Шаг 8: POST regenerate (черновик 2)")
@@ -355,6 +347,82 @@ def run_prepare_smoke_test() -> None:
         f"desc_changed={desc_changed}, photo_changed={photo_changed}"
     )
 
+    # ── Проверка 8а: ручная правка текста сохраняется на диск ────────────────
+    print("Шаг 8а: ручное редактирование текста варианта 1")
+    manual_title = "  Пиджак Hugo Boss — проверено вручную  "
+    manual_description = "  Ручное описание без изменения фотографий.  "
+    original_photo_urls = list(draft1["photo_urls"])
+    sc_edit, body_edit, _ = _post_json(
+        "/api/publish/prepare/update-text",
+        {
+            "prep_id": prep_id,
+            "draft_index": 1,
+            "title": manual_title,
+            "description": manual_description,
+        },
+    )
+    assert sc_edit == 200, (
+        f"POST update-text вернул {sc_edit}, ожидали 200. Тело: {body_edit[:300]}"
+    )
+    edited_card = json.loads(body_edit)
+    assert edited_card["title"] == manual_title.strip(), edited_card
+    assert edited_card["description"] == manual_description.strip(), edited_card
+    assert edited_card["photo_urls"] == original_photo_urls, (
+        "Ручная правка текста не должна менять фотографии"
+    )
+
+    sc_result, body_result, _ = _get(f"/api/publish/prepare/result/{prep_id}")
+    assert sc_result == 200, body_result[:300]
+    persisted_card = json.loads(body_result)["drafts"][0]
+    assert persisted_card["title"] == manual_title.strip(), persisted_card
+    assert persisted_card["description"] == manual_description.strip(), persisted_card
+    checks_passed += 1
+    print("  Проверка 8а PASS: текст сохранён, фото не изменились")
+
+    # ── Проверка 8аа: повтор названия другого варианта отклоняется ─────────
+    print("Шаг 8аа: повтор названия другого варианта → 422")
+    sc_duplicate, body_duplicate, _ = _post_json(
+        "/api/publish/prepare/update-text",
+        {
+            "prep_id": prep_id,
+            "draft_index": 2,
+            "title": "ПИДЖАК HUGO BOSS, ПРОВЕРЕНО ВРУЧНУЮ!",
+            "description": "Другое описание",
+        },
+    )
+    assert sc_duplicate == 422, body_duplicate[:300]
+    duplicate_payload = json.loads(body_duplicate)
+    assert duplicate_payload.get("error"), duplicate_payload
+    assert {
+        error["field"] for error in duplicate_payload.get("errors", [])
+    } == {"title"}, duplicate_payload
+    checks_passed += 1
+    print("  Проверка 8аа PASS: пунктуация и регистр не маскируют повтор")
+
+    # ── Проверка 8б: пустой текст отклоняется и не затирает вариант ─────────
+    print("Шаг 8б: пустое название при ручном редактировании → 422")
+    sc_edit_bad, body_edit_bad, _ = _post_json(
+        "/api/publish/prepare/update-text",
+        {
+            "prep_id": prep_id,
+            "draft_index": 1,
+            "title": "   ",
+            "description": "Непустое описание",
+        },
+    )
+    assert sc_edit_bad == 422, (
+        f"Пустое название update-text: ожидали 422, получили {sc_edit_bad}: "
+        f"{body_edit_bad[:300]}"
+    )
+    edit_errors = json.loads(body_edit_bad).get("errors", [])
+    assert {error["field"] for error in edit_errors} == {"title"}, edit_errors
+
+    _, body_after_bad, _ = _get(f"/api/publish/prepare/result/{prep_id}")
+    after_bad_card = json.loads(body_after_bad)["drafts"][0]
+    assert after_bad_card["title"] == manual_title.strip(), after_bad_card
+    checks_passed += 1
+    print("  Проверка 8б PASS: пустой текст отклонён, сохранённый вариант не затёрт")
+
     # ── Негативные кейсы ─────────────────────────────────────────────────────
     print("Шаг 9: негативный кейс — пустое описание → 422")
     sc_neg, body_neg, _ = _post_multipart(
@@ -373,14 +441,14 @@ def run_prepare_smoke_test() -> None:
     checks_passed += 1
     print(f"  Проверка 9 PASS: пустое описание → 422 (поля={error_fields})")
 
-    print("Шаг 10: негативный кейс — drafts_count=11 → 422")
+    print("Шаг 10: негативный кейс — drafts_count=21 → 422")
     sc_neg, body_neg, _ = _post_multipart(
         "/api/publish/prepare",
-        {"title": "Название", "description": "Описание", "drafts_count": "11"},
+        {"title": "Название", "description": "Описание", "drafts_count": "21"},
         [("photos", "photo_01.png", png1)],
     )
     assert sc_neg == 422, (
-        f"drafts_count=11: ожидали 422, получили {sc_neg}. Тело: {body_neg[:200]}"
+        f"drafts_count=21: ожидали 422, получили {sc_neg}. Тело: {body_neg[:200]}"
     )
     resp_data = json.loads(body_neg)
     error_fields = {e["field"] for e in resp_data.get("errors", [])}
@@ -388,7 +456,7 @@ def run_prepare_smoke_test() -> None:
         f"В 422-ответе нет ошибки поля 'drafts_count': {resp_data}"
     )
     checks_passed += 1
-    print(f"  Проверка 10 PASS: drafts_count=11 → 422 (поля={error_fields})")
+    print(f"  Проверка 10 PASS: drafts_count=21 → 422 (поля={error_fields})")
 
     print("Шаг 11: негативный кейс — 0 фото → 422")
     sc_neg, body_neg, _ = _post_multipart(
@@ -407,21 +475,20 @@ def run_prepare_smoke_test() -> None:
     checks_passed += 1
     print(f"  Проверка 11 PASS: 0 фото → 422 (поля={error_fields})")
 
-    print("Шаг 12: негативный кейс — regenerate draft_index=1 → 422")
-    sc_neg, body_neg, _ = _post_json(
+    print("Шаг 12: regenerate draft_index=1 → 200")
+    sc_regen1, body_regen1, _ = _post_json(
         "/api/publish/prepare/regenerate",
         {"prep_id": prep_id, "draft_index": 1},
     )
-    assert sc_neg == 422, (
-        f"regenerate(draft_index=1): ожидали 422, получили {sc_neg}. Тело: {body_neg[:200]}"
+    assert sc_regen1 == 200, (
+        f"regenerate(draft_index=1): ожидали 200, получили {sc_regen1}. Тело: {body_regen1[:200]}"
     )
-    resp_data = json.loads(body_neg)
-    error_fields = {e["field"] for e in resp_data.get("errors", [])}
-    assert "draft_index" in error_fields, (
-        f"В 422-ответе нет ошибки поля 'draft_index': {resp_data}"
-    )
+    regenerated1 = json.loads(body_regen1)
+    assert regenerated1.get("index") == 1, regenerated1
+    assert regenerated1.get("title") != manual_title.strip(), regenerated1
+    assert "оригинал" not in regenerated1.get("preset_name", "").lower(), regenerated1
     checks_passed += 1
-    print(f"  Проверка 12 PASS: regenerate(draft_index=1) → 422 (поля={error_fields})")
+    print("  Проверка 12 PASS: regenerate(draft_index=1) → обновлённый вариант")
 
     print("Шаг 13: негативный кейс — status неизвестного prep_id → 404")
     sc_neg, body_neg, _ = _get("/api/publish/prepare/status/unknown-prep-id-12345")

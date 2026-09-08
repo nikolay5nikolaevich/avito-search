@@ -1,7 +1,7 @@
 """
 FastAPI-сервер для анализа спроса на Авито.
 
-Запуск из корня проекта: python backend/app.py → http://127.0.0.1:8000
+Запуск из корня проекта: python backend/app.py → http://127.0.0.1:7777
 """
 
 import asyncio
@@ -27,11 +27,13 @@ from fastapi.responses import (
 )
 
 import analytics
+import address_generator
 import cache as cache_mod
 import category_profiles
 import parser as avito_parser
 import photo_variation
 import preparation
+import publish_state
 import publisher
 from cities import CITIES, City, get_cities_by_slugs, get_city_by_slug
 from filters import SearchFilters
@@ -118,6 +120,9 @@ JOBS: dict[str, dict[str, Any]] = {}
 # Задачи публикации черновиков — ОТДЕЛЬНЫЙ dict (не смешивать с JOBS аналитики).
 # Кэша для publish-задач нет: каждый запуск — новый черновик.
 PUBLISH_JOBS: dict[str, dict[str, Any]] = {}
+
+# Сильная ссылка на фоновые publish-задачи нужна и для защиты от двойного resume.
+ACTIVE_PUBLISH_TASKS: dict[str, asyncio.Task[Any]] = {}
 
 # Задачи фазы подготовки вариантов (ТЗ §17): prep_id → запись задачи.
 PREP_JOBS: dict[str, dict[str, Any]] = {}
@@ -336,9 +341,17 @@ def _prepare_search_job(search_data: dict[str, Any]) -> tuple[str, bool]:
 
 @app.on_event("startup")
 def on_startup() -> None:
-    """Инициализируем кэш-базу при старте сервера."""
+    """Инициализируем кэш и возвращаем незавершённые publish-задачи с диска."""
     cache_mod.init_db()
     logger.info("SQLite-кэш инициализирован")
+    recovered = publish_state.recover_publish_states(TMP_PUBLISH_DIR)
+    for job_id, (job, _draft) in recovered.items():
+        PUBLISH_JOBS[job_id] = job
+    if recovered:
+        logger.warning(
+            "Восстановлено незавершённых publish-задач: %d",
+            len(recovered),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -652,18 +665,51 @@ def _format_top3_cells(top3: list) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Публикация черновиков объявлений (ТЗ «черновики Avito», §10)
+# Полная публикация объявлений
 # ---------------------------------------------------------------------------
 
 def _serialize_publish_status(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
     """
-    JSON-статус publish-задачи: {job_id, status, step, step_label, done, total,
-    error, debug_dir} + поля пакетного режима (ТЗ §16): draft_index,
-    drafts_total, drafts_saved.
-    step/step_label/done/total описывают ТЕКУЩИЙ черновик, не суммарный прогресс.
+    JSON-статус publish-задачи с прогрессом переданных Авито объявлений.
+
+    Новые item-поля — источник правды. Старые draft-поля возвращаются как
+    вычисленные алиасы, чтобы не ломать старый frontend во время обновления.
+    step/step_label/done/total описывают ТЕКУЩЕЕ объявление.
     debug_dir — относительный путь дампа сбоя «debug/publish/<job_id>» или None.
     Дефолты всех ключей задаются ОДИН раз при создании задачи в api_publish_start.
     """
+    items_total = (
+        job.get("items_total")
+        if "items_total" in job
+        else job.get("drafts_total")
+    )
+    item_index = (
+        job.get("item_index")
+        if "item_index" in job
+        else job.get("draft_index")
+    )
+    items_published = (
+        job.get("items_published")
+        if "items_published" in job
+        else job.get("drafts_saved")
+    )
+    raw_urls = (
+        job.get("published_urls")
+        if "published_urls" in job
+        else job.get("saved_urls")
+    )
+    published_urls = list(raw_urls or [])
+
+    # Второй режим возобновления (skip_item) добавлен вслед за диагнозом
+    # реального пакета: остановка ПОСЛЕ continue_listing уже создала
+    # объявление на Авито, и is_publish_resume_safe его повтор запрещает —
+    # но пакет всё равно можно докатить пропуском текущего (publish_state.resume_plan).
+    resume_plan = publish_state.resume_plan(job)
+    resume_available = (
+        job.get("status") in {"failed", "needs_user_action", "interrupted"}
+        and resume_plan is not None
+    )
+
     return {
         "job_id": job_id,
         "status": job.get("status"),
@@ -673,9 +719,22 @@ def _serialize_publish_status(job_id: str, job: dict[str, Any]) -> dict[str, Any
         "total": job.get("total"),
         "error": job.get("error"),
         "debug_dir": job.get("debug_dir"),
-        "draft_index": job.get("draft_index"),
-        "drafts_total": job.get("drafts_total"),
-        "drafts_saved": job.get("drafts_saved"),
+        "item_index": item_index,
+        "items_total": items_total,
+        "items_published": items_published,
+        "published_urls": published_urls,
+        "brand_selected": job.get("brand_selected"),
+        "applied_view_prices": list(job.get("applied_view_prices") or []),
+        "address_warnings": list(job.get("address_warnings") or []),
+        "user_action": job.get("user_action"),
+        "resume_available": resume_available,
+        "resume_plan": resume_plan if resume_available else None,
+        "skipped_items": list(job.get("skipped_items") or []),
+        # Временные legacy-алиасы, всегда вычисленные из новых полей.
+        "draft_index": item_index,
+        "drafts_total": items_total,
+        "drafts_saved": items_published,
+        "saved_urls": list(published_urls),
     }
 
 
@@ -684,6 +743,7 @@ async def _run_publish_and_cleanup(
     draft: "publisher.DraftData",
     tmp_dir: Path,
     prep_id: Optional[str],
+    start_index: Optional[int] = None,
 ) -> None:
     """Обёртка фоновой publish-задачи.
 
@@ -694,9 +754,13 @@ async def _run_publish_and_cleanup(
     ВАЖНО: run_publish_job вызывается через атрибут модуля
     (publisher.run_publish_job), чтобы подмена в smoke-тестах работала."""
     job = PUBLISH_JOBS[job_id]
-    drafts_total = int(job.get("drafts_total") or 1)
+    items_total = int(job.get("items_total") or job.get("drafts_total") or 1)
 
-    if not prep_id and drafts_total >= 2:
+    if (
+        not prep_id
+        and items_total >= 2
+        and (start_index is None or int(job.get("items_published") or 0) == 0)
+    ):
         prep_id = job_id  # отдельный uuid не нужен — job_id уникален
         prep_dir = TMP_PUBLISH_DIR / f"prep_{prep_id}"
         job["status"] = "running"
@@ -714,7 +778,7 @@ async def _run_publish_and_cleanup(
         prep_job: dict[str, Any] = {}
         logger.info(
             "Авто-подготовка вариантов для задачи %s: %d черновиков",
-            job_id, drafts_total,
+            job_id, items_total,
         )
         await preparation.run_prep_job(
             prep_id,
@@ -722,7 +786,7 @@ async def _run_publish_and_cleanup(
             title=draft.title,
             description=draft.description,
             source_photos=[Path(p) for p in draft.photo_paths],
-            drafts_count=drafts_total,
+            drafts_count=items_total,
             facts=facts,
             base_dir=prep_dir,
         )
@@ -735,12 +799,29 @@ async def _run_publish_and_cleanup(
             logger.error(
                 "Авто-подготовка задачи %s провалилась: %s", job_id, job["error"]
             )
+            try:
+                publish_state.save_publish_state(tmp_dir, job_id, job, draft)
+            except Exception as exc:
+                logger.error("Не удалось сохранить сбой подготовки %s: %s", job_id, exc)
             return
         job["prep_id"] = prep_id
 
-    await publisher.run_publish_job(
-        job_id, job, draft, cdp_url=CDP_URL, tmp_dir=str(tmp_dir),
-    )
+    publish_kwargs: dict[str, Any] = {
+        "cdp_url": CDP_URL,
+        "tmp_dir": str(tmp_dir),
+    }
+    if start_index is not None:
+        publish_kwargs["start_index"] = start_index
+    await publisher.run_publish_job(job_id, job, draft, **publish_kwargs)
+    if job.get("status") == "done":
+        # В production это уже делает publisher; повтор безопасен и нужен тестовым
+        # драйверам, которые подменяют publisher.run_publish_job.
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    else:
+        try:
+            publish_state.save_publish_state(tmp_dir, job_id, job, draft)
+        except Exception as exc:
+            logger.error("Не удалось сохранить итог задачи %s: %s", job_id, exc)
     if not prep_id:
         return
     if PUBLISH_JOBS.get(job_id, {}).get("status") != "done":
@@ -749,6 +830,37 @@ async def _run_publish_and_cleanup(
     shutil.rmtree(TMP_PUBLISH_DIR / f"prep_{prep_id}", ignore_errors=True)
     PREP_JOBS.pop(prep_id, None)
     logger.info("Prep %s удалён после успешной заливки (задача %s)", prep_id, job_id)
+
+
+def _schedule_publish(
+    job_id: str,
+    draft: "publisher.DraftData",
+    tmp_dir: Path,
+    prep_id: Optional[str],
+    *,
+    start_index: Optional[int] = None,
+) -> None:
+    """Запускает одну publish-задачу и не допускает второй параллельный запуск."""
+    current = ACTIVE_PUBLISH_TASKS.get(job_id)
+    if current is not None and not current.done():
+        raise RuntimeError("Задача публикации уже выполняется")
+
+    task = asyncio.create_task(
+        _run_publish_and_cleanup(
+            job_id,
+            draft,
+            tmp_dir,
+            prep_id,
+            start_index=start_index,
+        )
+    )
+    ACTIVE_PUBLISH_TASKS[job_id] = task
+
+    def _forget(completed: asyncio.Task[Any]) -> None:
+        if ACTIVE_PUBLISH_TASKS.get(job_id) is completed:
+            ACTIVE_PUBLISH_TASKS.pop(job_id, None)
+
+    task.add_done_callback(_forget)
 
 
 @app.get("/api/publish/categories")
@@ -764,8 +876,54 @@ async def api_publish_categories() -> JSONResponse:
             "colors": list(p.color_options.keys()),
             "conditions": list(p.condition_options.keys()),
             "trade_types": list(p.trade_type_options.keys()),
+            # Есть не у всех категорий: пустой список = поле не рисовать
+            "item_types": list(p.item_type_options.keys()),
+            "materials": list(p.material_options.keys()),
+            "styles": list(p.style_options.keys()),
         })
     return JSONResponse({"categories": cats})
+
+
+@app.post("/api/addresses/generate")
+async def api_generate_addresses(request: Request) -> JSONResponse:
+    """Выдаёт существующие адреса OSM для уже введённых пользователем городов."""
+    try:
+        payload = await request.json()
+    except ValueError:
+        return JSONResponse({"error": "Передайте JSON со списком городов."}, status_code=400)
+    cities = payload.get("cities") if isinstance(payload, dict) else None
+    used_locations = payload.get("used_locations", []) if isinstance(payload, dict) else []
+    if not isinstance(cities, list) or not 1 <= len(cities) <= 20:
+        return JSONResponse({"error": "Можно запросить от 1 до 20 городов."}, status_code=422)
+    if not isinstance(used_locations, list) or len(used_locations) > 200:
+        return JSONResponse({"error": "Некорректный список уже использованных адресов."}, status_code=422)
+    clean_cities = []
+    for index, city in enumerate(cities, start=1):
+        if not isinstance(city, str):
+            return JSONResponse({"error": f"Город №{index} должен быть строкой."}, status_code=422)
+        value = " ".join(city.split())
+        if not value or len(value) > 120:
+            return JSONResponse({"error": f"Город №{index} должен быть строкой до 120 символов."}, status_code=422)
+        clean_cities.append(value)
+    clean_used = []
+    for index, location in enumerate(used_locations, start=1):
+        if not isinstance(location, dict) or not isinstance(location.get("city"), str) or not isinstance(location.get("address"), str):
+            return JSONResponse({"error": f"Использованный адрес №{index} должен содержать строки city и address."}, status_code=422)
+        city = " ".join(location["city"].split())
+        address = " ".join(location["address"].split())
+        if len(city) > 120 or len(address) > 200:
+            return JSONResponse({"error": "Город или адрес слишком длинный."}, status_code=422)
+        clean_used.append({"city": city, "address": address})
+    try:
+        results = await asyncio.to_thread(address_generator.generate_addresses, clean_cities, clean_used)
+    except Exception:
+        logger.exception("Неожиданная ошибка генератора адресов")
+        return JSONResponse({"error": "Сервис адресов временно недоступен. Введите адрес вручную."}, status_code=503)
+    return JSONResponse({
+        "results": results,
+        "source": "openstreetmap",
+        "attribution": "© OpenStreetMap contributors",
+    })
 
 
 @app.post("/api/publish/start")
@@ -778,21 +936,28 @@ async def api_publish_start(
     color: str = Form(""),
     description: str = Form(""),
     price: str = Form(""),
-    city: str = Form(""),
-    address: str = Form(""),
+    locations_json: str = Form(""),
+    view_price_max: str = Form(""),
     drafts_count: str = Form(""),
     prep_id: str = Form(""),
     category: str = Form("jackets"),
+    item_type: str = Form(""),
+    material: str = Form(""),
+    style: str = Form(""),
     photos: list[UploadFile] = File([]),
 ) -> JSONResponse:
     """
-    Запуск задачи сохранения черновика объявления (multipart/form-data).
+    Запуск задачи полной публикации объявлений (multipart/form-data).
 
     Серверная валидация по ТЗ §8 — backend не доверяет фронту.
     Невалидная форма → HTTP 422 со списком полей, задача НЕ создаётся.
     Валидная → фото сохраняются в tmp/publish/{job_id}/, задача уходит в фон.
 
-    Пакетный режим (ТЗ §16) + вариативность (ТЗ §17): drafts_count (1–10, дефолт 1).
+    Пакетный режим: locations_json содержит отдельную геолокацию для каждого
+    объявления, view_price_max — единый потолок стоимости просмотра для всех
+    (Decimal в publisher; движок всегда берёт минимальную цену Авито),
+    drafts_count задаёт количество объявлений (1–20, дефолт 1).
+    Вариативность (ТЗ §17):
     При drafts_count ≥ 2 без prep_id варианты готовятся автоматически перед
     заливкой (N одинаковых клонов больше не создаются). prep_id из превью
     используется как раньше.
@@ -815,9 +980,12 @@ async def api_publish_start(
         "color": color,
         "description": description,
         "price": price,
-        "city": city,
-        "address": address,
+        "locations_json": locations_json,
+        "view_price_max": view_price_max,
         "drafts_count": drafts_count,
+        "item_type": item_type,
+        "material": material,
+        "style": style,
     }
 
     # Метаданные фото для валидации БЕЗ чтения содержимого в память:
@@ -875,7 +1043,7 @@ async def api_publish_start(
             file_path = tmp_dir / f"photo_{idx:02d}{ext}"
             file_path.write_bytes(await upload.read())
             photo_paths.append(str(file_path))
-    except OSError as exc:
+    except Exception as exc:
         logger.error("Publish: не удалось сохранить фото в %s: %s", tmp_dir, exc)
         return JSONResponse(
             {"errors": [{"field": "photos", "error": f"Не удалось сохранить фото: {exc}"}]},
@@ -894,7 +1062,16 @@ async def api_publish_start(
         "debug_dir": None,  # путь дампа сбоя; заполняет publisher._dump_failure
         "result_url": None,
         "summary": draft.summary(),
-        # Пакетный режим (ТЗ §16); run_publish_job читает drafts_total отсюда
+        # Новые поля — источник правды для publisher и API.
+        "item_index": 0,
+        "items_total": drafts_total,
+        "items_published": 0,
+        "published_urls": [],
+        "brand_selected": None,
+        "applied_view_prices": [],
+        "address_warnings": [],
+        "user_action": None,
+        # Временные алиасы для обратной совместимости.
         "draft_index": 0,
         "drafts_total": drafts_total,
         "drafts_saved": 0,
@@ -903,15 +1080,106 @@ async def api_publish_start(
         "prep_id": prep_id if prep_id else None,
     }
 
-    asyncio.create_task(
-        _run_publish_and_cleanup(job_id, draft, tmp_dir, prep_id if prep_id else None)
+    try:
+        publish_state.save_publish_state(tmp_dir, job_id, PUBLISH_JOBS[job_id], draft)
+    except OSError as exc:
+        PUBLISH_JOBS.pop(job_id, None)
+        logger.error("Publish: не удалось сохранить начальный checkpoint %s: %s", job_id, exc)
+        return JSONResponse(
+            {"errors": [{
+                "field": "photos",
+                "error": f"Не удалось безопасно сохранить задачу публикации: {exc}",
+            }]},
+            status_code=500,
+        )
+
+    _schedule_publish(
+        job_id,
+        draft,
+        tmp_dir,
+        prep_id if prep_id else None,
     )
 
     logger.info(
-        "Publish-задача %s создана: '%s', фото: %d, черновиков: %d",
+        "Publish-задача %s создана: '%s', фото: %d, объявлений: %d",
         job_id, draft.title, len(photo_paths), drafts_total,
     )
     return JSONResponse({"job_id": job_id})
+
+
+@app.post("/api/publish/resume/{job_id}")
+async def api_publish_resume(job_id: str) -> JSONResponse:
+    """Продолжает сохранённую задачу с первого неотправленного объявления."""
+    current_task = ACTIVE_PUBLISH_TASKS.get(job_id)
+    if current_task is not None and not current_task.done():
+        return JSONResponse(
+            {"error": "Задача публикации уже выполняется"},
+            status_code=409,
+        )
+
+    job_dir = TMP_PUBLISH_DIR / job_id
+    try:
+        saved_job, draft = publish_state.load_publish_state(job_dir)
+    except (OSError, ValueError, KeyError) as exc:
+        logger.warning("Resume %s невозможен: %s", job_id, exc)
+        return JSONResponse(
+            {"error": "Сохранённое состояние публикации не найдено или повреждено"},
+            status_code=404,
+        )
+
+    plan = publish_state.resume_plan(saved_job)
+    if plan is None:
+        items_total = int(saved_job.get("items_total") or saved_job.get("drafts_total") or 1)
+        items_published = int(saved_job.get("items_published") or 0)
+        if items_published >= items_total:
+            message = "Все объявления этой задачи уже отправлены"
+        else:
+            message = (
+                "Продолжать нечего: пропустить пришлось бы последнее объявление "
+                "пакета, а оно уже создано на Авито — проверьте и завершите его вручную."
+            )
+        return JSONResponse({"error": message}, status_code=409)
+
+    start_index = plan["start_index"]
+    items_total = plan["items_total"]
+
+    # skip_item: текущее (уже созданное на Авито) объявление не трогаем вообще —
+    # ни одного повторного финансового клика, только запоминаем номер для
+    # ручной проверки и едем дальше со следующего индекса.
+    if plan["mode"] == "skip_item":
+        skipped_item = plan["skipped_item"]
+        skipped_items = sorted(set(saved_job.get("skipped_items") or []) | {skipped_item})
+        saved_job["skipped_items"] = skipped_items
+        logger.warning(
+            "Задача %s: объявление №%d пропущено при возобновлении — оно уже "
+            "создано на Авито и не будет отправлено повторно",
+            job_id, skipped_item,
+        )
+
+    saved_job["status"] = "queued"
+    saved_job["error"] = None
+    saved_job["user_action"] = None
+    PUBLISH_JOBS[job_id] = saved_job
+    _schedule_publish(
+        job_id,
+        draft,
+        job_dir,
+        saved_job.get("prep_id"),
+        start_index=start_index,
+    )
+    logger.info(
+        "Publish-задача %s возобновлена с объявления %d/%d (режим %s)",
+        job_id,
+        start_index,
+        items_total,
+        plan["mode"],
+    )
+    return JSONResponse({
+        "job_id": job_id,
+        "resumed_from": start_index,
+        "mode": plan["mode"],
+        "skipped_item": plan["skipped_item"],
+    })
 
 
 @app.get("/api/publish/status/{job_id}")
@@ -935,9 +1203,6 @@ async def api_publish_result(job_id: str) -> JSONResponse:
             **_serialize_publish_status(job_id, job),
             "result_url": job.get("result_url"),
             "summary": job.get("summary") or {},
-            # Пакетный режим (ТЗ §16): drafts_saved/drafts_total уже в статусе,
-            # здесь добавляем список конечных URL по сохранённым черновикам
-            "saved_urls": job.get("saved_urls") or [],
         }
     )
 
@@ -1142,7 +1407,7 @@ async def api_prepare_regenerate(request: Request) -> JSONResponse:
 
     Тело JSON: {"prep_id": str, "draft_index": int}.
     404, если prep_id неизвестен.
-    422, если draft_index вне допустимого диапазона (2..N).
+    422, если draft_index вне допустимого диапазона (1..N).
     Иначе: обновлённая карточка черновика.
     """
     payload = await request.json()
@@ -1155,7 +1420,7 @@ async def api_prepare_regenerate(request: Request) -> JSONResponse:
     job = PREP_JOBS[prep_id]
     n_drafts: int = job.get("drafts_count") or 1
 
-    # Валидация draft_index: допустимо только 2..N
+    # Валидация draft_index: допустим любой существующий вариант.
     try:
         draft_index = int(draft_index_raw)
     except (TypeError, ValueError):
@@ -1164,15 +1429,12 @@ async def api_prepare_regenerate(request: Request) -> JSONResponse:
             status_code=422,
         )
 
-    if draft_index < 2 or draft_index > n_drafts:
+    if draft_index < 1 or draft_index > n_drafts:
         return JSONResponse(
             {
                 "errors": [{
                     "field": "draft_index",
-                    "error": (
-                        f"draft_index должен быть в диапазоне 2..{n_drafts} "
-                        f"(вариант №1 — оригинал, не перегенерируется)"
-                    ),
+                    "error": f"draft_index должен быть в диапазоне 1..{n_drafts}",
                 }]
             },
             status_code=422,
@@ -1193,9 +1455,81 @@ async def api_prepare_regenerate(request: Request) -> JSONResponse:
     return JSONResponse(card)
 
 
+@app.post("/api/publish/prepare/update-text")
+async def api_prepare_update_text(request: Request) -> JSONResponse:
+    """Сохраняет ручную правку названия и описания подготовленного варианта."""
+    payload = await request.json()
+    prep_id = str(payload.get("prep_id") or "").strip()
+    draft_index_raw = payload.get("draft_index")
+
+    if prep_id not in PREP_JOBS:
+        return JSONResponse({"status": "not_found"}, status_code=404)
+
+    job = PREP_JOBS[prep_id]
+    n_drafts = int(job.get("drafts_count") or 1)
+    try:
+        draft_index = int(draft_index_raw)
+    except (TypeError, ValueError):
+        return JSONResponse(
+            {"errors": [{
+                "field": "draft_index",
+                "error": "draft_index должен быть целым числом",
+            }]},
+            status_code=422,
+        )
+
+    if draft_index < 1 or draft_index > n_drafts:
+        return JSONResponse(
+            {"errors": [{
+                "field": "draft_index",
+                "error": f"draft_index должен быть в диапазоне 1..{n_drafts}",
+            }]},
+            status_code=422,
+        )
+
+    title = payload.get("title")
+    description = payload.get("description")
+    errors: list[dict[str, str]] = []
+    if not isinstance(title, str) or not title.strip():
+        errors.append({"field": "title", "error": "Название: поле не заполнено"})
+    if not isinstance(description, str) or not description.strip():
+        errors.append({
+            "field": "description",
+            "error": "Описание: поле не заполнено",
+        })
+    if errors:
+        return JSONResponse({"errors": errors}, status_code=422)
+
+    prep_dir = TMP_PUBLISH_DIR / f"prep_{prep_id}"
+    try:
+        card = preparation.update_draft_text(
+            prep_dir,
+            draft_index,
+            title,
+            description,
+        )
+    except ValueError as exc:
+        error_message = str(exc)
+        error_field = "title" if error_message.startswith("Название") else "draft_index"
+        return JSONResponse(
+            {
+                "error": error_message,
+                "errors": [{"field": error_field, "error": error_message}],
+            },
+            status_code=422,
+        )
+
+    logger.info(
+        "Prepare %s: ручная правка текста черновика %d сохранена",
+        prep_id,
+        draft_index,
+    )
+    return JSONResponse(card)
+
+
 # ---------------------------------------------------------------------------
 # Точка входа
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=7777)

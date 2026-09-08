@@ -1,0 +1,197 @@
+{
+  "name": "Авито — приёмник диалогов (Этап 1)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "trigger-1",
+      "name": "Каждую минуту",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-460, 300]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "avito_client_id",
+              "value": "ВСТАВЬ_CLIENT_ID",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "avito_client_secret",
+              "value": "ВСТАВЬ_CLIENT_SECRET",
+              "type": "string"
+            },
+            {
+              "id": "a3",
+              "name": "telegram_bot_token",
+              "value": "ВСТАВЬ_ТОКЕН_ОТ_BOTFATHER",
+              "type": "string"
+            },
+            {
+              "id": "a4",
+              "name": "telegram_chat_id",
+              "value": "ВСТАВЬ_СВОЙ_CHAT_ID",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "config-1",
+      "name": "Конфиг",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [-240, 300],
+      "notes": "Единственное место, где нужно что-то заполнить руками."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.avito.ru/token",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "grant_type",
+              "value": "client_credentials"
+            },
+            {
+              "name": "client_id",
+              "value": "={{ $json.avito_client_id }}"
+            },
+            {
+              "name": "client_secret",
+              "value": "={{ $json.avito_client_secret }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "token-1",
+      "name": "Токен Авито",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-20, 300],
+      "notes": "Токен живёт ~24 ч. Берём каждый раз заново — проще, чем кэшировать."
+    },
+    {
+      "parameters": {
+        "url": "https://api.avito.ru/core/v1/accounts/self",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $json.access_token }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "self-1",
+      "name": "Кто я",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [200, 300],
+      "notes": "Заодно проверка доступа: если этот шаг прошёл — API живое."
+    },
+    {
+      "parameters": {
+        "url": "=https://api.avito.ru/messenger/v2/accounts/{{ $json.id }}/chats?unread_only=true&limit=50",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $('Токен Авито').first().json.access_token }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "chats-1",
+      "name": "Непрочитанные чаты",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [420, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Отсеиваем чаты, про которые уже писали в телегу.\n// Память живёт между запусками в статике воркфлоу.\nconst store = $getWorkflowStaticData('global');\nconst seen = store.seen || {};\n\nconst myId = $('Кто я').first().json.id;\nconst chats = $input.first().json.chats || [];\nconst out = [];\n\nfor (const chat of chats) {\n  const lastId = chat.last_message && chat.last_message.id;\n  if (!chat.id || !lastId) continue;\n  if (seen[chat.id] === lastId) continue;\n\n  // Своё же сообщение пересылать себе не надо.\n  if (chat.last_message.author_id === myId) {\n    seen[chat.id] = lastId;\n    continue;\n  }\n\n  seen[chat.id] = lastId;\n\n  const ctx = (chat.context && chat.context.value) || {};\n  const buyer = (chat.users || []).find(u => u.id !== myId) || {};\n  const body = (chat.last_message.content && chat.last_message.content.text) || '(нетекстовое сообщение)';\n\n  const text = [\n    'Новое сообщение на Авито',\n    '',\n    'Объявление: ' + (ctx.title || 'без названия'),\n    'Цена: ' + (ctx.price_string || 'не указана'),\n    'Покупатель: ' + (buyer.name || 'аноним'),\n    '',\n    'Пишет: ' + body,\n    '',\n    ctx.url || ''\n  ].join('\\n');\n\n  out.push({ json: { chat_id: chat.id, text } });\n}\n\nstore.seen = seen;\nreturn out;"
+      },
+      "id": "filter-1",
+      "name": "Только новые",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $('Конфиг').first().json.telegram_bot_token }}/sendMessage",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "chat_id",
+              "value": "={{ $('Конфиг').first().json.telegram_chat_id }}"
+            },
+            {
+              "name": "text",
+              "value": "={{ $json.text }}"
+            },
+            {
+              "name": "disable_web_page_preview",
+              "value": "true"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "tg-1",
+      "name": "В телегу",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [860, 300],
+      "notes": "Через обычный HTTP, чтобы не настраивать отдельные креды Telegram."
+    }
+  ],
+  "connections": {
+    "Каждую минуту": {
+      "main": [[{ "node": "Конфиг", "type": "main", "index": 0 }]]
+    },
+    "Конфиг": {
+      "main": [[{ "node": "Токен Авито", "type": "main", "index": 0 }]]
+    },
+    "Токен Авито": {
+      "main": [[{ "node": "Кто я", "type": "main", "index": 0 }]]
+    },
+    "Кто я": {
+      "main": [[{ "node": "Непрочитанные чаты", "type": "main", "index": 0 }]]
+    },
+    "Непрочитанные чаты": {
+      "main": [[{ "node": "Только новые", "type": "main", "index": 0 }]]
+    },
+    "Только новые": {
+      "main": [[{ "node": "В телегу", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
