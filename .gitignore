@@ -23,6 +23,7 @@ frontend/dist/
 
 # Служебные локальные файлы и заметки — не для репозитория
 .agents/
+.codex/
 .superpowers/
 .claude/
 skills-lock.json
@@ -34,3 +35,21 @@ docs/claude-feedback/
 .DS_Store
 Thumbs.db
 docs/superpowers/
+
+# Секреты окружения — никогда не коммитить
+.env
+.env.*
+*.env
+secrets.json
+
+# Кэш инструментов разработки
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Редакторы
+.vscode/
+.idea/
+*.swp

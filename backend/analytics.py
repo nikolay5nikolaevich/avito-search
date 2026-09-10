@@ -30,7 +30,7 @@ FRESH_MAX_VIEWS: int = 30          # верхняя граница диапаз�
 
 def filter_listings(listings: list[dict]) -> list[dict]:
     """
-    Фильтрует объявления по правилу из CLAUDE.md.
+    Фильтрует объявления по правилу проекта.
 
     Исключает объявление, если:
         age_hours < FRESH_HOURS  И  FRESH_MIN_VIEWS <= views_today <= FRESH_MAX_VIEWS
