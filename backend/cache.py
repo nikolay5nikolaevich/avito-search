@@ -78,6 +78,30 @@ def _parse_iso(ts: str) -> datetime:
     return dt
 
 
+def build_cache_key(
+    query: str,
+    count: int = 150,
+    filters_key: str = "",
+    cities_key: str = "",
+) -> str:
+    """
+    Собирает канонический ключ кэша — единая точка правды для save_result
+    и get_result, а также для события журнала agents.db (тип "artifact"
+    Разведчика): ключ там должен совпадать с ключом здесь, чтобы этап 3
+    мог разобрать его обратно.
+
+    Args:
+        query:       поисковый запрос пользователя
+        count:       количество объявлений на город
+        filters_key: строка активных фильтров ("" — без фильтра)
+        cities_key:  отсортированный список slug-ов городов через запятую
+
+    Returns:
+        Строка вида "нормализованный_запрос|count|filters_key|cities_key".
+    """
+    return f"{_normalize_query(query)}|{count}|{filters_key}|{cities_key}"
+
+
 # ── Публичный API ─────────────────────────────────────────────────────────────
 
 def save_result(
@@ -111,7 +135,7 @@ def save_result(
                      (по умолчанию "" — набор по умолчанию, обратная совместимость)
         db_path:     путь к файлу БД
     """
-    key = f"{_normalize_query(query)}|{count}|{filters_key}|{cities_key}"
+    key = build_cache_key(query, count, filters_key, cities_key)
     try:
         results_json = json.dumps(results, ensure_ascii=False, default=str)
         created_at = _now_utc().isoformat()
@@ -168,7 +192,7 @@ def get_result(
     Returns:
         Десериализованный объект или None.
     """
-    key = f"{_normalize_query(query)}|{count}|{filters_key}|{cities_key}"
+    key = build_cache_key(query, count, filters_key, cities_key)
 
     try:
         with sqlite3.connect(db_path) as conn:
@@ -199,6 +223,110 @@ def get_result(
     except (sqlite3.Error, ValueError, json.JSONDecodeError) as exc:
         logger.error("Ошибка при чтении кэша для '%s': %s", key, exc)
         return None
+
+
+# ── Разбор ключа для Стратега (docs/specs/agents-registry.md, Этап 3) ─────────
+
+def get_entry_by_key(cache_key: str, db_path: str = "cache.db") -> object | None:
+    """
+    Возвращает результат по точному ключу кэша, БЕЗ проверки TTL.
+
+    В отличие от get_result — Стратегу нужны и устаревшие отчёты Разведчика
+    (list_entries их тоже показывает с пометкой is_expired, а не выбрасывает):
+    старый отчёт всё ещё можно взять за основу гипотез.
+
+    Args:
+        cache_key: полный ключ кэша (как из build_cache_key или list_entries)
+        db_path:   путь к файлу БД
+
+    Returns:
+        Десериализованный объект или None (записи нет или сбой чтения).
+    """
+    try:
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.execute(
+                "SELECT results_json FROM cache WHERE query = ?", (cache_key,)
+            )
+            row = cursor.fetchone()
+    except sqlite3.Error as exc:
+        logger.error("Ошибка чтения записи кэша по ключу '%s': %s", cache_key, exc)
+        return None
+
+    if row is None:
+        return None
+
+    try:
+        return json.loads(row[0])
+    except (ValueError, json.JSONDecodeError) as exc:
+        logger.error("Битый results_json для ключа '%s': %s", cache_key, exc)
+        return None
+
+
+def list_entries(db_path: str = "cache.db") -> list[dict]:
+    """
+    Читает все записи кэша и разбирает ключ обратно в составные части.
+
+    Нужно Стратегу (GET /api/scout/reports), чтобы предложить человеку
+    последние отчёты Разведчика без ручного ввода ключа. Устаревшие по TTL
+    записи тоже возвращаются — с пометкой is_expired, а не выброшены: старый
+    отчёт всё ещё можно взять за основу гипотез.
+
+    Ключ разбирается через rsplit (справа налево): count/filters_key/
+    cities_key заведомо не содержат "|", а вот сам query — теоретически может
+    (пользовательский ввод), поэтому левая часть после rsplit остаётся с ним
+    независимо от того, что он содержит.
+
+    Args:
+        db_path: путь к файлу БД
+
+    Returns:
+        Список dict {cache_key, query, count, filters_key, cities_key,
+        cities_count, created_at, age_hours, is_expired}, новые сверху.
+        Пустой список при сбое БД.
+    """
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                "SELECT query, created_at FROM cache ORDER BY created_at DESC"
+            ).fetchall()
+    except sqlite3.Error as exc:
+        logger.error("Ошибка чтения списка кэша: %s", exc)
+        return []
+
+    entries: list[dict] = []
+    for cache_key, created_at_str in rows:
+        parts = cache_key.rsplit("|", 3)
+        if len(parts) != 4:
+            logger.warning("Не удалось разобрать ключ кэша '%s' — пропускаем", cache_key)
+            continue
+
+        query, count_str, filters_key, cities_key = parts
+        try:
+            count = int(count_str)
+        except ValueError:
+            logger.warning("Нечисловой count в ключе кэша '%s' — пропускаем", cache_key)
+            continue
+
+        try:
+            created_at = _parse_iso(created_at_str)
+            age_hours: float | None = (_now_utc() - created_at).total_seconds() / 3600
+        except ValueError:
+            age_hours = None
+
+        cities = [slug for slug in cities_key.split(",") if slug]
+        entries.append({
+            "cache_key": cache_key,
+            "query": query,
+            "count": count,
+            "filters_key": filters_key,
+            "cities_key": cities_key,
+            "cities_count": len(cities),
+            "created_at": created_at_str,
+            "age_hours": age_hours,
+            "is_expired": age_hours is not None and age_hours > CACHE_TTL_HOURS,
+        })
+
+    return entries
 
 
 # ── Самотест ──────────────────────────────────────────────────────────────────

@@ -1,55 +1,69 @@
-# Python
+# ─── Python ──────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 .venv/
 venv/
 
-# Артефакты приложения (создаются при запуске)
+# ─── Артефакты приложения (создаются при запуске) ────────────────────────
 cache.db
+outreach.db
+it_outreach.db
 smoke_cache.db
+resale_cache.db
+agents.db*
 logs/
 debug/
 tmp/
+trash/
 
-# Профиль Playwright (личные куки/сессия — не коммитить)
+# Профиль Playwright — личные куки и сессия, не коммитить
 .pw-profile/
 
-# Node / фронтенд
+# ─── Node / фронтенд ─────────────────────────────────────────────────────
 node_modules/
 *.log
-
-# Сборка фронтенда — артефакт Vite (npm run build в frontend/)
 frontend/dist/
 
-# Служебные локальные файлы и заметки — не для репозитория
+# ─── Markdown: в репозитории только README.md и CLAUDE.md из корня ───────
+# Отчёты, спеки, брифы и заметки остаются на диске, но в git не попадают.
+*.md
+*.mdc
+!/README.md
+!/CLAUDE.md
+
+# ─── Следы ИИ-инструментов ───────────────────────────────────────────────
 .agents/
 .codex/
 .superpowers/
 .claude/
+.cursor/
+.cursorrules
+.windsurf/
+.windsurfrules
+.aider*
+.continue/
+.mcp.json
+.claudeignore
+.artifact_deps/
 skills-lock.json
-AGENTS.md
-CLAUDE.md
-docs/claude-feedback/
+docs/_internal/
 
-# ОС / редакторы
-.DS_Store
-Thumbs.db
-docs/superpowers/
-
-# Секреты окружения — никогда не коммитить
+# ─── Секреты окружения — никогда не коммитить ────────────────────────────
 .env
 .env.*
 *.env
 secrets.json
 
-# Кэш инструментов разработки
+# ─── Кэш инструментов разработки ─────────────────────────────────────────
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
 .coverage
 htmlcov/
 
-# Редакторы
+# ─── ОС и редакторы ──────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
 .vscode/
 .idea/
 *.swp

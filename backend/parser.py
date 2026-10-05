@@ -382,11 +382,21 @@ def _item_from_json(raw: dict[str, Any]) -> dict[str, Any]:
     Возвращает поля: url, title, price, address.
     Поля views_total, views_today, published_at, age_hours, metro
     будут заполнены после парсинга страницы объявления.
+
+    Дополнительно (нужны разделу «Поиск под перепродажу», docs/specs/resale-finder.md):
+    item_id (raw["id"] строкой или None), description (сниппет из каталога
+    или ""), category_slug (raw["category"]["slug"] или None). Аналитику
+    спроса эти поля не затрагивают — она их не читает.
     """
     url_path: str = raw.get("urlPath") or raw.get("url") or ""
     url = BASE_URL + url_path if url_path.startswith("/") else url_path
 
     title: str = raw.get("title") or ""
+
+    raw_id = raw.get("id")
+    item_id: Optional[str] = str(raw_id) if raw_id is not None else None
+    description: str = raw.get("description") or ""
+    category_slug: Optional[str] = _deep_get(raw, "category", "slug")
 
     # Цена: Авито хранит в копейках (priceDetailed.value) или строке
     price: Optional[int] = None
@@ -421,12 +431,39 @@ def _item_from_json(raw: dict[str, Any]) -> dict[str, Any]:
         "views_today": None,
         "published_at": None,
         "age_hours": None,
+        "item_id": item_id,
+        "description": description,
+        "category_slug": category_slug,
     }
 
 
 # ---------------------------------------------------------------------------
 # Парсинг страницы поиска (сбор ссылок)
 # ---------------------------------------------------------------------------
+
+def _is_not_description(p_el: Any) -> bool:
+    """
+    Параграф p[style*='--module-max-lines-size'] — не описание карточки, а
+    имя продавца, «N отзывов» или город: все размечены тем же стилем
+    (см. avito_selectors.SEARCH_CARD_DESCRIPTION_TEXT). Признаки (ПОДТВЕРЖДЕНО
+    на debug/search_live_noutbuki.html, 28.09.2026):
+      1) параграф вложен в <a> — имя продавца всегда ссылка на его профиль,
+         а описание карточки — нет;
+      2) у самого параграфа data-marker с подстрокой "seller" — так размечен
+         блок «N отзывов» (data-marker="seller-info/summary");
+      3) параграф внутри гео-блока (item-location) — у объявлений из чужих
+         городов («Только доставка») город стоит ДО описания; без этой
+         проверки у 19 из 41 карточки описанием становилось «Москва».
+    """
+    own_marker = p_el.get("data-marker") or ""
+    if "seller" in own_marker:
+        return True
+    if p_el.find_parent("a") is not None:
+        return True
+    if p_el.find_parent(attrs={"data-marker": "item-location"}) is not None:
+        return True
+    return False
+
 
 def _extract_items_from_html(html: str) -> list[dict[str, Any]]:
     """
@@ -508,6 +545,26 @@ def _extract_items_from_html(html: str) -> list[dict[str, Any]]:
                     address = " ".join(raw_addr.split())
                     metro = _extract_metro(address)
 
+            # item_id — из атрибута data-item-id на карточке (см. avito_selectors.py).
+            item_id = card.get(sel.SEARCH_CARD_ID_ATTR)
+
+            # Описание — новая вёрстка (28.09.2026, debug/search_live_noutbuki.html):
+            # первый p[style*='--module-max-lines-size'] карточки, НЕ относящийся
+            # к блоку продавца (тем же стилем размечены имя продавца и «N отзывов»
+            # — см. _is_not_description). Резерв — старый meta itemprop="description"
+            # (старая вёрстка, ПОДТВЕРЖДЕНО на debug/search.html).
+            description = ""
+            for p_el in card.select(sel.SEARCH_CARD_DESCRIPTION_TEXT):
+                if _is_not_description(p_el):
+                    continue
+                text = p_el.get_text(strip=True)
+                if text:
+                    description = text
+                    break
+            if not description:
+                desc_el = card.select_one(sel.SEARCH_CARD_DESCRIPTION)
+                description = desc_el.get("content", "") if desc_el else ""
+
             items.append({
                 "url": url,
                 "title": title,
@@ -518,6 +575,9 @@ def _extract_items_from_html(html: str) -> list[dict[str, Any]]:
                 "views_today": None,
                 "published_at": None,
                 "age_hours": None,
+                "item_id": item_id,
+                "description": description,
+                "category_slug": None,
             })
         except Exception as exc:
             logger.debug("Ошибка парсинга карточки: %s", exc)
@@ -584,21 +644,39 @@ async def _collect_listing_items(
     query: str,
     max_items: int,
     filters: "SearchFilters | None" = None,
+    *,
+    local_only: bool = True,
 ) -> list[dict[str, Any]]:
     """
-    Открывает страницы выдачи и собирает сырые данные МЕСТНЫХ объявлений
-    (url, title, price, address) до достижения max_items МЕСТНЫХ или срабатывания
-    предохранителя.
+    Открывает страницы выдачи и собирает сырые данные объявлений (url, title,
+    price, address) до достижения max_items или срабатывания предохранителя.
+
+    local_only=True (по умолчанию — прежнее поведение аналитики спроса):
+    собираются ТОЛЬКО местные объявления, чужие (из другого города/региона)
+    пропускаются без захода на их страницы.
+
+    local_only=False (docs/specs/resale-finder.md, «Поиск под перепродажу»):
+    собираются ВСЕ объявления выдачи, включая чужие города с доставкой — у
+    Авито по узким запросам местных может почти не быть (см. спеку, живой
+    прогон 28.09.2026: из 41 объявления местных 3). У каждого объявления
+    проставляется is_local: bool.
 
     Местное объявление — первый сегмент пути URL совпадает с city.slug.
-    Чужие (из другого города/региона) пропускаются без захода на их страницы.
 
     Пагинация через параметр URL &p=N.
 
-    Предохранители остановки (break из цикла по страницам):
+    Предохранители остановки (break из цикла по страницам), в обоих режимах
+    считаются по тому же набору, что собирается (местные — при local_only,
+    иначе все объявления страницы):
       * нет карточек на странице (страница пустая или конец выдачи);
-      * local_on_page == 0 при непустой странице — местные, видимо, закончились;
+      * подходящих объявлений на странице 0 — видимо, закончились;
+      * все подходящие на странице уже встречались раньше (новых 0) — Авито
+        (выдача с localPriority) повторяет одни и те же объявления на каждой
+        странице, пагинация не имеет смысла;
       * page_num > MAX_SEARCH_PAGES — жёсткий лимит страниц для узких запросов.
+
+    Дедуп — по item_id (data-item-id), а если его нет — по url без
+    query-строки. Ключи копятся за все страницы одного вызова.
 
     Аргументы:
         filters: необязательные фильтры поиска (SearchFilters). Передаются в
@@ -611,8 +689,11 @@ async def _collect_listing_items(
          (вставляется тем же React-рендером), поэтому пробуем его как доп.
          резерв ПО РЕЗУЛЬТАТУ page.content() после ожидания.
     """
-    # collected содержит ТОЛЬКО местные объявления
+    # collected — местные (local_only=True) либо все объявления (local_only=False)
     collected: list[dict[str, Any]] = []
+    # Ключи уже собранных объявлений (item_id, при отсутствии — url без
+    # query-строки) — для дедупа между страницами, см. докстринг выше.
+    seen_keys: set[str] = set()
     page_num: int = 1
 
     while len(collected) < max_items and page_num <= MAX_SEARCH_PAGES:
@@ -665,29 +746,56 @@ async def _collect_listing_items(
             )
             break
 
-        # Отбираем только местные объявления
-        local_on_page: int = 0
+        # local_only=True — отбираем только местные объявления; иначе берём
+        # все, проставляя каждому is_local. Среди отобранных — только новые (дедуп).
+        relevant_on_page: int = 0
+        new_relevant_on_page: int = 0
         for item in raw_items:
             if not item.get("url"):
                 continue
-            # Пропускаем объявления из чужих регионов
-            if not is_local_listing(item["url"], city.slug):
+            is_local = is_local_listing(item["url"], city.slug)
+            item["is_local"] = is_local
+            if local_only and not is_local:
+                # Пропускаем объявления из чужих регионов — не заходим на их страницы.
                 continue
-            local_on_page += 1
+            relevant_on_page += 1
+
+            # Ключ дедупа: item_id, а если его нет — url без query-строки
+            item_id = item.get("item_id")
+            key = f"id:{item_id}" if item_id else f"url:{item['url'].split('?', 1)[0]}"
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            new_relevant_on_page += 1
+
             collected.append(item)
             if len(collected) >= max_items:
                 break
 
         logger.info(
-            "%s: стр. %d — местных на странице %d, всего собрано %d/%d",
-            city.name, page_num, local_on_page, len(collected), max_items,
+            "%s: стр. %d — %s на странице %d (новых %d), всего собрано %d/%d",
+            city.name, page_num,
+            "местных" if local_only else "объявлений",
+            relevant_on_page, new_relevant_on_page, len(collected), max_items,
         )
 
-        # Предохранитель 2: были карточки, но ни одной местной — местные закончились
-        if local_on_page == 0:
+        # Предохранитель 2: были карточки, но ни одного подходящего — местные
+        # (или вообще все объявления, при local_only=False) закончились.
+        if relevant_on_page == 0:
             logger.info(
-                "%s: местных на стр. %d нет — вероятно местные закончились, "
+                "%s: подходящих объявлений на стр. %d нет — вероятно закончились, "
                 "пагинация остановлена",
+                city.name, page_num,
+            )
+            break
+
+        # Предохранитель 3: подходящие были, но все уже встречались раньше —
+        # Авито (выдача с localPriority) повторяет одни и те же объявления
+        # на каждой странице, дальше листать бессмысленно (лишние запросы = риск бана).
+        if new_relevant_on_page == 0:
+            logger.info(
+                "%s: на стр. %d все объявления — повторы уже собранных (Авито "
+                "повторяет объявления в пагинации), пагинация остановлена",
                 city.name, page_num,
             )
             break

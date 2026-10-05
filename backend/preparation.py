@@ -14,6 +14,11 @@ app.py навешивает HTTP-эндпоинты, publisher.py читает �
         source/title.txt              # исходное название
         source/text.txt               # исходное описание
         source/facts.json             # словарь facts
+        source/seed.json              # {"seed": int, "drafts_count": int} —
+                                       # пишется ДО генерации черновиков, чтобы
+                                       # после рестарта сервера recover_prep_job
+                                       # мог детерминированно дописать
+                                       # недостающие draft_NN тем же сидом (F38)
         draft_01/{photos/, title.txt, text.txt, meta.json}
         draft_02/...
 
@@ -102,6 +107,135 @@ def _count_draft_dirs(base_dir: Path) -> int:
         for p in base_dir.iterdir()
         if p.is_dir() and p.name.startswith("draft_")
     )
+
+
+def _seed_info_path(base_dir: Path) -> Path:
+    """Путь к файлу с сидом вариаций (source/seed.json)."""
+    return _source_dir(base_dir) / "seed.json"
+
+
+def _write_seed_info(base_dir: Path, *, seed: int, drafts_count: int) -> None:
+    """Сохраняет сид и заявленное число вариантов ДО генерации черновиков.
+
+    Только это на диске позволяет после рестарта сервера детерминированно
+    дописать недостающие draft_NN — vary_listing/build_modified_presets
+    полностью определяются (seed, title, description, facts, drafts_count),
+    поэтому повторный проход с тем же сидом даёт тот же результат, что и
+    непрерывный (F38). Пишем через tmp + replace, как save_publish_state.
+    """
+    path = _seed_info_path(base_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(".json.tmp")
+    tmp_path.write_text(
+        json.dumps(
+            {"seed": seed, "drafts_count": drafts_count},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    tmp_path.replace(path)
+
+
+def _read_seed_info(base_dir: Path) -> Optional[dict]:
+    """Читает сид, сохранённый _write_seed_info. None — если его нет/битый."""
+    path = _seed_info_path(base_dir)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        seed = int(data["seed"])
+        drafts_count = int(data["drafts_count"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if drafts_count <= 0:
+        return None
+    return {"seed": seed, "drafts_count": drafts_count}
+
+
+def _draft_complete(base_dir: Path, index: int) -> bool:
+    """Полностью ли записан черновик index (title/text/meta + непустые photos/)."""
+    d_dir = _draft_dir(base_dir, index)
+    photos_dir = d_dir / "photos"
+    return (
+        (d_dir / "title.txt").is_file()
+        and (d_dir / "text.txt").is_file()
+        and (d_dir / "meta.json").is_file()
+        and photos_dir.is_dir()
+        and any(photos_dir.iterdir())
+    )
+
+
+def _write_drafts(
+    base_dir: Path,
+    *,
+    prep_id: str,
+    title: str,
+    description: str,
+    drafts_count: int,
+    facts: dict,
+    seed: int,
+    source_photo_paths: list[Path],
+) -> None:
+    """Генерирует и раскладывает все draft_NN по (title, description, facts,
+    drafts_count, seed, source_photo_paths). Детерминирована по этим входам —
+    вызывается и из run_prep_job (первый проход), и из восстановления после
+    рестарта с тем же сидом (F38): результат в обоих случаях одинаковый.
+    """
+    text_variants = vary_listing(
+        title,
+        description,
+        drafts_count,
+        seed=seed,
+        facts=facts,
+    )
+    presets = build_modified_presets(drafts_count, seed=seed)
+    source_photo_bytes = [sp.read_bytes() for sp in source_photo_paths]
+
+    for i in range(drafts_count):
+        draft_idx = i + 1  # 1-based
+        tv = text_variants[i]
+        preset = presets[i]
+
+        d_dir = _draft_dir(base_dir, draft_idx)
+        d_photos_dir = d_dir / "photos"
+        d_photos_dir.mkdir(parents=True, exist_ok=True)
+
+        (d_dir / "title.txt").write_text(tv.title, encoding="utf-8")
+        (d_dir / "text.txt").write_text(tv.description, encoding="utf-8")
+
+        notes = tv.notes or ""
+        warnings: list[str] = []
+        for j, (raw_bytes, src_photo) in enumerate(
+            zip(source_photo_bytes, source_photo_paths), start=1
+        ):
+            out_bytes, out_ext, warn = _photo_for_draft(
+                draft_idx, j, raw_bytes, src_photo.suffix, preset
+            )
+            if warn:
+                warnings.append(warn)
+                logger.warning(
+                    "Подготовка %s, черновик %d: %s (пресет %r)",
+                    prep_id, draft_idx, warn, preset.name,
+                )
+            (d_photos_dir / f"photo_{j:02d}{out_ext}").write_bytes(out_bytes)
+
+        meta = {
+            "preset": preset.name,
+            "seed": seed,
+            "notes": notes,
+            "warnings": warnings,
+        }
+        (d_dir / "meta.json").write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        logger.info(
+            "Подготовка %s: черновик %d/%d сохранён (пресет %r)",
+            prep_id,
+            draft_idx,
+            drafts_count,
+            preset.name,
+        )
 
 
 def _photo_for_draft(
@@ -275,85 +409,31 @@ async def run_prep_job(
         _set_prep_step(job, "vary_texts")
 
         seed = random.randrange(2**32)
+        # Сид пишем на диск СРАЗУ, до генерации черновиков: если процесс
+        # упадёт посреди раскладки draft_NN, после рестарта recover_prep_job
+        # сможет детерминированно дописать недостающее тем же сидом (F38),
+        # а не бросать всю недописанную подготовку.
+        _write_seed_info(base_dir, seed=seed, drafts_count=drafts_count)
         logger.info(
-            "Подготовка %s: генерация %d вариантов текста, seed=%d",
+            "Подготовка %s: генерация %d вариантов текста, seed=%d (сохранён на диск)",
             prep_id,
             drafts_count,
             seed,
-        )
-        text_variants = vary_listing(
-            title,
-            description,
-            drafts_count,
-            seed=seed,
-            facts=facts,
         )
 
         # ── Шаг 2: vary_photos ───────────────────────────────────────────────
         _set_prep_step(job, "vary_photos")
 
-        presets = build_modified_presets(drafts_count, seed=seed)
-        logger.info(
-            "Подготовка %s: построено %d пресетов фото",
-            prep_id,
-            len(presets),
+        _write_drafts(
+            base_dir,
+            prep_id=prep_id,
+            title=title,
+            description=description,
+            drafts_count=drafts_count,
+            facts=facts,
+            seed=seed,
+            source_photo_paths=copied_source_photos,
         )
-
-        # Читаем байты исходных фото один раз
-        source_photo_bytes: list[bytes] = []
-        for sp in copied_source_photos:
-            source_photo_bytes.append(sp.read_bytes())
-
-        # ── Раскладка по папкам draft_NN ─────────────────────────────────────
-        for i in range(drafts_count):
-            draft_idx = i + 1  # 1-based
-            tv = text_variants[i]
-            preset = presets[i]
-
-            d_dir = _draft_dir(base_dir, draft_idx)
-            d_photos_dir = d_dir / "photos"
-            d_photos_dir.mkdir(parents=True, exist_ok=True)
-
-            # Текст
-            (d_dir / "title.txt").write_text(tv.title, encoding="utf-8")
-            (d_dir / "text.txt").write_text(tv.description, encoding="utf-8")
-
-            # Фото каждого варианта обрабатываются своим пресетом.
-            # Заметки текста (notes) и предупреждения о сбоях фото (warnings)
-            # храним раздельно: warnings выводятся отдельным заметным блоком в UI.
-            notes = tv.notes or ""
-            warnings: list[str] = []
-            for j, (raw_bytes, src_photo) in enumerate(
-                zip(source_photo_bytes, copied_source_photos), start=1
-            ):
-                out_bytes, out_ext, warn = _photo_for_draft(
-                    draft_idx, j, raw_bytes, src_photo.suffix, preset
-                )
-                if warn:
-                    warnings.append(warn)
-                    logger.warning(
-                        "Подготовка %s, черновик %d: %s (пресет %r)",
-                        prep_id, draft_idx, warn, preset.name,
-                    )
-                (d_photos_dir / f"photo_{j:02d}{out_ext}").write_bytes(out_bytes)
-
-            # meta.json
-            meta = {
-                "preset": preset.name,
-                "seed": seed,
-                "notes": notes,
-                "warnings": warnings,
-            }
-            (d_dir / "meta.json").write_text(
-                json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            logger.info(
-                "Подготовка %s: черновик %d/%d сохранён (пресет %r)",
-                prep_id,
-                draft_idx,
-                drafts_count,
-                preset.name,
-            )
 
         # ── done ──────────────────────────────────────────────────────────────
         _set_prep_step(job, "done")
@@ -552,6 +632,117 @@ def update_draft_text(
 # ---------------------------------------------------------------------------
 # Построение результата
 # ---------------------------------------------------------------------------
+
+
+def _done_job_record(drafts_count: int) -> dict:
+    return {
+        "status": "done",
+        "step": "done",
+        "step_label": _PREP_STEP_LABELS["done"],
+        "done": PREP_TOTAL_STEPS,
+        "total": PREP_TOTAL_STEPS,
+        "error": None,
+        "drafts_count": drafts_count,
+    }
+
+
+def _regenerate_from_seed(prep_dir: Path, seed_info: dict) -> Optional[dict]:
+    """Дописывает недостающие/битые draft_NN тем же сидом, что и до рестарта.
+
+    Возможно только если source/ (исходники, скопированные ДО генерации
+    первого черновика) цел: title.txt, text.txt, facts.json и хотя бы одно
+    фото в source/photos/. Раз seed и исходники те же — vary_listing и
+    build_modified_presets детерминированы, повторный проход даёт тот же
+    результат, что дал бы непрерывный запуск. None — если исходники сами не
+    сохранились (крах случился ещё до их копирования) — тогда пересчитывать
+    нечего, а не полагаться на угадывание.
+    """
+    src_dir = _source_dir(prep_dir)
+    title_path = src_dir / "title.txt"
+    text_path = src_dir / "text.txt"
+    facts_path = src_dir / "facts.json"
+    src_photos_dir = src_dir / "photos"
+    if not (
+        title_path.is_file()
+        and text_path.is_file()
+        and facts_path.is_file()
+        and src_photos_dir.is_dir()
+    ):
+        return None
+    source_photo_paths = sorted(p for p in src_photos_dir.iterdir() if p.is_file())
+    if not source_photo_paths:
+        return None
+
+    try:
+        title = title_path.read_text(encoding="utf-8")
+        description = text_path.read_text(encoding="utf-8")
+        facts = json.loads(facts_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(facts, dict):
+        return None
+
+    drafts_count = seed_info["drafts_count"]
+    prep_id = prep_dir.name.removeprefix("prep_")
+    try:
+        _write_drafts(
+            prep_dir,
+            prep_id=prep_id,
+            title=title,
+            description=description,
+            drafts_count=drafts_count,
+            facts=facts,
+            seed=seed_info["seed"],
+            source_photo_paths=source_photo_paths,
+        )
+    except Exception:
+        logger.exception(
+            "Восстановление подготовки %s: не удалось дописать черновики тем же сидом",
+            prep_id,
+        )
+        return None
+
+    logger.info(
+        "Восстановление подготовки %s: недописанные черновики дозаписаны тем же "
+        "сидом (seed=%d)", prep_id, seed_info["seed"],
+    )
+    return _done_job_record(drafts_count)
+
+
+def recover_prep_job(prep_dir: Path) -> Optional[dict]:
+    """Восстанавливает запись PREP_JOBS[prep_id] по данным на диске.
+
+    Два случая:
+    - подготовка успела ПОЛНОСТЬЮ завершиться до рестарта — все draft_NN на
+      месте, просто собираем запись обратно;
+    - подготовка была прервана посреди генерации (сбой во время
+      vary_texts/vary_photos), но сид уже сохранён на диск (source/seed.json,
+      см. _write_seed_info) — дописываем недостающее тем же сидом, результат
+      детерминирован и совпадает с тем, что дал бы непрерывный запуск.
+
+    Если ни того, ни другого нет (крах случился ещё до сохранения сида/
+    исходников либо seed.json отсутствует — legacy-каталог, подготовленный до
+    этой правки) — возвращаем None, вызывающий код это логирует; повторная
+    публикация должна начинаться заново, а не угадывать недостающие данные.
+    """
+    if not prep_dir.is_dir():
+        return None
+
+    seed_info = _read_seed_info(prep_dir)
+    if seed_info is not None:
+        drafts_count = seed_info["drafts_count"]
+        if all(_draft_complete(prep_dir, i) for i in range(1, drafts_count + 1)):
+            return _done_job_record(drafts_count)
+        return _regenerate_from_seed(prep_dir, seed_info)
+
+    # Legacy-каталог без seed.json: доступно только восстановление уже
+    # полностью готового набора, пересчитать недостающее нечем.
+    drafts_count = _count_draft_dirs(prep_dir)
+    if drafts_count == 0:
+        return None
+    if all(_draft_complete(prep_dir, i) for i in range(1, drafts_count + 1)):
+        return _done_job_record(drafts_count)
+    return None
 
 
 def build_result(prep_dir: Path, drafts_count: int) -> list[dict]:
@@ -906,6 +1097,108 @@ if __name__ == "__main__":
             f"Тест 11: №2 на битом фото должен иметь warnings: {_cards3[1]}"
         )
     print("[OK] Тест 11: сбой обработки фото всех вариантов → warnings, статус done")
+
+    # ── Тест 12: recover_prep_job — восстановление PREP_JOBS с диска (F38) ────
+    with tempfile.TemporaryDirectory() as _tmpdir4:
+        _base4 = Path(_tmpdir4) / "prep_recover001"
+        _base4.mkdir()
+
+        _photo_dir = Path(_tmpdir4) / "input_photos2"
+        _photo_dir.mkdir()
+        _photo3 = _photo_dir / "img.png"
+        _photo3.write_bytes(_make_png_bytes())
+
+        # До завершения задачи (папок draft_* ещё нет) — восстановить нечего.
+        assert recover_prep_job(_base4) is None, (
+            "Тест 12: пустая папка не должна давать восстановление"
+        )
+
+        _job4: dict = {}
+        asyncio.run(run_prep_job(
+            "recover001",
+            _job4,
+            title="Пиджак",
+            description="Описание пиджака",
+            source_photos=[_photo3],
+            drafts_count=2,
+            facts={},
+            base_dir=_base4,
+        ))
+        assert _job4.get("status") == "done", f"Тест 12: подготовка не завершилась: {_job4}"
+
+        _restored = recover_prep_job(_base4)
+        assert _restored is not None, "Тест 12: завершённая подготовка должна восстанавливаться"
+        assert _restored["status"] == "done", _restored
+        assert _restored["drafts_count"] == 2, _restored
+
+        # Сид сохранён на диске (F38) — seed.json появился ДО первого draft_NN.
+        assert (_base4 / "source" / "seed.json").is_file(), (
+            "Тест 12: source/seed.json должен сохраняться при run_prep_job"
+        )
+
+        # Удаляем фото одного черновика — имитируем крах посреди vary_photos.
+        # Сид на диске есть → recover_prep_job обязан детерминированно
+        # дописать недостающее, а не сдаться.
+        _title2_before_crash = (_base4 / "draft_02" / "title.txt").read_text(encoding="utf-8")
+        shutil.rmtree(_base4 / "draft_02" / "photos")
+        _restored2 = recover_prep_job(_base4)
+        assert _restored2 is not None, (
+            "Тест 12: недописанный черновик с сохранённым сидом обязан "
+            "дозаписываться детерминированно, а не отказывать"
+        )
+        assert _restored2["drafts_count"] == 2, _restored2
+        assert (_base4 / "draft_02" / "photos").is_dir() and any(
+            (_base4 / "draft_02" / "photos").iterdir()
+        ), "Тест 12: фото черновика 2 должны быть дозаписаны"
+        _title2_after_recover = (_base4 / "draft_02" / "title.txt").read_text(encoding="utf-8")
+        assert _title2_after_recover == _title2_before_crash, (
+            "Тест 12: дозапись тем же сидом должна быть детерминированной "
+            "(title черновика 2 не должен измениться)"
+        )
+
+    # ── Тест 13: recover_prep_job — крах ДО первого draft_NN (F38) ───────────
+    with tempfile.TemporaryDirectory() as _tmpdir5:
+        _base5 = Path(_tmpdir5) / "prep_recover002"
+        _base5.mkdir()
+        _photo_dir5 = Path(_tmpdir5) / "input_photos3"
+        _photo_dir5.mkdir()
+        _photo5 = _photo_dir5 / "img.png"
+        _photo5.write_bytes(_make_png_bytes())
+
+        _job5: dict = {}
+        asyncio.run(run_prep_job(
+            "recover002",
+            _job5,
+            title="Кроссовки",
+            description="Описание кроссовок",
+            source_photos=[_photo5],
+            drafts_count=2,
+            facts={},
+            base_dir=_base5,
+        ))
+        assert _job5.get("status") == "done", f"Тест 13: подготовка не завершилась: {_job5}"
+
+        # Имитируем краш ДО того, как успел записаться хотя бы один draft_NN:
+        # source/ и seed.json целы, а самих черновиков на диске ещё нет.
+        shutil.rmtree(_base5 / "draft_01")
+        shutil.rmtree(_base5 / "draft_02")
+        assert _count_draft_dirs(_base5) == 0, "Тест 13: draft_NN должны отсутствовать"
+
+        _restored3 = recover_prep_job(_base5)
+        assert _restored3 is not None, (
+            "Тест 13: сохранённый сид без единого draft_NN всё равно должен "
+            "давать полную регенерацию"
+        )
+        assert _restored3["drafts_count"] == 2, _restored3
+        for _i in range(1, 3):
+            assert _draft_complete(_base5, _i), (
+                f"Тест 13: draft_{_i:02d} должен быть дозаписан с нуля"
+            )
+
+    print(
+        "[OK] Тест 12-13: recover_prep_job — полное восстановление и "
+        "детерминированная дозапись тем же сидом (F38)"
+    )
 
     print("\n=== Все самотесты preparation.py пройдены ===")
     sys.exit(0)

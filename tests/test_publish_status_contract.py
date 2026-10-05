@@ -2,7 +2,11 @@
 
 import os
 import sys
+import tempfile
 import unittest
+from decimal import Decimal
+from pathlib import Path
+from unittest import mock
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -11,9 +15,32 @@ if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
 import app  # noqa: E402
+import publish_state  # noqa: E402
+import publisher  # noqa: E402
+
+
+def _draft(n_items: int) -> publisher.DraftData:
+    return publisher.DraftData(
+        title="Статус", trade_type="tt", condition="c", size="s", brand="",
+        color="col", description="d", price=100,
+        locations=tuple(
+            publisher.LocationData(city="Москва", address=f"ул. Статусная, {k}")
+            for k in range(1, n_items + 1)
+        ),
+        view_price_max=Decimal("1"), photo_paths=(), category="jackets",
+    )
 
 
 class PublishStatusContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # План возобновления /status читает с диска (TMP_PUBLISH_DIR/<job_id>).
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._publish_root = Path(tmp.name)
+        patcher = mock.patch.object(app, "TMP_PUBLISH_DIR", self._publish_root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_new_publish_fields_are_authoritative_and_aliases_match(self) -> None:
         job = {
             "status": "running",
@@ -81,8 +108,18 @@ class PublishStatusContractTests(unittest.TestCase):
         self.assertEqual(payload["user_action"], action)
 
     def test_resume_availability_is_derived_from_the_safe_checkpoint_boundary(self) -> None:
+        # Бриф 03 (F06): план возобновления /status берёт из checkpoint НА ДИСКЕ
+        # (tmp/publish/<job_id>), как и /resume, — поэтому каждое состояние
+        # сначала записывается настоящей save_publish_state. Смысл проверки
+        # прежний: граница безопасного повтора — continue_listing.
+        def status_for(job_id: str, job: dict) -> dict:
+            publish_state.save_publish_state(
+                self._publish_root / job_id, job_id, job, _draft(13),
+            )
+            return app._serialize_publish_status(job_id, job)
+
         # До continue_listing — retry_item: можно спокойно повторить текущее.
-        safe = app._serialize_publish_status(
+        safe = status_for(
             "job-safe",
             {
                 "status": "needs_user_action",
@@ -94,7 +131,7 @@ class PublishStatusContractTests(unittest.TestCase):
         )
         # После continue_listing, но не последнее объявление — skip_item:
         # текущее уже создано на Авито, продолжаем со следующего.
-        skippable = app._serialize_publish_status(
+        skippable = status_for(
             "job-skippable",
             {
                 "status": "needs_user_action",
@@ -106,7 +143,7 @@ class PublishStatusContractTests(unittest.TestCase):
         )
         # После continue_listing на ПОСЛЕДНЕМ объявлении — пропускать нечего,
         # продолжения не будет.
-        nothing_left = app._serialize_publish_status(
+        nothing_left = status_for(
             "job-nothing-left",
             {
                 "status": "needs_user_action",
@@ -120,6 +157,7 @@ class PublishStatusContractTests(unittest.TestCase):
         self.assertIs(safe["resume_available"], True)
         self.assertEqual(safe["resume_plan"]["mode"], "retry_item")
         self.assertEqual(safe["resume_plan"]["start_index"], 10)
+        self.assertIsNone(safe["resume_unavailable_reason"])
 
         self.assertIs(skippable["resume_available"], True)
         self.assertEqual(skippable["resume_plan"]["mode"], "skip_item")
@@ -128,6 +166,40 @@ class PublishStatusContractTests(unittest.TestCase):
 
         self.assertIs(nothing_left["resume_available"], False)
         self.assertIsNone(nothing_left["resume_plan"])
+        self.assertIn("последнее объявление", nothing_left["resume_unavailable_reason"])
+
+    def test_resume_is_not_offered_without_a_readable_checkpoint(self) -> None:
+        """Память говорит «можно повторить», но checkpoint на диске нет —
+        продолжать было бы нечем: /resume работает только по диску."""
+        payload = app._serialize_publish_status(
+            "job-without-disk",
+            {
+                "status": "failed",
+                "step": "open_form",
+                "items_total": 3,
+                "item_index": 2,
+                "items_published": 1,
+            },
+        )
+
+        self.assertIs(payload["resume_available"], False)
+        self.assertIsNone(payload["resume_plan"])
+        self.assertTrue(payload["resume_unavailable_reason"])
+
+    def test_running_job_does_not_read_disk_or_offer_resume(self) -> None:
+        with mock.patch.object(
+            app.publish_state, "load_publish_state",
+            side_effect=AssertionError("диск не должен читаться для активной задачи"),
+        ):
+            payload = app._serialize_publish_status(
+                "job-running",
+                {"status": "running", "step": "fill_title", "items_total": 3,
+                 "item_index": 1, "items_published": 0},
+            )
+
+        self.assertIs(payload["resume_available"], False)
+        self.assertIsNone(payload["resume_plan"])
+        self.assertIsNone(payload["resume_unavailable_reason"])
 
     def test_skipped_items_are_exposed_and_default_to_empty(self) -> None:
         without = app._serialize_publish_status(
@@ -146,7 +218,11 @@ class PublishStatusContractTests(unittest.TestCase):
         )
 
         self.assertEqual(without["skipped_items"], [])
-        self.assertEqual(with_skips["skipped_items"], [7])
+        # Бриф 05: /status отдаёт записи; старый формат (число) приводится.
+        self.assertEqual(with_skips["skipped_items"], [{
+            "item_index": 7, "item_id": None, "item_url": None,
+            "step": None, "city": None, "address": None,
+        }])
 
 
 if __name__ == "__main__":

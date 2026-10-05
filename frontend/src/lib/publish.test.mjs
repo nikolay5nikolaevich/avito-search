@@ -6,8 +6,11 @@ import {
   buildPublishFormData,
   buildPrepPhotoUrl,
   canResumePublish,
+  countUnstartedItems,
   describeResumePlan,
+  describeStuckItemPayment,
   extractPublishFieldErrors,
+  hasStuckCreatedItem,
   normalizePublishProgress,
     normalizeViewPrice,
   publishButtonLabel,
@@ -72,13 +75,70 @@ test("describeResumePlan renders retry_item and skip_item texts from resume_plan
   assert.match(skip.description, /№7 уже создано на Авито/);
 });
 
-test("resumeUnavailableMessage only fires when resume is genuinely unavailable with items left", () => {
+test("F05: describeResumePlan/hasStuckCreatedItem/describeStuckItemPayment распознают шаг остановки", () => {
+  // До подтверждения цены (fill_view_price) — объявление создано, но
+  // просмотр точно ещё не оплачен.
+  assert.equal(hasStuckCreatedItem({ step: "fill_view_price" }), true);
+  assert.equal(describeStuckItemPayment({ step: "fill_view_price" }), "но не оплачено");
+
+  // После — просмотр уже мог быть оплачен, текст не должен врать про
+  // «не оплачено» (F05: раньше был одинаковый текст для любого денежного шага).
+  assert.equal(hasStuckCreatedItem({ step: "skip_services" }), true);
+  assert.match(describeStuckItemPayment({ step: "skip_services" }), /уже оплачен/);
+
+  // Безопасный (доденежный) шаг — застрявшего объявления нет вовсе.
+  assert.equal(hasStuckCreatedItem({ step: "fill_address" }), false);
+  assert.equal(describeStuckItemPayment({ step: "fill_address" }), null);
+
+  const skipAfterPrice = describeResumePlan({
+    step: "skip_services",
+    resume_plan: { mode: "skip_item", start_index: 8, skipped_item: 7, items_total: 13 },
+  });
+  assert.match(skipAfterPrice.description, /просмотр уже оплачен/);
+
+  const skipBeforePrice = describeResumePlan({
+    step: "fill_view_price",
+    resume_plan: { mode: "skip_item", start_index: 8, skipped_item: 7, items_total: 13 },
+  });
+  assert.match(skipBeforePrice.description, /но не оплачено/);
+});
+
+test("F26: countUnstartedItems вычитает застрявшее объявление, не входящее в items_published", () => {
+  // Денежный шаг — текущее объявление уже создано, но не входит в счётчик:
+  // «ещё не начиналось» должно быть на 1 меньше, чем items_total - items_published.
+  assert.equal(countUnstartedItems({
+    step: "fill_view_price", items_total: 10, items_published: 3,
+  }), 6);
+
+  // Безопасный шаг — ничего не создано, вычитать нечего.
+  assert.equal(countUnstartedItems({
+    step: "fill_address", items_total: 10, items_published: 3,
+  }), 7);
+
+  // Застрявшее — последнее объявление пакета: отрицательным быть не должно.
+  assert.equal(countUnstartedItems({
+    step: "skip_services", items_total: 4, items_published: 3,
+  }), 0);
+});
+
+test("resumeUnavailableMessage forwards the backend reason verbatim (F30/F08/S2 differ)", () => {
+  // Причину даёт бэкенд дословно — раньше фронт её игнорировал и всегда
+  // показывал один и тот же текст про «последнее объявление» (F31).
+  assert.equal(resumeUnavailableMessage({
+    status: "failed",
+    resume_available: false,
+    resume_unavailable_reason: "Задача ещё завершается — подождите несколько секунд и обновите страницу.",
+    items_total: 13,
+    items_published: 12,
+  }), "Задача ещё завершается — подождите несколько секунд и обновите страницу.");
+
+  // Причины с бэкенда нет — честный фолбэк, а не выдуманный текст
   assert.equal(resumeUnavailableMessage({
     status: "failed",
     resume_available: false,
     items_total: 13,
     items_published: 12,
-  }), "Продолжение недоступно: остановка пришлась на последнее объявление — завершите его вручную.");
+  }), "Продолжение недоступно — проверьте кабинет Авито вручную.");
 
   // Всё отправлено — это не тот случай, объяснение не нужно
   assert.equal(resumeUnavailableMessage({
@@ -154,11 +214,13 @@ test("normalizePublishProgress prefers published contract and supports legacy fa
   });
 });
 
-test("publishButtonLabel uses Russian announcement plural forms", () => {
-  assert.equal(publishButtonLabel(1), "Опубликовать 1 объявление");
-  assert.equal(publishButtonLabel(2), "Опубликовать 2 объявления");
-  assert.equal(publishButtonLabel(5), "Опубликовать 5 объявлений");
-  assert.equal(publishButtonLabel(21), "Опубликовать 21 объявление");
+test("publishButtonLabel uses Russian plural forms and honest 'send' wording (F35)", () => {
+  // F35: сервис отправляет на модерацию, а не публикует — кнопка не должна
+  // обещать больше, чем сервис проверяет.
+  assert.equal(publishButtonLabel(1), "Отправить 1 объявление на Авито");
+  assert.equal(publishButtonLabel(2), "Отправить 2 объявления на Авито");
+  assert.equal(publishButtonLabel(5), "Отправить 5 объявлений на Авито");
+  assert.equal(publishButtonLabel(21), "Отправить 21 объявление на Авито");
 });
 
 test("buildPublishFormData uses backend field names for publish form", () => {

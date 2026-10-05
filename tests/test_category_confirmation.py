@@ -51,6 +51,10 @@ class _Locator:
             return True
         return False
 
+    async def is_enabled(self) -> bool:
+        # F36: промежуточную кнопку жмём только доступной, как и финальную.
+        return self.selector == CONTINUE_SELECTOR
+
     async def inner_text(self, timeout: int | None = None) -> str:
         del timeout
         if self.selector == CONTINUE_SELECTOR:
@@ -66,6 +70,8 @@ class _Locator:
 
 class _CategoryConfirmationPage:
     def __init__(self, *, title_visible: bool = False) -> None:
+        # F36: промежуточный клик разрешён только на пути /additem.
+        self.url = "https://www.avito.ru/additem"
         self.title_visible = title_visible
         self.continue_clicks = 0
 

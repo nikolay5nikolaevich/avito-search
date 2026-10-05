@@ -675,7 +675,11 @@ export default function WorkspacePage() {
             ariaLabel="Навигация рабочего экрана"
             links={[
               { to: "/draft", label: "Черновик объявления" },
-              { to: "/", label: "Назад к кейсу" },
+              { to: "/outreach", label: "Рассылка" },
+              { to: "/it-outreach", label: "Рассылка IT" },
+              { to: "/seller", label: "Разбор продавца" },
+              { to: "/resale", label: "Перепродажа" },
+              { to: "/agents", label: "Агенты" },
             ]}
           />
 
@@ -734,7 +738,7 @@ export default function WorkspacePage() {
           ) : null}
         </section>
 
-        <SiteFooter links={[{ to: "/", label: "К кейсу" }]} />
+        <SiteFooter links={[]} />
       </div>
     </main>
   );

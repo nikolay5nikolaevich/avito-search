@@ -30,7 +30,10 @@ assert.match(pageSource, /canResume\s*&&\s*resumePlan/);
 assert.doesNotMatch(pageSource, /verify_published/);
 assert.doesNotMatch(pageSource, /Проверка публикации/);
 assert.match(pageSource, /Отправлено \{itemsPublished\} из \{itemsTotal\}/);
-assert.match(pageSource, /Наличие объявления во вкладке «Активные» не проверялось/);
+// F34/F35: честная оговорка теперь при ЛЮБОМ терминальном статусе с
+// отправленными объявлениями, не только на полном успехе (done).
+assert.match(pageSource, /Наличие во вкладке «Активные» не проверялось/);
+assert.match(pageSource, /isTerminal && publishedUrls\.length > 0/);
 assert.match(pageSource, /publishedUrls\.map/);
 assert.match(pageSource, /minimum_view_price/);
 assert.match(pageSource, /\{`Вариант \$\{draft\.index\}`\}/);

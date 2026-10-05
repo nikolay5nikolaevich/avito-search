@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  closePublishJob,
+  fetchPendingPublishJobs,
   fetchPublishCategories,
   generateAddresses,
   fetchPublishResult,
@@ -16,7 +18,10 @@ import {
   buildLaunchFormData,
   buildPublishFormData,
   canResumePublish,
+  countUnstartedItems,
   describeResumePlan,
+  formatJobCreatedAt,
+  hasStuckCreatedItem,
   MAX_DRAFTS,
   normalizePublishProgress,
   normalizeViewPrice,
@@ -120,6 +125,10 @@ const PANEL_TITLES = {
   needs_user_action: "Требуется действие",
   interrupted: "Публикация прервана",
 };
+
+// F01: ключ localStorage для job_id активной публикации — без него задача
+// терялась при любой перезагрузке страницы (useState живёт только в памяти).
+const PUBLISH_JOB_ID_STORAGE_KEY = "avito-publish-job-id";
 
 const ACCEPTED_MIME = "image/jpeg,image/png,image/gif,image/heic";
 const MAX_PHOTOS = 10;
@@ -233,7 +242,7 @@ function validate(form, photos, profile) {
   return errors;
 }
 
-function DraftForm({ onStarted, onPrepared }) {
+function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
   const [form, setForm] = useState(buildInitialForm());
   const [photos, setPhotos] = useState([]);
   const [errors, setErrors] = useState({});
@@ -602,7 +611,7 @@ function DraftForm({ onStarted, onPrepared }) {
 
   const draftsNum = Number(form.drafts_count);
   const showPrepareButton = Number.isInteger(draftsNum) && draftsNum >= 2;
-  const anyBusy = isSubmitting || isPreparing;
+  const anyBusy = isSubmitting || isPreparing || disabledByPendingJob;
 
   return (
     <form
@@ -1061,6 +1070,11 @@ function DraftForm({ onStarted, onPrepared }) {
             ? (isPreparing ? "Готовим варианты..." : "Подготовить варианты")
             : (isSubmitting ? "Запускаем..." : publishButtonLabel(draftsNum))}
         </button>
+        {disabledByPendingJob ? (
+          <p className="workspace-body-copy" style={{ marginTop: "0.5rem" }}>
+            Сначала продолжите или закройте незавершённую публикацию выше.
+          </p>
+        ) : null}
       </div>
       </fieldset>
     </form>
@@ -1441,6 +1455,7 @@ function PublishProgressPanel({ jobId, summary, onBack }) {
   const [result, setResult] = useState(null);
   const [pollError, setPollError] = useState("");
   const [isResuming, setIsResuming] = useState(false);
+  const [isClosing, setIsClosing] = useState(false);
   const [resumeNonce, setResumeNonce] = useState(0);
 
   useEffect(() => {
@@ -1450,10 +1465,11 @@ function PublishProgressPanel({ jobId, summary, onBack }) {
       try {
         const s = await fetchPublishStatus(jobId);
         if (cancelled) return;
+        setPollError("");
         setStatus(s);
 
-        if (TERMINAL_STATUSES.has(s.status)) {
-          // Терминальное состояние — грузим итог
+        if (TERMINAL_STATUSES.has(s.status) || s.status === "closed") {
+          // Терминальное состояние (включая «закрыта вручную») — грузим итог
           try {
             const r = await fetchPublishResult(jobId);
             if (!cancelled) setResult(r);
@@ -1466,7 +1482,13 @@ function PublishProgressPanel({ jobId, summary, onBack }) {
         // Продолжаем поллинг
         setTimeout(poll, 2000);
       } catch (err) {
-        if (!cancelled) setPollError(err.message || "Не удалось получить статус");
+        // F01: одна сетевая ошибка (например, сервер перезапускается) раньше
+        // останавливала опрос насовсем — пользователь терял прогресс из вида.
+        // Теперь повторяем с паузой и честно показываем, что связи нет.
+        if (!cancelled) {
+          setPollError(err.message || "Нет связи с сервером — повторяем...");
+          setTimeout(poll, 3000);
+        }
       }
     }
 
@@ -1475,7 +1497,7 @@ function PublishProgressPanel({ jobId, summary, onBack }) {
   }, [jobId, resumeNonce]);
 
   const currentStep = status?.step ?? null;
-  const isTerminal = TERMINAL_STATUSES.has(status?.status);
+  const isTerminal = TERMINAL_STATUSES.has(status?.status) || status?.status === "closed";
 
   // Определяем индекс текущего шага
   const currentStepIndex = PUBLISH_STEPS.findIndex((s) => s.key === currentStep);
@@ -1498,6 +1520,15 @@ function PublishProgressPanel({ jobId, summary, onBack }) {
   const resumeUnavailableReason = resumeUnavailableMessage(status ?? {});
 
   async function handleResume() {
+    // Решение 3: задача старше 24 ч — подтверждение с датой и числом
+    // отправленных, чтобы не продолжить забытый пакет по случайному клику.
+    if (status?.is_older_than_24h) {
+      const confirmed = window.confirm(
+        `Эта задача создана ${formatJobCreatedAt(status?.created_at)} — прошли сутки `
+        + `или больше. Отправлено ${itemsPublished} из ${itemsTotal}. Продолжить публикацию?`
+      );
+      if (!confirmed) return;
+    }
     setIsResuming(true);
     setPollError("");
     try {
@@ -1517,7 +1548,31 @@ function PublishProgressPanel({ jobId, summary, onBack }) {
     }
   }
 
-  const panelTitle = status?.status === "done" && isBatch
+  // Решение 2: закрыть незавершённую задачу можно только явной кнопкой с
+  // подтверждением — новый старт молча старую задачу не закрывает (N02).
+  async function handleClose() {
+    const skippedCount = skippedItems.length;
+    const confirmed = window.confirm(
+      `Закрыть задачу? Отправлено ${itemsPublished} из ${itemsTotal}`
+      + (skippedCount > 0 ? `, пропущено ${skippedCount}` : "")
+      + ". Возобновить закрытую задачу будет нельзя."
+    );
+    if (!confirmed) return;
+    setIsClosing(true);
+    setPollError("");
+    try {
+      await closePublishJob(jobId);
+      setStatus((current) => ({ ...(current ?? {}), status: "closed" }));
+    } catch (error) {
+      setPollError(error.message || "Не удалось закрыть задачу");
+    } finally {
+      setIsClosing(false);
+    }
+  }
+
+  const panelTitle = status?.status === "closed"
+    ? "Задача закрыта"
+    : status?.status === "done" && isBatch
     ? `Отправлено ${itemsPublished} из ${itemsTotal}`
     : PANEL_TITLES[status?.status] ?? "Отправляем объявления";
 
@@ -1582,13 +1637,34 @@ function PublishProgressPanel({ jobId, summary, onBack }) {
         </div>
       ) : null}
 
-      {/* Объявления, пропущенные автоматикой при skip_item-возобновлении:
-          уже созданы на Авито, но не оплачены — их не трогаем, судьба на
-          пользователе */}
+      {/* Объявления, пропущенные автоматикой при skip_item-возобновлении: уже
+          созданы (или могли быть) на Авито — их не трогаем, судьба на
+          пользователе. Показываем номер, город/адрес и ссылку/id, а не голый
+          номер (F33) — на любом статусе, включая done с пропусками. */}
       {skippedItems.length > 0 ? (
-        <p className="workspace-body-copy" style={{ marginTop: "0.5rem" }}>
-          Пропущены и требуют ручной проверки: {skippedItems.map((n) => `№${n}`).join(", ")}
-        </p>
+        <div className="draft-terminal-copy draft-terminal-partial" style={{ marginTop: "0.5rem" }}>
+          <strong>Пропущены — проверьте в кабинете Авито вручную:</strong>
+          <ul>
+            {skippedItems.map((item) => {
+              const number = item?.item_index ?? item;
+              const place = [item?.city, item?.address].filter(Boolean).join(", ");
+              return (
+                <li key={number}>
+                  №{number}
+                  {place ? ` — ${place}` : ""}
+                  {item?.item_url ? (
+                    <>
+                      {" "}·{" "}
+                      <a href={item.item_url} target="_blank" rel="noreferrer">
+                        открыть объявление
+                      </a>
+                    </>
+                  ) : item?.item_id ? ` (id ${item.item_id})` : ""}
+                </li>
+              );
+            })}
+          </ul>
+        </div>
       ) : null}
 
       {/* Список шагов */}
@@ -1667,59 +1743,35 @@ function PublishProgressPanel({ jobId, summary, onBack }) {
               </ul>
             </div>
           ) : null}
-          <p className="draft-terminal-copy">
-            Данные переданы Авито. Наличие объявления во вкладке «Активные» не проверялось.
-          </p>
-          {/* Ссылки редактирования переданных объявлений по полученным item id */}
-          {publishedUrls.length > 0 ? (
-            <ul className="draft-saved-urls-list">
-              {publishedUrls.map((url, i) => (
-                <li key={url} className="draft-saved-urls-item">
-                  <a
-                    href={url}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="draft-saved-url-link"
-                  >
-                    Открыть объявление {i + 1}
-                  </a>
-                </li>
-              ))}
-            </ul>
-          ) : null}
         </div>
       ) : null}
 
       {status?.status === "needs_user_action" ? (
         <div className="draft-terminal draft-terminal-action">
           <p className="draft-terminal-title">Требуется ваше участие</p>
-          {/* Частичный успех при пакетном режиме */}
+          {/* Частичный успех при пакетном режиме: F26/F34 — если текущий шаг
+              уже создал объявление на Авито (hasStuckCreatedItem), его номер
+              называем отдельно и не смешиваем с «ещё не начинались» */}
           {isBatch && itemsPublished > 0 ? (
             <p className="draft-terminal-copy draft-terminal-partial">
-              Отправлено {itemsPublished} из {itemsTotal}. Остальные не запускались.
+              {hasStuckCreatedItem(status) ? (
+                <>
+                  Отправлено {itemsPublished} из {itemsTotal}. Объявление №{itemIndex} уже
+                  создано на Авито — не отправляйте его повторно. Ещё не начинались:{" "}
+                  {countUnstartedItems(status)}.
+                </>
+              ) : (
+                <>Отправлено {itemsPublished} из {itemsTotal}. Остальные не запускались.</>
+              )}
             </p>
           ) : null}
           <p className="draft-terminal-copy">
             {status?.user_action?.message || status?.error || "Сервис не смог продолжить автоматически."}
           </p>
-          {/* Обе остановки по цене (минимум выше потолка и отказ Авито) требуют
-              одного и того же действия — поднять потолок. Но советовать
-              «запустите весь пакет заново» можно ТОЛЬКО когда ещё ничего не
-              отправлено: иначе первые объявления уйдут повторно и спишутся
-              второй раз (дубли = двойная оплата). */}
           {status?.user_action?.type === "view_price_too_low"
             || status?.user_action?.type === "view_price_cap_exceeded" ? (
             <p className="draft-terminal-copy" style={{ marginTop: "0.75rem" }}>
               Объявление №{status.user_action.item_index}: минимум Авито — {status.user_action.minimum_view_price} ₽.
-              {itemsPublished > 0 ? (
-                <>
-                  {" "}Увеличьте потолок стоимости просмотра и запустите ТОЛЬКО оставшиеся{" "}
-                  {itemsTotal - itemsPublished}: повторный запуск всего пакета
-                  отправит первые {itemsPublished} второй раз и спишет за них деньги повторно.
-                </>
-              ) : (
-                <>{" "}Увеличьте потолок стоимости просмотра и запустите пакет заново.</>
-              )}
             </p>
           ) : null}
         </div>
@@ -1728,10 +1780,18 @@ function PublishProgressPanel({ jobId, summary, onBack }) {
       {status?.status === "failed" ? (
         <div className="draft-terminal draft-terminal-error">
           <p className="draft-terminal-title">Не удалось завершить публикацию</p>
-          {/* Частичный успех при пакетном режиме */}
+          {/* Частичный успех при пакетном режиме — та же поправка, что и выше */}
           {isBatch && itemsPublished > 0 ? (
             <p className="draft-terminal-copy draft-terminal-partial">
-              Отправлено {itemsPublished} из {itemsTotal}. Остальные не запускались.
+              {hasStuckCreatedItem(status) ? (
+                <>
+                  Отправлено {itemsPublished} из {itemsTotal}. Объявление №{itemIndex} уже
+                  создано на Авито — не отправляйте его повторно. Ещё не начинались:{" "}
+                  {countUnstartedItems(status)}.
+                </>
+              ) : (
+                <>Отправлено {itemsPublished} из {itemsTotal}. Остальные не запускались.</>
+              )}
             </p>
           ) : null}
           <p className="draft-terminal-copy">
@@ -1749,6 +1809,40 @@ function PublishProgressPanel({ jobId, summary, onBack }) {
           <p className="draft-terminal-copy">
             {status?.error || "Сохранённый прогресс найден. Можно продолжить без повторной отправки уже завершённых объявлений."}
           </p>
+        </div>
+      ) : null}
+
+      {status?.status === "closed" ? (
+        <div className="draft-terminal draft-terminal-action">
+          <p className="draft-terminal-copy">
+            Отправлено {itemsPublished} из {itemsTotal}. Задачу нельзя возобновить —
+            начните новую публикацию, если нужно отправить остальное.
+          </p>
+        </div>
+      ) : null}
+
+      {/* Отправленные объявления — при ЛЮБОМ терминальном статусе, а не только
+          на полном успехе (F34): по частичному успеху их раньше было негде
+          посмотреть */}
+      {isTerminal && publishedUrls.length > 0 ? (
+        <div className="draft-terminal-copy" style={{ marginTop: "0.75rem" }}>
+          <p>
+            Данные переданы Авито ({itemsPublished} из {itemsTotal}). Наличие во вкладке «Активные» не проверялось — отправлено на модерацию, не значит опубликовано.
+          </p>
+          <ul className="draft-saved-urls-list">
+            {publishedUrls.map((url, i) => (
+              <li key={url} className="draft-saved-urls-item">
+                <a
+                  href={url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="draft-saved-url-link"
+                >
+                  Открыть объявление {i + 1}
+                </a>
+              </li>
+            ))}
+          </ul>
         </div>
       ) : null}
 
@@ -1771,13 +1865,150 @@ function PublishProgressPanel({ jobId, summary, onBack }) {
         </div>
       ) : null}
 
-      {/* Кнопки нет, но пакет не отправлен целиком — честно объясняем почему */}
+      {/* Кнопки нет, но пакет не отправлен целиком — честно объясняем почему
+          (дословная причина с бэкенда: F30 «задача ещё завершается», F08
+          «шаг неповторяем», S2 «пропустить пришлось бы последнее» и т.д.) */}
       {!canResume && resumeUnavailableReason ? (
         <p className="draft-terminal-copy" style={{ marginTop: "1rem" }}>
           {resumeUnavailableReason}
         </p>
       ) : null}
+
+      {/* Закрыть незавершённую задачу — отдельная явная кнопка (решение 2,
+          N02): новый пакет старую задачу молча не закрывает, а «Продолжить»
+          навсегда остаётся рабочей кнопкой, если её не закрыть явно. */}
+      {["failed", "needs_user_action", "interrupted"].includes(status?.status) ? (
+        <div style={{ marginTop: "0.75rem" }}>
+          <button
+            type="button"
+            className="secondary-button"
+            disabled={isClosing}
+            onClick={handleClose}
+          >
+            {isClosing ? "Закрываем..." : "Закрыть задачу"}
+          </button>
+        </div>
+      ) : null}
     </section>
+  );
+}
+
+// ─── Баннер незавершённой публикации (F01, N02) ───────────────────────────────
+
+// Показывается на экране формы, пока с прошлого раза остаётся задача, которую
+// не отправили до конца и не закрыли. Пока баннер есть, «Опубликовать»
+// недоступна — сначала явное решение: продолжить или закрыть.
+function PendingJobBanner({ job, onOpen, onResumed, onClosed }) {
+  const [isBusy, setIsBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const isActive = job.status === "queued" || job.status === "running";
+  // /api/publish/close принимает только failed/interrupted/needs_user_action
+  // (и уже closed) — «завершена с пропусками» (status=done) закрыть нельзя,
+  // кнопку в этом случае не показываем, чтобы не предлагать заведомо
+  // проваленное действие (открытый вопрос из отчёта брифа 05).
+  const canClose = ["failed", "needs_user_action", "interrupted"].includes(job.status);
+  const resumePlan = describeResumePlan(job);
+  const resumeReason = resumeUnavailableMessage(job);
+
+  async function handleResume() {
+    if (job.is_older_than_24h) {
+      const confirmed = window.confirm(
+        `Эта задача создана ${formatJobCreatedAt(job.created_at)} — прошли сутки или `
+        + `больше. Отправлено ${job.items_published} из ${job.items_total}. Продолжить?`
+      );
+      if (!confirmed) return;
+    }
+    setIsBusy(true);
+    setError("");
+    try {
+      await resumePublish(job.job_id);
+      onResumed(job.job_id);
+    } catch (err) {
+      setError(err.message || "Не удалось продолжить публикацию");
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  async function handleClose() {
+    const skippedCount = Array.isArray(job.skipped_items) ? job.skipped_items.length : 0;
+    const confirmed = window.confirm(
+      `Закрыть задачу? Отправлено ${job.items_published} из ${job.items_total}`
+      + (skippedCount > 0 ? `, пропущено ${skippedCount}` : "")
+      + ". Возобновить закрытую задачу будет нельзя."
+    );
+    if (!confirmed) return;
+    setIsBusy(true);
+    setError("");
+    try {
+      await closePublishJob(job.job_id);
+      onClosed();
+    } catch (err) {
+      setError(err.message || "Не удалось закрыть задачу");
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  const isDoneWithSkips = job.status === "done";
+
+  return (
+    <div className="draft-general-error" style={{ marginBottom: "1rem" }}>
+      <p className="workspace-body-copy">
+        Есть незавершённая публикация от {formatJobCreatedAt(job.created_at)}: отправлено{" "}
+        {job.items_published} из {job.items_total}.
+      </p>
+      {error ? <p className="workspace-body-copy">{error}</p> : null}
+      {isActive ? (
+        <div style={{ marginTop: "0.5rem" }}>
+          <p className="workspace-body-copy">Публикация ещё выполняется.</p>
+          <button type="button" className="secondary-button" onClick={() => onOpen(job.job_id)}>
+            Открыть
+          </button>
+        </div>
+      ) : isDoneWithSkips ? (
+        // done с пропусками (F24/S3) — пакет уже целиком отправлен, новую
+        // публикацию это не блокирует. /api/publish/close такую задачу не
+        // принимает (брифом 04 закрывать разрешено только остановленные), это
+        // осталось открытым вопросом — баннер можно только скрыть на сессию.
+        <div style={{ marginTop: "0.5rem" }}>
+          <p className="workspace-body-copy">
+            Пакет завершён, но часть объявлений пропущена — проверьте их в кабинете Авито
+            вручную (список см. на экране публикации). Новую публикацию это не блокирует.
+          </p>
+          <button type="button" className="secondary-button" onClick={onClosed}>
+            Скрыть
+          </button>
+        </div>
+      ) : (
+        <div style={{ marginTop: "0.5rem", display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+          {resumePlan ? (
+            <button
+              type="button"
+              className="submit-button"
+              disabled={isBusy}
+              onClick={handleResume}
+            >
+              {isBusy ? "Продолжаем..." : resumePlan.buttonLabel}
+            </button>
+          ) : null}
+          {canClose ? (
+            <button
+              type="button"
+              className="secondary-button"
+              disabled={isBusy}
+              onClick={handleClose}
+            >
+              {isBusy ? "Закрываем..." : "Закрыть задачу"}
+            </button>
+          ) : null}
+        </div>
+      )}
+      {!isDoneWithSkips && !resumePlan && resumeReason ? (
+        <p className="workspace-body-copy" style={{ marginTop: "0.5rem" }}>{resumeReason}</p>
+      ) : null}
+    </div>
   );
 }
 
@@ -1803,9 +2034,70 @@ export default function DraftPage() {
   const [jobId, setJobId] = useState(null);
   const [summary, setSummary] = useState(null);
 
+  // F01: задача теряется при перезагрузке страницы (useState живёт только в
+  // памяти вкладки) — job_id дополнительно сохраняем в localStorage, чтение
+  // и запись в try/catch (недоступное хранилище не должно ронять страницу).
+  function rememberJobId(id) {
+    setJobId(id);
+    try {
+      if (id) {
+        window.localStorage.setItem(PUBLISH_JOB_ID_STORAGE_KEY, id);
+      } else {
+        window.localStorage.removeItem(PUBLISH_JOB_ID_STORAGE_KEY);
+      }
+    } catch {
+      // Хранилище недоступно (приватный режим и т.п.) — просто не запомним
+    }
+  }
+
+  // Незавершённая публикация, найденная при открытии страницы (F01, N02):
+  // пока она есть, «Опубликовать» недоступна — сначала продолжить или закрыть.
+  const [pendingJob, setPendingJob] = useState(null);
+  const [pendingJobsError, setPendingJobsError] = useState("");
+
+  useEffect(() => {
+    if (phase !== "form") return;
+    let cancelled = false;
+
+    async function loadPending() {
+      let savedJobId = null;
+      try {
+        savedJobId = window.localStorage.getItem(PUBLISH_JOB_ID_STORAGE_KEY);
+      } catch {
+        // Хранилище недоступно — просто не найдём «свою» задачу по id
+      }
+      try {
+        const { jobs } = await fetchPendingPublishJobs();
+        if (cancelled) return;
+        if (!jobs || jobs.length === 0) {
+          setPendingJob(null);
+          if (savedJobId) rememberJobId(null);
+          return;
+        }
+        const own = savedJobId ? jobs.find((job) => job.job_id === savedJobId) : null;
+        const active = own && (own.status === "queued" || own.status === "running");
+        if (active) {
+          // Задача уже выполняется — баннер не нужен, сразу открываем прогресс
+          rememberJobId(own.job_id);
+          setSummary(null);
+          setPhase("publishing");
+          return;
+        }
+        setPendingJob(own || jobs[0]);
+      } catch (error) {
+        if (!cancelled) {
+          setPendingJobsError(error.message || "Не удалось проверить незавершённые задачи");
+        }
+      }
+    }
+
+    loadPending();
+    return () => { cancelled = true; };
+  }, [phase]);
+
   // Форма → прямой запуск (N=1 или явный «Запустить»)
   function handleStarted(id, draftSummary) {
-    setJobId(id);
+    rememberJobId(id);
     setSummary(draftSummary);
     setPhase("publishing");
     window.scrollTo({ top: 0, behavior: "smooth" });
@@ -1831,7 +2123,7 @@ export default function DraftPage() {
 
   // Превью → публикация
   function handlePreviewStartPublish(id, draftSummary) {
-    setJobId(id);
+    rememberJobId(id);
     setSummary(draftSummary);
     setPhase("publishing");
     window.scrollTo({ top: 0, behavior: "smooth" });
@@ -1839,7 +2131,7 @@ export default function DraftPage() {
 
   // Кнопка «Назад» — всегда возвращает на форму
   function handleBack() {
-    setJobId(null);
+    rememberJobId(null);
     setSummary(null);
     setPrepId(null);
     setPreviewDrafts(null);
@@ -1860,7 +2152,11 @@ export default function DraftPage() {
             ariaLabel="Навигация публикации"
             links={[
               { to: "/workspace", label: "Аналитика" },
-              { to: "/", label: "К кейсу" },
+              { to: "/outreach", label: "Рассылка" },
+              { to: "/it-outreach", label: "Рассылка IT" },
+              { to: "/seller", label: "Разбор продавца" },
+              { to: "/resale", label: "Перепродажа" },
+              { to: "/agents", label: "Агенты" },
             ]}
           />
 
@@ -1870,8 +2166,10 @@ export default function DraftPage() {
               <h1 className="workspace-title">Публикация объявлений</h1>
               {phase === "form" ? (
                 <p className="workspace-intro-copy">
-                  Заполните форму — сервис последовательно опубликует объявления в вашем Chrome,
-                  задаст стоимость просмотра и откажется от дополнительных услуг. Для работы нужен запущенный{" "}
+                  Заполните форму — сервис последовательно отправит объявления на Авито в вашем
+                  Chrome, задаст стоимость просмотра и откажется от дополнительных услуг.
+                  Отправлено — не значит опубликовано: данные уходят на модерацию Авито, появление
+                  во «Активных» сервис не проверяет. Для работы нужен запущенный{" "}
                   <code style={{ fontFamily: "var(--font-mono)", fontSize: "0.85em" }}>
                     start-chrome.bat
                   </code>{" "}
@@ -1893,7 +2191,34 @@ export default function DraftPage() {
         {/* Основной контент */}
         <section className="workspace-main-stack" aria-label="Форма публикации">
           {phase === "form" ? (
-            <DraftForm onStarted={handleStarted} onPrepared={handlePrepared} />
+            <>
+              {pendingJobsError ? (
+                <div className="draft-general-error">
+                  <p className="workspace-body-copy">{pendingJobsError}</p>
+                </div>
+              ) : null}
+              {pendingJob ? (
+                <PendingJobBanner
+                  job={pendingJob}
+                  onOpen={(id) => {
+                    rememberJobId(id);
+                    setSummary(null);
+                    setPhase("publishing");
+                  }}
+                  onResumed={(id) => {
+                    rememberJobId(id);
+                    setSummary(null);
+                    setPhase("publishing");
+                  }}
+                  onClosed={() => setPendingJob(null)}
+                />
+              ) : null}
+              <DraftForm
+                onStarted={handleStarted}
+                onPrepared={handlePrepared}
+                disabledByPendingJob={!!pendingJob && pendingJob.status !== "done"}
+              />
+            </>
           ) : phase === "preparing" ? (
             <PrepareProgressPanel
               prepId={prepId}
@@ -1921,10 +2246,7 @@ export default function DraftPage() {
 
         {/* Footer */}
         <SiteFooter
-          links={[
-            { to: "/workspace", label: "Аналитика" },
-            { to: "/", label: "К кейсу" },
-          ]}
+          links={[{ to: "/workspace", label: "Аналитика" }]}
         />
       </div>
     </main>

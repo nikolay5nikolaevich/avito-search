@@ -64,6 +64,11 @@ for _p in (_tests_dir, _project_root, _backend_dir):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+# Изоляция от боевых артефактов — импортируется ДО app/publisher (см. докстринг
+# модуля): мёртвый AVITO_CDP_URL, TMP_PUBLISH_DIR/DEBUG_PUBLISH_DIR во временном
+# каталоге, файловый лог publisher.py отключён.
+import publish_test_isolation  # noqa: E402,F401
+
 from smoke_helpers import http_get, start_server, wait_server_ready  # noqa: E402
 
 logging.basicConfig(
@@ -259,6 +264,18 @@ def _post_multipart(
             return resp.status, resp.read().decode("utf-8", errors="replace"), dict(resp.headers)
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode("utf-8", errors="replace"), dict(e.headers)
+
+
+def _close_publish_job(job_id: str) -> None:
+    """Закрывает остановленную задачу, как пользователь после проверки кабинета.
+
+    Незакрытая задача с отправленным объявлением блокирует новый start (бриф 04).
+    """
+    req = urllib.request.Request(
+        f"{BASE_URL}/api/publish/close/{job_id}", data=b"", method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        assert resp.status == 200, f"close {job_id} вернул {resp.status}"
 
 
 def _wait_publish_done(job_id: str, timeout: float = 30.0) -> dict:
@@ -652,6 +669,8 @@ def run_publish_smoke_test() -> None:
         checks_passed += 1
         print(f"  Проверка 20 PASS: error содержит '1 из 3' ({error_text!r})")
 
+    _close_publish_job(partial_job_id)
+
     # ── Шаги 17–18: интеграция publish с prep_id (ТЗ §17, Задача 8.3) ────────
     # Сборка минимального prep вручную: две папки draft_01/draft_02 с текстами
     # и фото, запись в PREP_JOBS со status="done", POST start с prep_id.
@@ -886,6 +905,7 @@ def run_publish_smoke_test() -> None:
                 f"keep-тест: ожидали failed/needs_user_action, "
                 f"получили: {keep_final.get('status')!r}"
             )
+            _close_publish_job(keep_job_id)
 
         assert _prep_dir_keep.exists(), (
             "Проверка 24 FAIL: prep-папка удалена при НЕуспешной заливке"
@@ -923,6 +943,8 @@ def run_publish_smoke_test() -> None:
         assert sc == 200, f"start без prep_id: ожидали 200, получили {sc}: {body[:300]}"
         auto_job_id = json.loads(body)["job_id"]
         auto_status = _wait_publish_done(auto_job_id)
+        if auto_status.get("status") != "done":
+            _close_publish_job(auto_job_id)
 
     auto_job = app_module.PUBLISH_JOBS.get(auto_job_id, {})
     assert auto_job.get("prep_id") == auto_job_id, (
@@ -1035,27 +1057,31 @@ def run_publish_smoke_test() -> None:
         print("  Проверка 30 PASS: чужое значение «Вида товара» → 422")
 
         # Валидное значение → задача создана, значение долетело до DraftData
-        sc, body, _ = _post_multipart(
-            "/api/publish/start",
-            {**_it_fields, "category": _fake.key, "item_type": "Худи"}, _it_files,
-        )
-        assert sc == 200, f"валидная форма отклонена: {sc} {body[:200]}"
-        _jid = json.loads(body)["job_id"]
-        _draft = pub_module.build_draft_data(
-            {**_it_fields, "item_type": "Худи"}, ["a.jpg"], category=_fake.key
-        )
-        assert _draft.item_type == "Худи", _draft.item_type
-        assert _draft.summary()["item_type"] == "Худи", _draft.summary()
-        app_module.PUBLISH_JOBS.pop(_jid, None)
+        # (N03: оба POST ниже реально создают задачу и планируют фоновый
+        # run_publish_job — без мока это был бы настоящий прогон публикации)
+        with mock.patch.object(pub_module, "run_publish_job", _make_fake_job()):
+            sc, body, _ = _post_multipart(
+                "/api/publish/start",
+                {**_it_fields, "category": _fake.key, "item_type": "Худи"}, _it_files,
+            )
+            assert sc == 200, f"валидная форма отклонена: {sc} {body[:200]}"
+            _jid = json.loads(body)["job_id"]
+            _draft = pub_module.build_draft_data(
+                {**_it_fields, "item_type": "Худи"}, ["a.jpg"], category=_fake.key
+            )
+            assert _draft.item_type == "Худи", _draft.item_type
+            assert _draft.summary()["item_type"] == "Худи", _draft.summary()
+            app_module.PUBLISH_JOBS.pop(_jid, None)
         checks_passed += 1
         print("  Проверка 31 PASS: валидный «Вид товара» принят и дошёл до DraftData")
 
         # У категории без поля лишнее значение не мешает
-        sc, _body, _ = _post_multipart(
-            "/api/publish/start",
-            {**_it_fields, "category": "jackets", "item_type": "Чепуха"}, _it_files,
-        )
-        assert sc == 200, f"лишний item_type сломал jackets: {sc}"
+        with mock.patch.object(pub_module, "run_publish_job", _make_fake_job()):
+            sc, _body, _ = _post_multipart(
+                "/api/publish/start",
+                {**_it_fields, "category": "jackets", "item_type": "Чепуха"}, _it_files,
+            )
+            assert sc == 200, f"лишний item_type сломал jackets: {sc}"
         checks_passed += 1
         print("  Проверка 32 PASS: у категории без поля лишний item_type игнорируется")
     finally:

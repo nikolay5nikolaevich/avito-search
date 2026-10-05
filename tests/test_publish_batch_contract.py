@@ -310,6 +310,8 @@ class PublishStateMachineTests(unittest.IsolatedAsyncioTestCase):
             "fill_address",
             "checkpoint:continue_listing",
             "continue_listing",
+            # F04/S4: item_id на диск сразу после клика, до цены просмотра.
+            "checkpoint:continue_listing",
             "fill_view_price",
             "continue_view_price",
             "skip_services",

@@ -70,6 +70,50 @@ export function canResumePublish(status = {}) {
 // (совпадает с /api/publish/status: resume_available считается только для них)
 const RESUMABLE_STATUSES = new Set(["failed", "needs_user_action", "interrupted"]);
 
+// Шаги пакета начиная с денежного клика «Продолжить» (совпадает по именам с
+// backend publish_state.FINANCIAL_STEPS) — используются здесь ТОЛЬКО для
+// формулировок на экране. Само решение «можно ли продолжать автоматически»
+// по-прежнему целиком у бэкенда (resume_plan/resume_available), тут его не
+// повторяем.
+const FINANCIAL_STEPS = new Set([
+  "continue_listing",
+  "fill_view_price",
+  "continue_view_price",
+  "skip_services",
+  "done",
+]);
+
+// Шаги ДО подтверждения стоимости просмотра («Продолжить с минимальной
+// ценой»): объявление уже может быть создано (после continue_listing), но
+// показ точно ещё не оплачен.
+const STEPS_BEFORE_VIEW_PRICE_CONFIRMED = new Set(["continue_listing", "fill_view_price"]);
+
+// F26: на текущем шаге уже есть созданное, но не доведённое до конца
+// объявление — его номер не входит в items_published, и его нужно явно
+// вычитать из «остальных»/«оставшихся», иначе счётчик врёт.
+export function hasStuckCreatedItem(status = {}) {
+  return FINANCIAL_STEPS.has(status?.step);
+}
+
+// F05: один и тот же текст «создано, но не оплачено» был неверен, если
+// остановка случилась уже после оплаты просмотра (на экране отказа от услуг).
+export function describeStuckItemPayment(status = {}) {
+  if (!hasStuckCreatedItem(status)) return null;
+  return STEPS_BEFORE_VIEW_PRICE_CONFIRMED.has(status?.step)
+    ? "но не оплачено"
+    : "просмотр уже оплачен — проверьте, не подключились ли платные услуги, прежде чем платить снова";
+}
+
+// F26: «оставшиеся»/«ещё не начинались» без вычета застрявшего объявления
+// врали — оно не входит в items_published (растёт только после полного
+// успеха), но и не «ещё не начиналось».
+export function countUnstartedItems(status = {}) {
+  const { itemsTotal, itemsPublished } = normalizePublishProgress(status);
+  if (itemsTotal == null) return 0;
+  const stuck = hasStuckCreatedItem(status) ? 1 : 0;
+  return Math.max(itemsTotal - itemsPublished - stuck, 0);
+}
+
 // Кнопка/пояснение возобновления зависят от режима resume_plan с бэкенда:
 // retry_item — повтор текущего объявления (ничего платного ещё не случилось),
 // skip_item — текущее уже создано на Авито и не трогается, едем со следующего.
@@ -79,11 +123,12 @@ export function describeResumePlan(status = {}) {
   if (!plan) return null;
 
   if (plan.mode === "skip_item") {
+    const payment = describeStuckItemPayment(status) || "но оплата не подтверждена";
     return {
       buttonLabel: "Продолжить со следующего",
       description: (
         `Продолжим с объявления №${plan.start_index} из ${plan.items_total}. `
-        + `Объявление №${plan.skipped_item} уже создано на Авито, но не оплачено — `
+        + `Объявление №${plan.skipped_item} уже создано на Авито, ${payment} — `
         + "автоматика его повторять не будет, проверьте и завершите его вручную."
       ),
     };
@@ -95,17 +140,26 @@ export function describeResumePlan(status = {}) {
   };
 }
 
-// Честное объяснение отсутствия кнопки, когда пакет не полностью отправлен,
-// но продолжить нельзя (пропустить пришлось бы последнее объявление пакета).
+// Честное объяснение отсутствия кнопки — дословно причина с бэкенда
+// (resume_unavailable_reason), а не заранее заготовленный текст здесь: причины
+// разные (последнее объявление пакета, задача ещё завершается, шаг помечен
+// неповторяемым...), и раньше фронт их не различал (F30, F08, S2).
 export function resumeUnavailableMessage(status = {}) {
   const { itemsTotal, itemsPublished } = normalizePublishProgress(status);
   if (!RESUMABLE_STATUSES.has(status?.status)) return null;
   if (itemsTotal == null || itemsPublished >= itemsTotal) return null;
   if (status?.resume_available === true) return null;
-  return (
-    "Продолжение недоступно: остановка пришлась на последнее объявление — "
-    + "завершите его вручную."
-  );
+  return status?.resume_unavailable_reason
+    || "Продолжение недоступно — проверьте кабинет Авито вручную.";
+}
+
+// Дата задачи для баннера незавершённой публикации (F01) — без библиотек.
+export function formatJobCreatedAt(createdAt) {
+  const date = createdAt ? new Date(createdAt) : null;
+  if (!date || Number.isNaN(date.getTime())) return "неизвестной даты";
+  return date.toLocaleString("ru-RU", {
+    day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit",
+  });
 }
 
 export function publishButtonLabel(count) {
@@ -119,7 +173,7 @@ export function publishButtonLabel(count) {
       : mod10 >= 2 && mod10 <= 4
         ? "объявления"
         : "объявлений";
-  return `Опубликовать ${value} ${noun}`;
+  return `Отправить ${value} ${noun} на Авито`;
 }
 
 export function resizeLocations(locations, count) {

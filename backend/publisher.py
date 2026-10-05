@@ -18,31 +18,40 @@ item_index/items_total/items_published/published_urls; названия этих
 точного текста управляющей кнопки и всех финансовых инвариантов. Любое
 неизвестное состояние останавливает задачу до клика.
 
-Статусы задачи: queued / running / needs_user_action / done / failed.
-needs_user_action — ТЕРМИНАЛЬНЫЙ (v1 без resume): пользователь получает
-инструкцию, делает действие руками и перезапускает задачу заново.
+Статусы задачи: queued / running / needs_user_action / failed / interrupted /
+done / closed. needs_user_action/failed/interrupted — терминальные, но НЕ
+означают конец истории: checkpoint на диске (publish_state.py) знает, безопасно
+ли повторить текущее объявление (retry_item) или его нужно пропустить, потому
+что оно уже могло быть создано (skip_item) — POST /api/publish/resume/{job_id}
+продолжает пакет по этому плану, без повторных финансовых кликов. closed —
+задачу явно закрыли (POST /api/publish/close/{job_id}), продолжать её больше
+нельзя. items_published=0 не значит «на Авито ничего нет»: денежный клик мог
+уже пройти на текущем объявлении — смотри step/resume_plan, не только счётчик.
 
 Самотесты валидации: python backend/publisher.py
 """
 
 import asyncio
+import contextvars
 import datetime
 import json
 import logging
+import os
 import pathlib
 import random
 import re
-import shutil
 import time
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, NoReturn, Optional
 from urllib.parse import urlsplit
 
 import avito_publish_selectors as psel
 import category_profiles
+import journal
 import publish_state
 from category_profiles import CategoryProfile
+from cities import CITIES
 
 # ---------------------------------------------------------------------------
 # Константы сценария
@@ -84,6 +93,13 @@ PHOTO_UPLOAD_TIMEOUT_S: float = 120.0     # фото грузятся на се�
 GEO_SUGGEST_TIMEOUT_MS: int = 10_000      # ожидание гео-саджеста
 GEO_RETRIES: int = 3                      # ретраи ввода адреса
 PUBLISH_TRANSITION_TIMEOUT_S: float = 30.0
+
+# Единственные допустимые подписи кнопки item-edit/button-next (после
+# _norm_label): и финальной (денежной), и промежуточной на экране категории.
+# Авито добавляет внутрь подписи служебный
+# <span elementtiming="sx.additem.forward-button">timing</span>. Любая другая
+# подпись — стоп без клика.
+CONTINUE_BUTTON_LABELS: frozenset[str] = frozenset({"Продолжить", "Продолжить timing"})
 OPEN_FORM_RETRY_DELAYS_S: tuple[float, ...] = (5.0, 15.0, 30.0)
 TRANSIENT_NAVIGATION_ERRORS: tuple[str, ...] = (
     "net::ERR_ABORTED",
@@ -142,8 +158,17 @@ logger = logging.getLogger("publisher")
 
 
 def _setup_publisher_logger() -> None:
-    """Добавляет файловый хэндлер logs/publisher.log (однократно)."""
+    """Добавляет файловый хэндлер logs/publisher.log (однократно).
+
+    В тестах, трогающих publisher.py, писать в боевой лог нельзя — это F28
+    из аудита resume/checkpoint. Переменная окружения
+    AVITO_DISABLE_PUBLISHER_FILE_LOG отключает файловый хэндлер целиком;
+    без неё поведение не меняется. Ставит её tests/publish_test_isolation.py
+    до первого импорта этого модуля.
+    """
     if logger.handlers:
+        return
+    if os.environ.get("AVITO_DISABLE_PUBLISHER_FILE_LOG"):
         return
     try:
         LOGS_DIR.mkdir(exist_ok=True)
@@ -188,6 +213,37 @@ class UserActionRequired(Exception):
     ) -> None:
         super().__init__(message)
         self.user_action = user_action
+
+
+@dataclass
+class _MoneyClickTracker:
+    """Связь денежных кликов внутри шагов с job["money_click"] объявления.
+
+    Шаги (`_step_continue_listing`, `_continue_category_confirmation`) не
+    получают job — их сигнатуры подменяются стендами и тестами. Поэтому
+    `_run_single_item` кладёт трекер в контекстную переменную на время
+    объявления, а шаги сообщают через него, где они находятся.
+
+    listing_checks_started — настоящий `_step_continue_listing` начал
+        предкликовые проверки;
+    listing_click_called — дошли до ВЫЗОВА `button.click()` (не «клик
+        вернулся»: брошенное click() исключение не доказывает, что клик
+        не ушёл в Авито).
+    «not_clicked» ставится только при started and not click_called: подменённый
+    шаг (стенд) ничего не отмечает и потому остаётся консервативным None.
+    """
+
+    mark_clicked: Callable[[], None]
+    listing_checks_started: bool = False
+    listing_click_called: bool = False
+
+
+_MONEY_CLICK_TRACKER: contextvars.ContextVar[Optional[_MoneyClickTracker]] = (
+    contextvars.ContextVar("publisher_money_click_tracker", default=None)
+)
+
+# Маркер «id в пакете не встречался» (номер встречавшегося может быть None).
+_NOT_SEEN = object()
 
 
 # ---------------------------------------------------------------------------
@@ -697,6 +753,11 @@ async def _dump_failure(
         logger.warning("error.txt для шага %s не сохранён: %s", step_name, exc)
 
     if page is None or _page_is_closed(page):
+        # Не молча (F21): без живой страницы в дампе только error.txt.
+        logger.warning(
+            "Дамп шага %s без скриншота и HTML: вкладка %s",
+            step_name, "отсутствует" if page is None else "уже закрыта",
+        )
         if written_files > 0:
             logger.info("Дамп шага %s сохранён в %s", step_name, dump_dir)
             return dump_dir.as_posix()
@@ -798,7 +859,8 @@ def _manual_category_instruction(prefix: str, profile: CategoryProfile) -> str:
     path_tail = " → ".join(profile.full_path[2:])  # «Мужская обувь → Кроссовки»
     return (
         f"{prefix} Открой avito.ru/additem в своём Chrome, выбери категорию "
-        f"«{profile.category_title_text}» ({path_tail}) вручную и перезапусти задачу."
+        f"«{profile.category_title_text}» ({path_tail}) вручную и нажми «Продолжить» — "
+        "деньги ещё не потрачены, это объявление просто начнётся заново."
     )
 
 
@@ -1169,22 +1231,28 @@ async def _hidden_value(page: Any, selector: str) -> str:
 
 
 async def _guard_against_reopened_draft(
-    page: Any, title: str, draft_index: int, drafts_total: int
+    page: Any,
+    title: str,
+    draft_index: int,
+    drafts_total: int,
+    *,
+    own_draft_allowed: bool = False,
 ) -> None:
     """
-    Защита от перезаписи в пакетном режиме (ТЗ §16).
+    Защита от перезаписи в пакетном режиме (ТЗ §16), для КАЖДОГО объявления,
+    включая №1.
 
-    Перед заполнением названия объявления i>1 читаем текущее значение
-    input[name='title']:
+    Перед заполнением названия читаем текущее значение input[name='title']:
       - пусто → нормальная свежая форма, заполняем;
       - непусто и СОВПАДАЕТ с нашим названием → Авито переоткрыл уже
         обработанную форму; заполнять нельзя (можно создать дубль) →
         UserActionRequired (терминальный, дамп снимет обработчик);
+        исключение — own_draft_allowed: resume повторяет ЭТО ЖЕ объявление
+        по плану retry_item (денежного клика по нему не было), и Авито
+        переоткрыл наш же несозданный черновик — его можно дозаполнить;
       - непусто, но ДРУГОЙ текст (старый черновик пользователя) → норма,
         _clear_and_type очистит поле как обычно.
     """
-    if draft_index <= 1:
-        return
     try:
         current = (
             await page.locator(psel.TITLE_INPUT).first.input_value(
@@ -1200,6 +1268,13 @@ async def _guard_against_reopened_draft(
         return
 
     current = current.strip()
+    if current and current == title.strip() and own_draft_allowed:
+        logger.info(
+            "Объявление %d/%d: форма содержит наше название %r — это свой "
+            "несозданный черновик повторяемого объявления, дозаполняю",
+            draft_index, drafts_total, current,
+        )
+        return
     if current and current == title.strip():
         logger.error(
             "Объявление %d/%d: поле названия уже содержит наше название %r — "
@@ -1397,10 +1472,19 @@ async def _continue_category_confirmation(
     """
     Открывает форму с промежуточного экрана «Черновик → Продолжить».
 
-    Авито переиспользует item-edit/button-next и на более позднем опасном шаге,
-    поэтому функция вызывается только ПОСЛЕ проверки категории и кликает лишь
-    когда title уже присутствует в DOM, но остаётся невидимым. Если форма уже
-    открыта, ничего не делает.
+    Авито переиспользует item-edit/button-next и на денежном шаге
+    (continue_listing), поэтому функция вызывается только ПОСЛЕ проверки
+    категории и кликает лишь когда title уже присутствует в DOM, но остаётся
+    невидимым. Если форма уже открыта, ничего не делает.
+
+    Перед кликом — те же строгие проверки, что у финальной кнопки (F36):
+    путь /additem, точная подпись, кнопка доступна; плюс признаки именно
+    промежуточного экрана — title и адрес ещё пусты (при заполненной форме
+    это была бы денежная кнопка). Любая проверка не пройдена → стоп без клика.
+
+    Если клик всё же увёл с /additem (например, на /cpxpromo — экран цены),
+    он считается денежным задним числом: отметка money_click="clicked" через
+    трекер объявления и стоп — объявление могло быть создано, повторять нельзя.
     """
     title = page.locator(psel.TITLE_INPUT).first
 
@@ -1408,6 +1492,14 @@ async def _continue_category_confirmation(
     if await _selector_visible(page, psel.TITLE_INPUT, 2_000):
         logger.info("Форма категории уже открыта — промежуточный клик не нужен")
         return
+
+    path = _page_path(page)
+    if path != "/additem":
+        raise UserActionRequired(_manual_category_instruction(
+            f"Промежуточная кнопка «Продолжить» разрешена только на форме /additem "
+            f"(сейчас {path or 'адрес не прочитан'}).",
+            profile,
+        ))
 
     try:
         title_exists = await title.count() > 0
@@ -1418,6 +1510,38 @@ async def _continue_category_confirmation(
             "Категория выбрана, но поле названия отсутствует в DOM.", profile
         ))
 
+    try:
+        title_value = (await title.input_value(timeout=3_000)) or ""
+    except Exception as exc:
+        raise UserActionRequired(_manual_category_instruction(
+            "Не удалось убедиться, что название на промежуточном экране пусто.",
+            profile,
+        )) from exc
+    if title_value.strip():
+        raise UserActionRequired(_manual_category_instruction(
+            "На промежуточном экране категории название уже заполнено — "
+            "это не свежая форма, кнопку «Продолжить» не нажимаю.",
+            profile,
+        ))
+
+    address = page.locator(psel.ADDRESS_HIDDEN).first
+    address_value = ""
+    try:
+        # Элемента адреса нет в DOM — адрес пуст; есть, но не читается — стоп.
+        if await address.count() > 0:
+            address_value = (await address.input_value(timeout=3_000)) or ""
+    except Exception as exc:
+        raise UserActionRequired(_manual_category_instruction(
+            "Не удалось убедиться, что адрес на промежуточном экране пуст.",
+            profile,
+        )) from exc
+    if address_value.strip():
+        raise UserActionRequired(_manual_category_instruction(
+            "На промежуточном экране категории адрес уже заполнен — "
+            "это не свежая форма, кнопку «Продолжить» не нажимаю.",
+            profile,
+        ))
+
     button = page.locator(psel.CATEGORY_CONFIRM_CONTINUE_BUTTON).first
     try:
         button_visible = await button.is_visible()
@@ -1426,10 +1550,23 @@ async def _continue_category_confirmation(
         button_visible = False
         button_text = ""
 
-    if not button_visible or not button_text.startswith("Продолжить"):
+    if not button_visible:
         raise UserActionRequired(_manual_category_instruction(
             "Категория выбрана, но промежуточная кнопка «Продолжить» не найдена.",
             profile,
+        ))
+    if button_text not in CONTINUE_BUTTON_LABELS:
+        raise UserActionRequired(_manual_category_instruction(
+            f"Промежуточная кнопка имеет неизвестное название: {button_text!r}.",
+            profile,
+        ))
+    try:
+        button_enabled = await button.is_enabled()
+    except Exception:
+        button_enabled = False
+    if not button_enabled:
+        raise UserActionRequired(_manual_category_instruction(
+            "Промежуточная кнопка «Продолжить» недоступна.", profile
         ))
 
     logger.info(
@@ -1439,15 +1576,57 @@ async def _continue_category_confirmation(
     try:
         await button.click(timeout=WAIT_SELECTOR_TIMEOUT_MS)
     except Exception as exc:
+        if _page_path(page) != "/additem":
+            _stop_after_intermediate_money_click(page, profile)
         raise UserActionRequired(_manual_category_instruction(
             "Не удалось нажать промежуточную кнопку «Продолжить».", profile
         )) from exc
 
-    if not await _selector_visible(page, psel.TITLE_INPUT, WAIT_FORM_TIMEOUT_MS):
+    async def _left_form_or_opened() -> bool:
+        if _page_path(page) != "/additem":
+            return True
+        return await _selector_now_visible(page, psel.TITLE_INPUT)
+
+    await _wait_until(
+        _left_form_or_opened,
+        timeout_s=WAIT_FORM_TIMEOUT_MS / 1000,
+        interval_s=0.25,
+    )
+    if _page_path(page) != "/additem":
+        _stop_after_intermediate_money_click(page, profile)
+    if not await _selector_now_visible(page, psel.TITLE_INPUT):
         raise UserActionRequired(_manual_category_instruction(
             "После подтверждения категории форма объявления не открылась.", profile
         ))
     logger.info("Промежуточный экран категории пройден, поле title стало видимым")
+
+
+def _stop_after_intermediate_money_click(page: Any, profile: CategoryProfile) -> NoReturn:
+    """Промежуточный клик увёл с /additem: считаем его денежным и останавливаемся.
+
+    Отметка money_click="clicked" пишется через трекер объявления (в
+    предполётной проверке трекера нет — только стоп). Сбой записи отметки не
+    отменяет стоп: в памяти отметка уже стоит, финальный checkpoint обработчика
+    ошибок попробует записать её ещё раз.
+    """
+    url = str(getattr(page, "url", "") or "")
+    logger.error(
+        "Промежуточная кнопка «Продолжить» увела с формы на %s — клик считаю "
+        "денежным, объявление могло быть создано",
+        url,
+    )
+    tracker = _MONEY_CLICK_TRACKER.get()
+    if tracker is not None:
+        try:
+            tracker.mark_clicked()
+        except Exception as exc:
+            logger.error("Отметка денежного клика не записана на диск: %s", exc)
+    raise UserActionRequired(
+        "Промежуточная кнопка «Продолжить» на экране категории увела с формы "
+        f"({_page_path(page) or url}) — объявление могло быть создано на Авито. "
+        "Автоматическая публикация остановлена и это объявление повторно не "
+        "отправит. Проверьте кабинет Авито вручную."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1957,7 +2136,7 @@ async def _select_brand(
     """
     Вводит бренд с заглавных букв и обязательно выбирает видимую подсказку.
 
-    Пустой или явный «Без бренда» → штатный пункт справочник Авито (разведка
+    Пустой, неизвестный или явный «Без бренда» → штатный пункт справочника Авито (разведка
     16.08.2026: пункт есть в списке кроссовок, форма сама подсказывает
     «Выберите "Без бренда", если марка не указана»). Просто оставить поле
     пустым нельзя — Авито не пропускает форму дальше.
@@ -1975,12 +2154,18 @@ async def _select_brand(
     # прежнего data-marker params[...]/option. Как и для комбобоксов, выбираем
     # реально видимый элемент по точному тексту, иначе введённая строка не
     # считается выбранным брендом и Авито не пропускает форму дальше.
-    if not await _click_visible_text(page, brand_text, timeout_s=6.0):
-        if brand_text != NO_BRAND_LABEL:
-            raise StepError(
-                f"Бренд «{brand_text}» отсутствует в подсказках Авито. "
-                "Публикация остановлена до загрузки фото."
-            )
+    clicked = await _click_visible_text(page, brand_text, timeout_s=6.0)
+    if not clicked and brand_text != NO_BRAND_LABEL:
+        logger.warning(
+            "Бренд %r отсутствует в подсказках Авито — выбираю %r",
+            brand_text,
+            NO_BRAND_LABEL,
+        )
+        brand_text = NO_BRAND_LABEL
+        await _clear_and_type(page, profile.brand_input, brand_text)
+        clicked = await _click_visible_text(page, brand_text, timeout_s=6.0)
+
+    if not clicked:
         raise StepError(
             f"Не удалось выбрать «{NO_BRAND_LABEL}» в подсказках Авито "
             "для этой категории. Публикация остановлена до загрузки фото."
@@ -2196,7 +2381,8 @@ async def _step_fill_address(
     # Все ретраи исчерпаны — стоп с инструкцией (дамп снимет обработчик)
     raise UserActionRequired(
         "Не удалось выбрать адрес через подсказку Авито (гео-саджест не сработал). "
-        "Проверь адрес в форме сервиса и запусти публикацию заново."
+        "Проверь адрес в форме сервиса и нажми «Продолжить» — деньги ещё не "
+        "потрачены, это объявление просто начнётся заново."
     )
 
 
@@ -2238,7 +2424,20 @@ async def _resolve_cpxpromo_page(page: Any, item_id: str) -> Any:
 
 
 async def _step_continue_listing(page: Any) -> tuple[str, Any]:
-    """Один раз переводит заполненную форму на экран стоимости просмотра."""
+    """Один раз переводит заполненную форму на экран стоимости просмотра.
+
+    Денежная отметка (через трекер объявления, если он есть):
+      - до вызова button.click() — только проверки; их сбой доказывает, что
+        клика не было (_run_single_item поставит money_click="not_clicked");
+      - перед самым вызовом click() — listing_click_called=True: дальше
+        любой исход считается «клик мог уйти»;
+      - сразу после успешного click() — mark_clicked(): money_click="clicked"
+        и запись checkpoint. Запись не удалась → StepError, стоп без повтора.
+    """
+    tracker = _MONEY_CLICK_TRACKER.get()
+    if tracker is not None:
+        tracker.listing_checks_started = True
+
     if _page_path(page) != "/additem":
         raise StepError("Кнопка публикации разрешена только на форме /additem")
     if not await _selector_now_visible(page, psel.SAVE_AND_EXIT_BUTTON):
@@ -2260,21 +2459,34 @@ async def _step_continue_listing(page: Any) -> tuple[str, Any]:
         if not await button.is_visible():
             raise StepError("Кнопка «Продолжить» на заполненной форме не видна")
         button_text = _norm_label(await button.inner_text())
-        # Авито добавляет внутрь подписи служебный
-        # <span elementtiming="sx.additem.forward-button">timing</span>.
-        # Разрешаем только два точных подтверждённых DOM-варианта: произвольный
-        # суффикс у финансово значимой кнопки по-прежнему блокирует клик.
-        if button_text not in {"Продолжить", "Продолжить timing"}:
+        # Разрешаем только два точных подтверждённых DOM-варианта
+        # (CONTINUE_BUTTON_LABELS): произвольный суффикс у финансово значимой
+        # кнопки по-прежнему блокирует клик.
+        if button_text not in CONTINUE_BUTTON_LABELS:
             raise StepError(
                 f"Финальная кнопка формы имеет неизвестное название: {button_text!r}"
             )
         if not await button.is_enabled():
             raise StepError("Кнопка «Продолжить» на заполненной форме недоступна")
-        await button.click(timeout=WAIT_SELECTOR_TIMEOUT_MS)
     except StepError:
         raise
     except Exception as exc:
+        raise StepError(
+            "Не удалось проверить кнопку «Продолжить» на заполненной форме"
+        ) from exc
+
+    # Граница денег: с этого места клик мог уйти в Авито, даже если click()
+    # бросит исключение.
+    if tracker is not None:
+        tracker.listing_click_called = True
+    try:
+        await button.click(timeout=WAIT_SELECTOR_TIMEOUT_MS)
+    except Exception as exc:
         raise StepError("Не удалось нажать «Продолжить» на заполненной форме") from exc
+
+    if tracker is not None:
+        # money_click="clicked" + checkpoint; сбой записи — StepError, стоп.
+        tracker.mark_clicked()
 
     reached = await _wait_until(
         lambda: _async_bool(parse_cpxpromo_item_id(getattr(page, "url", ""))),
@@ -2835,7 +3047,54 @@ async def _run_single_item(
     Возвращает `(item_id, edit_url)` после перехода со страницы услуг в кабинет.
     Наличие карточки во вкладке «Активные» не проверяется. Исключения шагов
     обрабатывает run_publish_job.
+
+    На время объявления в контексте лежит трекер денежного клика: через него
+    `_step_continue_listing` и `_continue_category_confirmation` ставят
+    job["money_click"]="clicked" (+ checkpoint) сразу после клика.
+
+    job["resume_retry_item"] == item_index (ставит /api/publish/resume при
+    retry_item того же объявления) → own_draft_allowed для
+    `_guard_against_reopened_draft` (F27): совпадение названия на форме —
+    наш несозданный черновик, а не дубль.
     """
+    own_draft_allowed = job.get("resume_retry_item") == item_index
+
+    def _mark_money_clicked() -> None:
+        # Сначала память: даже если запись упадёт, финальный checkpoint
+        # обработчика ошибок попробует записать отметку ещё раз.
+        job["money_click"] = "clicked"
+        if checkpoint_callback is not None:
+            checkpoint_callback()
+
+    tracker = _MoneyClickTracker(mark_clicked=_mark_money_clicked)
+    token = _MONEY_CLICK_TRACKER.set(tracker)
+    try:
+        return await _run_single_item_steps(
+            page, job, data, location, item_index, items_total, profile,
+            tracker=tracker,
+            active_page_ref=active_page_ref,
+            checkpoint_callback=checkpoint_callback,
+            own_draft_allowed=own_draft_allowed,
+        )
+    finally:
+        _MONEY_CLICK_TRACKER.reset(token)
+
+
+async def _run_single_item_steps(
+    page: Any,
+    job: dict[str, Any],
+    data: DraftData,
+    location: LocationData,
+    item_index: int,
+    items_total: int,
+    profile: CategoryProfile,
+    *,
+    tracker: _MoneyClickTracker,
+    active_page_ref: Optional[list[Any]],
+    checkpoint_callback: Optional[Callable[[], None]],
+    own_draft_allowed: bool,
+) -> tuple[str, str, Decimal, Optional[dict[str, str]]]:
+    """Шаги одного объявления; обвязку (трекер) делает `_run_single_item`."""
     # ── Шаг 2: open_form (заново для каждого объявления) ─────────────────
     _set_step(job, "open_form")
     form_state = await _step_open_form(page, profile)
@@ -2851,9 +3110,12 @@ async def _run_single_item(
     await _step_check_category(page, profile)
     await _pause()
 
-    # ── Шаг 5: fill_title (+ защита от перезаписи для i>1, ТЗ §16) ───────
+    # ── Шаг 5: fill_title (+ защита от переоткрытой формы, ТЗ §16) ───────
     _set_step(job, "fill_title")
-    await _guard_against_reopened_draft(page, data.title, item_index, items_total)
+    await _guard_against_reopened_draft(
+        page, data.title, item_index, items_total,
+        own_draft_allowed=own_draft_allowed,
+    )
     await _clear_and_type(page, psel.TITLE_INPUT, data.title)
     await _pause()
 
@@ -2884,13 +3146,62 @@ async def _run_single_item(
 
     # ── Шаг 11: continue_listing ──────────────────────────────────────────
     _set_step(job, "continue_listing")
-    # Сначала фиксируем на диске начало неоднозначной финансовой зоны. Если
-    # Chrome или сервер оборвётся после клика, resume не повторит объявление.
-    if checkpoint_callback is not None:
-        checkpoint_callback()
-    item_id, page = await _step_continue_listing(page)
+    # Сначала фиксируем на диске начало неоднозначной финансовой зоны
+    # (continue_listing без отметки = «клик мог уйти»). Если Chrome или сервер
+    # оборвётся после клика, resume не повторит объявление.
+    try:
+        if checkpoint_callback is not None:
+            checkpoint_callback()
+    except Exception:
+        # Запись не удалась — _step_continue_listing даже не вызывался, клика
+        # точно не было. Отметку на диск донесёт финальный checkpoint
+        # обработчика ошибок run_publish_job.
+        job["money_click"] = "not_clicked"
+        raise
+    try:
+        item_id, page = await _step_continue_listing(page)
+    except Exception:
+        # «not_clicked» — только с доказательством: настоящий шаг начал
+        # проверки и НЕ дошёл до вызова click(). Если click() вызван (даже
+        # если бросил) или шаг подменён и ничего не отметил — остаётся None
+        # (консервативно: skip, не повтор).
+        if tracker.listing_checks_started and not tracker.listing_click_called:
+            job["money_click"] = "not_clicked"
+        raise
     if active_page_ref is not None:
         active_page_ref[:] = [page]
+
+    # F04/S4: Авито создал объявление — его id на диск сразу, до цены
+    # просмотра: иначе при остановке дальше брошенное объявление не найти.
+    # Клик уже отмечен трекером; сбой этой записи — стоп без повтора клика.
+    job["current_item_id"] = item_id
+    page_url = str(getattr(page, "url", "") or "")
+    job["current_item_url"] = (
+        page_url if parse_cpxpromo_item_id(page_url) == item_id else None
+    )
+    try:
+        if checkpoint_callback is not None:
+            checkpoint_callback()
+    except Exception as exc:
+        raise StepError(
+            f"Объявление №{item_index} (id {item_id}) могло быть создано на Авито, "
+            "но сохранить это на диск не удалось — неизвестно, создано ли оно. "
+            "Публикация остановлена до оплаты просмотра и повторно это объявление "
+            "не отправит. Проверьте кабинет Авито."
+        ) from exc
+
+    # F37: Авито вернул id, уже встречавшийся в этом пакете (отправленное или
+    # пропущенное объявление) — поведение Авито неизвестно, стоп пакета до
+    # цены просмотра, а не пропуск.
+    previous = publish_state.known_item_ids(job).get(str(item_id), _NOT_SEEN)
+    if previous is not _NOT_SEEN:
+        earlier = f"№{previous}" if previous else "из этого пакета"
+        raise UserActionRequired(
+            f"Авито вернул уже созданное объявление {earlier} (id {item_id}) "
+            f"вместо нового №{item_index}, проверьте кабинет Авито. Публикация "
+            "остановлена до оплаты просмотра; автоматика это объявление повторно "
+            "не отправит."
+        )
 
     # ── Шаг 12: fill_view_price ───────────────────────────────────────────
     _set_step(job, "fill_view_price")
@@ -3028,10 +3339,14 @@ async def run_publish_job(
         job:     состояние задачи (status/step/step_label/done/total/error/...)
         data:    провалидированные данные объявления (общие поля пакета)
         cdp_url: адрес CDP Chrome пользователя (None → сразу failed)
-        tmp_dir: каталог tmp/publish/{job_id} с фото; удаляется при done,
-                 при failed/needs_user_action — остаётся для разбора.
+        tmp_dir: каталог tmp/publish/{job_id} с фото и checkpoint. Итог
+                 пишется в checkpoint всегда (в finally, до уборки). При done
+                 без пропусков каталог удаляется целиком, при done с
+                 пропусками остаётся publish-state.json; при остановке —
+                 остаётся всё для разбора и resume.
 
-    Никогда не бросает исключений наружу — итог только в job["status"].
+    Исключения наружу не бросает, кроме asyncio.CancelledError: отмена
+    записывается как interrupted (в память и checkpoint) и пробрасывается.
     """
     # Ленивый импорт: playwright нужен только при реальном прогоне
     from playwright.async_api import async_playwright
@@ -3065,11 +3380,15 @@ async def run_publish_job(
         job["item_index"] = 0
         job["items_published"] = 0
         job["published_urls"] = []
+        job["published_items"] = []
         job["applied_view_prices"] = []
         job["address_warnings"] = []
         job["brand_selected"] = None
+        # Свежий старт: своего недосозданного черновика быть не может.
+        job["resume_retry_item"] = None
     else:
         job.setdefault("published_urls", [])
+        job.setdefault("published_items", [])
         job.setdefault("applied_view_prices", [])
         job.setdefault("address_warnings", [])
         job.setdefault("items_published", start_index - 1)
@@ -3077,6 +3396,9 @@ async def run_publish_job(
     _sync_legacy_publish_aliases(job)
     page: Any = None
     active_page_ref: list[Any] = [None]
+    # Итог (done или сбой) уже записан в job: дальнейшие исключения — например,
+    # при остановке драйвера — его не перезаписывают.
+    outcome_recorded = False
 
     def _save_checkpoint() -> None:
         if not tmp_dir:
@@ -3092,140 +3414,8 @@ async def run_publish_job(
             logger.error("Checkpoint задачи %s не сохранён: %s", job_id, exc)
             raise StepError("Не удалось безопасно сохранить прогресс публикации") from exc
 
-    try:
-        _save_checkpoint()
-        # Выставляем шаг ДО запуска Node-драйвера Playwright. Если дочерний
-        # процесс не смог стартовать, пользователь увидит понятный этап вместо
-        # misleading `unknown`, а дамп будет правильно назван.
-        _set_step(job, "connect_chrome")
-        async with async_playwright() as pw:
-            # ── Шаг 1: connect_chrome (один раз на всю задачу) ────────────
-            if not cdp_url:
-                raise StepError(
-                    "CDP-адрес не задан. Сначала запусти start-chrome.bat."
-                )
-            try:
-                context = await connect_over_cdp(
-                    pw,
-                    cdp_url,
-                    repair_unresponsive_avito_pages=True,
-                    cleanup_stale_publish_pages=True,
-                )
-            except RuntimeError as exc:
-                # browser.connect_over_cdp уже различает недоступный endpoint,
-                # timeout инициализации и прочие ошибки протокола. Не затираем
-                # эту диагностику неточным «Chrome не найден».
-                raise StepError(str(exc)) from exc
-            selected_brand = await _run_publish_preflight(context, data, profile)
-            job["brand_selected"] = selected_brand
-            _save_checkpoint()
-
-            # Открываем СВОЮ рабочую вкладку; предполётная уже закрыта
-            page = await context.new_page()
-            await _pause()
-
-            # ── Объявления 1..N: строго последовательная публикация ───────
-            for item_index in range(start_index, items_total + 1):
-                job["item_index"] = item_index
-                _set_step(job, "open_form")
-                _sync_legacy_publish_aliases(job)
-                _save_checkpoint()
-
-                if page is None or _page_is_closed(page):
-                    page = await context.new_page()
-                    logger.info(
-                        "Объявление %d/%d: вкладка пересоздана после закрытия Авито",
-                        item_index, items_total,
-                    )
-
-                if item_index > 1:
-                    # Пауза 5–15 с между объявлениями (антибот, ТЗ §16)
-                    pause_s = random.uniform(DRAFT_PAUSE_MIN_S, DRAFT_PAUSE_MAX_S)
-                    logger.info(
-                        "Пауза %.1f с перед объявлением %d/%d",
-                        pause_s, item_index, items_total,
-                    )
-                    await asyncio.sleep(pause_s)
-
-                logger.info("Объявление %d/%d: начато", item_index, items_total)
-
-                # Вариативность (ТЗ §17): при наличии prep_id подставляем
-                # title/description/фото варианта i из папки подготовки.
-                # Без prep_id — прежнее поведение: data без изменений.
-                data_i = data
-                if job.get("prep_id"):
-                    title_i, desc_i, photos_i = _load_prep_variant(
-                        TMP_PUBLISH_DIR / f"prep_{job['prep_id']}", item_index
-                    )
-                    data_i = replace(
-                        data,
-                        title=title_i,
-                        description=desc_i,
-                        photo_paths=tuple(photos_i),
-                    )
-                    logger.info(
-                        "Объявление %d/%d: взят вариант из подготовки (%d фото)",
-                        item_index, items_total, len(photos_i),
-                    )
-
-                active_page_ref[:] = [page]
-                (
-                    item_id,
-                    submitted_url,
-                    actual_view_price,
-                    address_warning,
-                ) = await _run_single_item(
-                    page,
-                    job,
-                    data_i,
-                    data.location_for(item_index),
-                    item_index,
-                    items_total,
-                    profile,
-                    active_page_ref=active_page_ref,
-                    checkpoint_callback=_save_checkpoint,
-                )
-                page = active_page_ref[0]
-                # Имена полей оставлены для совместимости существующего API.
-                job["items_published"] += 1
-                job["published_urls"].append(submitted_url)
-                job["result_url"] = submitted_url
-                job["applied_view_prices"].append({
-                    "item_index": item_index,
-                    "price": format(actual_view_price, "f"),
-                })
-                if address_warning:
-                    job["address_warnings"].append({
-                        "item_index": item_index,
-                        **address_warning,
-                    })
-                _sync_legacy_publish_aliases(job)
-                # Это граница возобновления: только после подтверждённой отправки
-                # объявления фиксируем, что следующий запуск может начать с i + 1.
-                _save_checkpoint()
-                logger.info(
-                    "Объявление %d/%d отправлено Авито: item_id=%s, URL=%s",
-                    item_index, items_total, item_id, submitted_url,
-                )
-
-                if item_index < items_total:
-                    _set_step(job, "open_next_form")
-                    # Следующий цикл сам открывает чистую /additem через общий
-                    # безопасный сетевой retry. Второй прямой goto здесь создавал
-                    # лишнюю гонку и обходил обработку временных ошибок.
-
-            # ── Финальный done ────────────────────────────────────────────
-            _set_step(job, "done")
-            job["status"] = "done"
-            job["done"] = TOTAL_STEPS
-            _sync_legacy_publish_aliases(job)
-            logger.info(
-                "Задача %s: отправлено Авито %d/%d (последний URL: %s)",
-                job_id, job["items_published"], items_total, job.get("result_url"),
-            )
-
-    except Exception as exc:  # любой сбой шага — сервер не падает, итог в job
-        page = active_page_ref[0] or page
+    def _record_failure(exc: BaseException) -> str:
+        """Статус, текст и user_action сбоя — только в память. Возвращает шаг."""
         current_step = str(job.get("step") or "unknown")
         if isinstance(exc, UserActionRequired):
             # Терминальный статус: нужна ручная помощь пользователя
@@ -3257,46 +3447,331 @@ async def run_publish_job(
                 job.get("items_published", 0),
                 items_total,
             )
-            logger.exception(
+            logger.error(
                 "Задача %s, шаг %s: Node-драйвер Playwright завершился при старте",
                 job_id,
                 current_step,
+                exc_info=exc,
             )
         else:  # непредвиденный сбой
             status = "failed"
             job["user_action"] = None
-            logger.exception("Задача %s, шаг %s: непредвиденная ошибка: %s",
-                             job_id, current_step, exc)
+            logger.error("Задача %s, шаг %s: непредвиденная ошибка: %s",
+                         job_id, current_step, exc, exc_info=exc)
             message = _format_partial_error(
                 f"Непредвиденная ошибка на шаге {current_step}: {exc}",
                 job.get("items_published", 0), items_total,
             )
-        # Путь дампа отдаём фронту в статусе (debug_dir = debug/publish/<job_id>)
-        job["debug_dir"] = await _dump_failure(page, job_id, current_step, message)
         job["status"] = status
         job["error"] = message
         _sync_legacy_publish_aliases(job)
+        return current_step
+
+    def _record_interrupted() -> None:
+        """S5: отмена задачи (остановка сервера) — interrupted, не failed."""
+        job["status"] = "interrupted"
+        job["user_action"] = None
+        job["error"] = _format_partial_error(
+            "Публикация прервана: сервер остановлен или задача отменена. "
+            "Состояние сохранено — после перезапуска можно продолжить.",
+            job.get("items_published", 0), items_total,
+        )
+        _sync_legacy_publish_aliases(job)
+        logger.warning("Задача %s, шаг %s: прервана (отмена задачи)",
+                       job_id, job.get("step"))
+
+    async def _dump(dump_page: Any, current_step: str) -> None:
+        # В обработчике ошибок — только дамп, закрытие и запись: сбой самого
+        # дампа не должен оставить задачу без итога (F19).
         try:
-            _save_checkpoint()
-        except StepError:
-            logger.exception("Финальный checkpoint задачи %s не сохранён", job_id)
+            job["debug_dir"] = await _dump_failure(
+                dump_page, job_id, current_step, str(job.get("error") or "")
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Задача %s: дамп сбоя не сохранён", job_id)
+
+    # Вложенность (F21): дамп сбоя и закрытие своей вкладки — ВНУТРИ
+    # `async with async_playwright()`, пока драйвер жив; внешний try ловит то,
+    # что случилось до/при старте и остановке драйвера; финальная запись
+    # checkpoint и уборка — во внешнем finally при любом исходе.
+    try:
+        _save_checkpoint()
+        # Выставляем шаг ДО запуска Node-драйвера Playwright. Если дочерний
+        # процесс не смог стартовать, пользователь увидит понятный этап вместо
+        # misleading `unknown`, а дамп будет правильно назван.
+        _set_step(job, "connect_chrome")
+        async with async_playwright() as pw:
+            try:
+                # ── Шаг 1: connect_chrome (один раз на всю задачу) ────────
+                if not cdp_url:
+                    raise StepError(
+                        "CDP-адрес не задан. Сначала запусти start-chrome.bat."
+                    )
+                try:
+                    context = await connect_over_cdp(
+                        pw,
+                        cdp_url,
+                        repair_unresponsive_avito_pages=True,
+                        cleanup_stale_publish_pages=True,
+                    )
+                except RuntimeError as exc:
+                    # browser.connect_over_cdp уже различает недоступный endpoint,
+                    # timeout инициализации и прочие ошибки протокола. Не затираем
+                    # эту диагностику неточным «Chrome не найден».
+                    raise StepError(str(exc)) from exc
+                selected_brand = await _run_publish_preflight(context, data, profile)
+                job["brand_selected"] = selected_brand
+                _save_checkpoint()
+
+                # Открываем СВОЮ рабочую вкладку; предполётная уже закрыта
+                page = await context.new_page()
+                active_page_ref[:] = [page]
+                await _pause()
+
+                await _publish_items(
+                    job_id, job, data, profile,
+                    context=context,
+                    start_index=start_index,
+                    items_total=items_total,
+                    active_page_ref=active_page_ref,
+                    save_checkpoint=_save_checkpoint,
+                )
+
+                # ── Финальный done ────────────────────────────────────────
+                _set_step(job, "done")
+                job["status"] = "done"
+                job["done"] = TOTAL_STEPS
+                _sync_legacy_publish_aliases(job)
+                outcome_recorded = True
+                logger.info(
+                    "Задача %s: отправлено Авито %d/%d (последний URL: %s)",
+                    job_id, job["items_published"], items_total, job.get("result_url"),
+                )
+            except Exception as exc:  # любой сбой шага — сервер не падает, итог в job
+                current_step = _record_failure(exc)
+                outcome_recorded = True
+                # Драйвер ещё жив: дамп получает скриншот и HTML страницы.
+                await _dump(active_page_ref[0], current_step)
+            except asyncio.CancelledError:
+                _record_interrupted()
+                outcome_recorded = True
+                raise
+            finally:
+                # Закрываем ТОЛЬКО свою вкладку и пока драйвер жив: после выхода
+                # из async with close() — молчаливый no-op, вкладка остаётся.
+                page = active_page_ref[0]
+                active_page_ref[:] = [None]
+                await _close_own_page(page, job_id)
+
+    except Exception as exc:
+        if outcome_recorded:
+            # Итог уже в job; это, например, сбой остановки драйвера.
+            logger.warning(
+                "Задача %s: ошибка после итога (%s) — итог не меняется: %s",
+                job_id, job.get("status"), exc,
+            )
+        else:
+            # Сбой до/при старте драйвера: своей вкладки ещё нет.
+            current_step = _record_failure(exc)
+            outcome_recorded = True
+            await _dump(None, current_step)
+    except asyncio.CancelledError:
+        if not outcome_recorded:
+            _record_interrupted()
+            outcome_recorded = True
+        raise
 
     finally:
-        # Закрываем ТОЛЬКО свою вкладку — браузер пользователя не трогаем
-        if page is not None:
-            try:
-                await page.close()
-                logger.info("Задача %s: своя вкладка закрыта", job_id)
-            except Exception as exc:
-                logger.debug("Не удалось закрыть вкладку: %s", exc)
+        if job.get("status") in {"queued", "running"}:
+            # Без итога сюда попадаем только при BaseException, отличном от
+            # отмены: задача не должна остаться «running» навсегда (F19).
+            job["status"] = "failed"
+            job["user_action"] = None
+            job["error"] = _format_partial_error(
+                f"Публикация остановлена аварийно на шаге {job.get('step') or 'unknown'}.",
+                job.get("items_published", 0), items_total,
+            )
+            _sync_legacy_publish_aliases(job)
+        if job.get("status") in {"failed", "needs_user_action", "interrupted"}:
+            # S2: последнее объявление создано, продолжать нечем — номер и
+            # следы в skipped_items сразу, иначе пропуск невидим.
+            last = publish_state.record_unresumable_last_item(job, data)
+            if last is not None:
+                logger.warning(
+                    "Задача %s: последнее объявление №%d создано (или могло быть "
+                    "создано) и не доведено — занесено в пропущенные",
+                    job_id, last,
+                )
+        # Итог — на диск ДО уборки (F16); при done без пропусков каталог
+        # удаляется, с пропусками остаётся publish-state.json (F24/S3).
+        if tmp_dir:
+            publish_state.write_final_state(pathlib.Path(tmp_dir), job_id, job, data)
+            if job.get("status") == "done":
+                logger.info("Задача %s: временные файлы убраны (%s)", job_id, tmp_dir)
 
-        # Фото: при done подчищаем tmp; при failed/needs_user_action оставляем
-        if tmp_dir and job.get("status") == "done":
-            try:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-                logger.info("Задача %s: временные фото удалены (%s)", job_id, tmp_dir)
-            except Exception as exc:
-                logger.warning("Не удалось удалить %s: %s", tmp_dir, exc)
+
+async def _close_own_page(page: Any, job_id: str) -> None:
+    """Закрывает свою вкладку; «закрыта» в логе — только если close() прошёл."""
+    if page is None:
+        return
+    try:
+        await page.close()
+    except Exception as exc:  # noqa: BLE001 — вкладка не повод менять итог
+        logger.warning("Задача %s: свою вкладку закрыть не удалось: %s", job_id, exc)
+        return
+    logger.info("Задача %s: своя вкладка закрыта", job_id)
+
+
+async def _publish_items(
+    job_id: str,
+    job: dict[str, Any],
+    data: DraftData,
+    profile: CategoryProfile,
+    *,
+    context: Any,
+    start_index: int,
+    items_total: int,
+    active_page_ref: list[Any],
+    save_checkpoint: Callable[[], None],
+) -> None:
+    """Объявления start_index..N строго последовательно; сбой — исключение.
+
+    Рабочая вкладка — active_page_ref[0]: её подменяют шаги (новая вкладка
+    цены) и пересоздание после закрытия Авито; закрывает её вызывающий.
+    """
+    for item_index in range(start_index, items_total + 1):
+        job["item_index"] = item_index
+        # Денежная отметка и id относятся только к текущему объявлению:
+        # «clicked»/id предыдущего не должны попасть в план этого.
+        job["money_click"] = None
+        job["current_item_id"] = None
+        job["current_item_url"] = None
+        _set_step(job, "open_form")
+        _sync_legacy_publish_aliases(job)
+        save_checkpoint()
+
+        page = active_page_ref[0]
+        if page is None or _page_is_closed(page):
+            page = await context.new_page()
+            active_page_ref[:] = [page]
+            logger.info(
+                "Объявление %d/%d: вкладка пересоздана после закрытия Авито",
+                item_index, items_total,
+            )
+
+        if item_index > 1:
+            # Пауза 5–15 с между объявлениями (антибот, ТЗ §16)
+            pause_s = random.uniform(DRAFT_PAUSE_MIN_S, DRAFT_PAUSE_MAX_S)
+            logger.info(
+                "Пауза %.1f с перед объявлением %d/%d",
+                pause_s, item_index, items_total,
+            )
+            await asyncio.sleep(pause_s)
+
+        logger.info("Объявление %d/%d: начато", item_index, items_total)
+
+        # Вариативность (ТЗ §17): при наличии prep_id подставляем
+        # title/description/фото варианта i из папки подготовки.
+        # Без prep_id — прежнее поведение: data без изменений.
+        data_i = data
+        if job.get("prep_id"):
+            title_i, desc_i, photos_i = _load_prep_variant(
+                TMP_PUBLISH_DIR / f"prep_{job['prep_id']}", item_index
+            )
+            data_i = replace(
+                data,
+                title=title_i,
+                description=desc_i,
+                photo_paths=tuple(photos_i),
+            )
+            logger.info(
+                "Объявление %d/%d: взят вариант из подготовки (%d фото)",
+                item_index, items_total, len(photos_i),
+            )
+
+        (
+            item_id,
+            submitted_url,
+            actual_view_price,
+            address_warning,
+        ) = await _run_single_item(
+            page,
+            job,
+            data_i,
+            data.location_for(item_index),
+            item_index,
+            items_total,
+            profile,
+            active_page_ref=active_page_ref,
+            checkpoint_callback=save_checkpoint,
+        )
+        # Имена полей оставлены для совместимости существующего API.
+        job["items_published"] += 1
+        job["published_urls"].append(submitted_url)
+        job.setdefault("published_items", []).append({
+            "item_index": item_index,
+            "item_id": item_id,
+        })
+        job["result_url"] = submitted_url
+        job["applied_view_prices"].append({
+            "item_index": item_index,
+            "price": format(actual_view_price, "f"),
+        })
+        if address_warning:
+            job["address_warnings"].append({
+                "item_index": item_index,
+                **address_warning,
+            })
+        _sync_legacy_publish_aliases(job)
+        # Это граница возобновления: только после подтверждённой отправки
+        # объявления фиксируем, что следующий запуск может начать с i + 1.
+        save_checkpoint()
+        logger.info(
+            "Объявление %d/%d отправлено Авито: item_id=%s, URL=%s",
+            item_index, items_total, item_id, submitted_url,
+        )
+
+        # Журнал агентов (docs/specs/agents-registry.md, «Хуки в существующих
+        # агентах»): строго ПОСЛЕ save_checkpoint() выше — объявление уже
+        # подтверждено и оплачено, финансовый шаг не повторяется. journal.py
+        # сам глотает ошибки SQLite, но на случай непредвиденного сбоя (не
+        # sqlite3.Error) заворачиваем в try — запись в журнал не должна
+        # менять исход публикации: объявление и так уже отправлено.
+        try:
+            city_i = data.location_for(item_index).city
+            city_slug = next(
+                (c.slug for c in CITIES if c.name == city_i), None
+            )
+            variant_index = item_index if job.get("prep_id") else None
+            journal.record_listing(
+                item_id,
+                publish_job_id=job_id,
+                prep_id=job.get("prep_id"),
+                variant_index=variant_index,
+                city_slug=city_slug,
+                city_name=city_i,
+                category=data.category,
+                title=data_i.title,
+            )
+            journal.log_event(
+                "publisher",
+                "artifact",
+                f"Объявление {item_index}/{items_total} отправлено Авито",
+                run_id=job_id,
+                tool="avito_additem",
+                payload={"item_id": item_id, "item_index": item_index},
+            )
+        except Exception as journal_exc:  # noqa: BLE001 — см. комментарий выше
+            logger.error(
+                "Журнал агентов: не удалось записать объявление %s задачи %s: %s",
+                item_id, job_id, journal_exc,
+            )
+
+        if item_index < items_total:
+            _set_step(job, "open_next_form")
+            # Следующий цикл сам открывает чистую /additem через общий
+            # безопасный сетевой retry. Второй прямой goto здесь создавал
+            # лишнюю гонку и обходил обработку временных ошибок.
 
 
 # ---------------------------------------------------------------------------

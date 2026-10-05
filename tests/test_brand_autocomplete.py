@@ -110,9 +110,9 @@ class BrandAutocompleteTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(page.option.clicked)
         old_marker_mock.assert_not_awaited()
 
-    async def test_missing_nonempty_brand_stops_without_fallback(self) -> None:
+    async def test_missing_nonempty_brand_selects_no_brand_fallback(self) -> None:
         type_text = mock.AsyncMock(return_value=None)
-        click_text = mock.AsyncMock(return_value=False)
+        click_text = mock.AsyncMock(side_effect=(False, True))
 
         with (
             mock.patch.object(
@@ -125,20 +125,36 @@ class BrandAutocompleteTest(unittest.IsolatedAsyncioTestCase):
                 "_click_visible_text",
                 new=click_text,
             ),
-            self.assertRaisesRegex(publisher.StepError, "Stussy"),
         ):
-            await publisher._select_brand(
+            selected = await publisher._select_brand(
                 object(),
                 category_profiles.TSHIRTS,
                 "stussy",
             )
 
-        type_text.assert_awaited_once_with(
-            mock.ANY,
-            category_profiles.TSHIRTS.brand_input,
-            "Stussy",
+        self.assertEqual(selected, publisher.NO_BRAND_LABEL)
+        self.assertEqual(
+            type_text.await_args_list,
+            [
+                mock.call(
+                    mock.ANY,
+                    category_profiles.TSHIRTS.brand_input,
+                    "Stussy",
+                ),
+                mock.call(
+                    mock.ANY,
+                    category_profiles.TSHIRTS.brand_input,
+                    publisher.NO_BRAND_LABEL,
+                ),
+            ],
         )
-        click_text.assert_awaited_once_with(mock.ANY, "Stussy", timeout_s=6.0)
+        self.assertEqual(
+            click_text.await_args_list,
+            [
+                mock.call(mock.ANY, "Stussy", timeout_s=6.0),
+                mock.call(mock.ANY, publisher.NO_BRAND_LABEL, timeout_s=6.0),
+            ],
+        )
 
     async def test_missing_no_brand_option_stops_safely(self) -> None:
         with (

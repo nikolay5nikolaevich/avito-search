@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import unittest
+import uuid
 from decimal import Decimal
 from pathlib import Path
 from unittest import mock
@@ -115,6 +116,10 @@ class PublishStateFileTests(unittest.TestCase):
                 "job-1",
                 {
                     "status": "running",
+                    # Бриф 03 (F11): пустой step при item_index > 0 кодом не
+                    # производится и теперь даёт «план неизвестен» — фикстура
+                    # несёт реальный безопасный шаг объявления в работе.
+                    "step": "upload_photos",
                     "items_total": 3,
                     "item_index": 2,
                     "items_published": 1,
@@ -168,6 +173,99 @@ class PublishStateFileTests(unittest.TestCase):
         })
         # Сообщение пользователю обязано объяснять судьбу пропущенного
         self.assertIn("№2", job["error"])
+
+    def test_recovery_does_not_crash_on_corrupted_job_among_valid(self) -> None:
+        """F13: одна битая задача (нечисловые поля) не должна ронять весь
+        recover_publish_states — остальные задачи восстанавливаются, битая
+        помечается статусом corrupted и не пытается восстановиться из .bak."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            # Валидная задача рядом с битой.
+            publish_state.save_publish_state(
+                root / "job-good",
+                "job-good",
+                {
+                    "status": "running",
+                    "items_total": 3,
+                    "item_index": 2,
+                    "items_published": 1,
+                },
+                make_draft(),
+            )
+
+            # Битая задача: items_published — не число.
+            broken_dir = root / "job-broken"
+            broken_dir.mkdir(parents=True)
+            broken_payload = {
+                "version": publish_state.STATE_VERSION,
+                "job_id": "job-broken",
+                "job": {
+                    "status": "running",
+                    "items_total": 3,
+                    "item_index": 2,
+                    "items_published": "abc",
+                },
+                "draft": {
+                    "title": "Кроссовки Heckel",
+                    "trade_type": "Продаю своё",
+                    "condition": "Новое",
+                    "size": "42",
+                    "brand": "Heckel",
+                    "color": "Чёрный",
+                    "description": "Описание",
+                    "price": 5000,
+                    "locations": [{"city": "Москва", "address": "Тверская, 10"}],
+                    "view_price_max": "2",
+                    "photo_paths": ["tmp/publish/job-broken/photo_01.jpg"],
+                    "category": "sneakers",
+                },
+            }
+            (broken_dir / publish_state.STATE_FILENAME).write_text(
+                json.dumps(broken_payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            recovered = publish_state.recover_publish_states(root)
+
+        # Задача не упала и вернула ОБЕ записи.
+        self.assertIn("job-good", recovered)
+        self.assertIn("job-broken", recovered)
+
+        good_job, _good_draft = recovered["job-good"]
+        self.assertEqual(good_job["status"], "interrupted")
+
+        broken_job, broken_draft = recovered["job-broken"]
+        self.assertEqual(broken_job["status"], "corrupted")
+        self.assertIsNone(broken_draft)
+        self.assertIn("повреждён", broken_job["error"])
+
+    def test_recovery_preserves_original_error_as_interrupted_reason(self) -> None:
+        """F15: рестарт не должен стирать исходную причину остановки —
+        она сохраняется отдельно, а job["error"] содержит новое сообщение
+        про рестарт (это то, что видит пользователь как текущий статус)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original_error = "Playwright: элемент не найден (timeout 30s)"
+            publish_state.save_publish_state(
+                root / "job-1",
+                "job-1",
+                {
+                    "status": "failed",
+                    "error": original_error,
+                    "items_total": 3,
+                    "item_index": 2,
+                    "items_published": 1,
+                },
+                make_draft(),
+            )
+
+            recovered = publish_state.recover_publish_states(root)
+
+        job, _draft = recovered["job-1"]
+        self.assertEqual(job["interrupted_reason"], original_error)
+        self.assertNotEqual(job["error"], original_error)
+        self.assertIn("перезапущен", job["error"])
 
 
 class PublishResumeSafetyTests(unittest.TestCase):
@@ -422,7 +520,7 @@ class PublishResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prepare_mock.await_count, 1)
 
     async def test_resume_endpoint_schedules_only_unpublished_items(self) -> None:
-        job_id = "job-resume"
+        job_id = str(uuid.uuid4())
         job = {
             "status": "needs_user_action",
             "step": "open_form",
@@ -454,7 +552,7 @@ class PublishResumeTests(unittest.IsolatedAsyncioTestCase):
         создано на Авито (шаг после continue_listing) — resume НЕ повторяет
         его (никаких финансовых кликов второй раз), а едет с №3 и запоминает
         пропущенный номер для ручной проверки пользователем."""
-        job_id = "job-skip-resume"
+        job_id = str(uuid.uuid4())
         saved_job = {
             "status": "failed",
             "step": "continue_view_price",
@@ -494,12 +592,14 @@ class PublishResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["skipped_item"], 2)
         self.assertEqual(payload["resumed_from"], 3)
         self.assertEqual(schedule.call_args.kwargs["start_index"], 3)
-        self.assertEqual(skipped_items, [2])
+        # Бриф 05: пропуск — запись со следами, а не голый номер.
+        self.assertEqual([r["item_index"] for r in skipped_items], [2])
+        self.assertEqual(skipped_items[0]["step"], "continue_view_price")
 
     async def test_resume_endpoint_rejects_when_skip_would_leave_nothing(self) -> None:
         """Остановка на последнем объявлении пакета после финансового шага —
         пропускать некого продолжать, resume запрещён."""
-        job_id = "job-resume-none-left"
+        job_id = str(uuid.uuid4())
         saved_job = {
             "status": "failed",
             "step": "continue_view_price",
@@ -531,6 +631,78 @@ class PublishResumeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 409)
         schedule.assert_not_called()
+
+    async def test_resume_endpoint_returns_409_on_broken_decimal(self) -> None:
+        """F14: view_price_max, который не парсится в Decimal (decimal.InvalidOperation,
+        не подкласс ValueError), должен давать 409 "checkpoint повреждён", а не 500."""
+        job_id = str(uuid.uuid4())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            job_dir = root / job_id
+            job_dir.mkdir(parents=True)
+            payload = {
+                "version": publish_state.STATE_VERSION,
+                "job_id": job_id,
+                "job": {
+                    "status": "failed",
+                    "items_total": 3,
+                    "item_index": 2,
+                    "items_published": 1,
+                },
+                "draft": {
+                    "title": "Кроссовки Heckel",
+                    "trade_type": "Продаю своё",
+                    "condition": "Новое",
+                    "size": "42",
+                    "brand": "Heckel",
+                    "color": "Чёрный",
+                    "description": "Описание",
+                    "price": 5000,
+                    "locations": [{"city": "Москва", "address": "Тверская, 10"}],
+                    "view_price_max": "не число",
+                    "photo_paths": ["tmp/publish/job-1/photo_01.jpg"],
+                    "category": "sneakers",
+                },
+            }
+            (job_dir / publish_state.STATE_FILENAME).write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            with mock.patch.object(backend_app, "TMP_PUBLISH_DIR", root):
+                response = await backend_app.api_publish_resume(job_id)
+
+        self.assertEqual(response.status_code, 409)
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertIn("повреждён", payload["error"])
+
+    async def test_resume_endpoint_returns_409_on_garbage_json(self) -> None:
+        """F14: мусор вместо JSON в файле checkpoint'а — тоже 409, не 500."""
+        job_id = str(uuid.uuid4())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            job_dir = root / job_id
+            job_dir.mkdir(parents=True)
+            (job_dir / publish_state.STATE_FILENAME).write_text(
+                "это не json {{{", encoding="utf-8",
+            )
+            with mock.patch.object(backend_app, "TMP_PUBLISH_DIR", root):
+                response = await backend_app.api_publish_resume(job_id)
+
+        self.assertEqual(response.status_code, 409)
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertIn("повреждён", payload["error"])
+
+    async def test_resume_endpoint_rejects_non_uuid_job_id(self) -> None:
+        """F29: job_id не в формате UUID (в т.ч. path traversal) → 404, а не
+        500 и не чтение файлов вне TMP_PUBLISH_DIR."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "tmp_publish"
+            root.mkdir()
+            for bad_job_id in ("../x", "../../etc/passwd", "случайная-строка-не-uuid"):
+                with self.subTest(job_id=bad_job_id):
+                    with mock.patch.object(backend_app, "TMP_PUBLISH_DIR", root):
+                        response = await backend_app.api_publish_resume(bad_job_id)
+                    self.assertEqual(response.status_code, 404)
 
     async def test_resume_starts_at_first_unpublished_item(self) -> None:
         seen: list[int] = []
