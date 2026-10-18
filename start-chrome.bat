@@ -12,4 +12,5 @@ REM --disable-features=WebUIOmniboxPopup профилактически откл
 REM   выпадашку адресной строки. Chrome 150 может всё равно показать её в CDP как
 REM   type=browser_ui. Backend только диагностирует эту цель и НИКОГДА не вызывает
 REM   для неё /json/close: такой запрос может завершить весь Chrome с вкладками.
-start "" "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --remote-allow-origins=* --disable-features=WebUIOmniboxPopup,WebUIOmniboxAimPopup --user-data-dir="%USERPROFILE%\avito-chrome-profile"
+REM shortcut: HTTP/2 ломает загрузку фото (ERR_HTTP2_PROTOCOL_ERROR), включить после проверки исправленного сетевого канала.
+start "" "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --remote-allow-origins=* --disable-http2 --disable-features=WebUIOmniboxPopup,WebUIOmniboxAimPopup --user-data-dir="%USERPROFILE%\avito-chrome-profile"

@@ -1506,6 +1506,10 @@ async def _continue_category_confirmation(
     except Exception:
         title_exists = False
     if not title_exists:
+        # Категория приходит раньше полей: на заглушках React ждём без кликов.
+        if await _selector_visible(page, psel.TITLE_INPUT, WAIT_FORM_TIMEOUT_MS):
+            logger.info("Форма категории загрузилась — промежуточный клик не нужен")
+            return
         raise UserActionRequired(_manual_category_instruction(
             "Категория выбрана, но поле названия отсутствует в DOM.", profile
         ))

@@ -24,18 +24,17 @@ node_modules/
 *.log
 frontend/dist/
 
-# ─── Markdown: в репозитории только README.md и CLAUDE.md из корня ───────
-# Отчёты, спеки, брифы и заметки остаются на диске, но в git не попадают.
-*.md
+# ─── Markdown ────────────────────────────────────────────────────────────
+# Публичны: README, инструкции для ИИ-агентов (CLAUDE.md, AGENTS.md) и docs/
+# (разборы прогонов, спеки, интеграции). Рабочая кухня — docs/_internal/.
 *.mdc
-!/README.md
-!/CLAUDE.md
 
-# ─── Следы ИИ-инструментов ───────────────────────────────────────────────
+# ─── Локальные настройки ИИ-инструментов ─────────────────────────────────
 .agents/
 .codex/
 .superpowers/
-.claude/
+.claude/settings.local.json
+.claude/worktrees/
 .cursor/
 .cursorrules
 .windsurf/
@@ -51,6 +50,7 @@ docs/_internal/
 # ─── Секреты окружения — никогда не коммитить ────────────────────────────
 .env
 .env.*
+!.env.example
 *.env
 secrets.json
 
@@ -67,3 +67,5 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+*.db

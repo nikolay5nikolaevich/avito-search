@@ -114,6 +114,35 @@ class _DelayedHiddenPage(_CategoryConfirmationPage):
 
 
 class CategoryConfirmationTest(unittest.TestCase):
+    def test_loading_form_waits_for_title_without_clicking_continue(self) -> None:
+        """Категория уже есть, а поля формы появляются позже двух секунд."""
+        page = _CategoryConfirmationPage()
+        elapsed_ms = 0
+
+        async def wait_for_title(selector: str, *, timeout: int, state: str):
+            nonlocal elapsed_ms
+            elapsed_ms += timeout
+            if elapsed_ms < 3_000:
+                raise TimeoutError(selector)
+            page.title_visible = True
+            return page.locator(selector)
+
+        original_count = _Locator.count
+
+        async def count(locator):
+            if locator.selector == TITLE_SELECTOR and not page.title_visible:
+                return 0
+            return await original_count(locator)
+
+        with mock.patch.object(page, "wait_for_selector", side_effect=wait_for_title), \
+                mock.patch.object(_Locator, "count", new=count):
+            asyncio.run(
+                publisher._step_check_category(page, category_profiles.TSHIRTS)
+            )
+
+        self.assertTrue(page.title_visible)
+        self.assertEqual(page.continue_clicks, 0)
+
     def test_verified_category_confirmation_opens_edit_form(self) -> None:
         """После проверенной категории промежуточный экран открывает форму."""
         page = _CategoryConfirmationPage()
