@@ -202,7 +202,7 @@ def _write_drafts(
         d_photos_dir.mkdir(parents=True, exist_ok=True)
 
         (d_dir / "title.txt").write_text(tv.title, encoding="utf-8")
-        (d_dir / "text.txt").write_text(tv.description, encoding="utf-8")
+        (d_dir / "text.txt").write_text(tv.description, encoding="utf-8", newline="")
 
         notes = tv.notes or ""
         warnings: list[str] = []
@@ -386,7 +386,8 @@ async def run_prep_job(
 
         # Сохраняем исходные тексты и факты
         (src_dir / "title.txt").write_text(title, encoding="utf-8")
-        (src_dir / "text.txt").write_text(description, encoding="utf-8")
+        # Не переводим CRLF повторно в Windows: иначе получаем CRCRLF и лишние строки.
+        (src_dir / "text.txt").write_text(description, encoding="utf-8", newline="")
         (src_dir / "facts.json").write_text(
             json.dumps(facts, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -533,7 +534,7 @@ def regenerate_draft(prep_dir: Path, draft_index: int) -> dict:
 
     # Перезаписываем текст
     (d_dir / "title.txt").write_text(tv.title, encoding="utf-8")
-    (d_dir / "text.txt").write_text(tv.description, encoding="utf-8")
+    (d_dir / "text.txt").write_text(tv.description, encoding="utf-8", newline="")
 
     # Перезаписываем фото выбранного варианта.
     notes = tv.notes or ""
@@ -618,7 +619,9 @@ def update_draft_text(
         raise ValueError(f"Папка варианта не найдена: {d_dir}")
 
     (d_dir / "title.txt").write_text(normalized_title, encoding="utf-8")
-    (d_dir / "text.txt").write_text(normalized_description, encoding="utf-8")
+    (d_dir / "text.txt").write_text(
+        normalized_description, encoding="utf-8", newline=""
+    )
 
     logger.info(
         "Ручная правка текста черновика %d/%d сохранена",
