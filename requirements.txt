@@ -13,7 +13,7 @@ websockets==17.0.1
 beautifulsoup4==4.12.3
 
 # Шаблонизатор для HTML-страниц
-jinja2==3.1.4
+jinja2==3.1.6
 
 # Поддержка HTML-форм в FastAPI
 python-multipart==0.0.18

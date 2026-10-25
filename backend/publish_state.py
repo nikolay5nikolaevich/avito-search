@@ -550,6 +550,9 @@ def _serialize_draft(draft: Any) -> dict[str, Any]:
         "item_type": draft.item_type,
         "material": draft.material,
         "style": draft.style,
+        "model": getattr(draft, "model", ""),
+        "memory": getattr(draft, "memory", ""),
+        "sim_type": getattr(draft, "sim_type", ""),
     }
 
 
@@ -568,7 +571,7 @@ def _deserialize_draft(payload: dict[str, Any]) -> Any:
         title=str(payload["title"]),
         trade_type=str(payload["trade_type"]),
         condition=str(payload["condition"]),
-        size=str(payload["size"]),
+        size=str(payload.get("size") or ""),
         brand=str(payload.get("brand") or ""),
         color=str(payload["color"]),
         description=str(payload["description"]),
@@ -584,6 +587,9 @@ def _deserialize_draft(payload: dict[str, Any]) -> Any:
         item_type=str(payload.get("item_type") or ""),
         material=str(payload.get("material") or ""),
         style=str(payload.get("style") or ""),
+        model=str(payload.get("model") or ""),
+        memory=str(payload.get("memory") or ""),
+        sim_type=str(payload.get("sim_type") or ""),
     )
 
 

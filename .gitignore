@@ -69,3 +69,14 @@ Thumbs.db
 *.swp
 
 *.db
+
+# Профили и сессии браузера, дампы
+avito-chrome-profile/
+*.har
+cookies*.json
+storage_state*.json
+library/iphone/
+*.sqlite
+*.sqlite3
+screenshots/
+*.trace.zip

@@ -30,6 +30,7 @@ from fastapi.responses import (
     Response,
     StreamingResponse,
 )
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 import agents_registry
 import analytics
@@ -124,6 +125,54 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Авито — анализ спроса")
 
+# ---------------------------------------------------------------------------
+# Защита локального API от чужих страниц в браузере пользователя.
+# Сервер слушает 127.0.0.1, но любая открытая вкладка может слать на него
+# запросы, поэтому: (1) Host только локальный — против DNS-rebinding;
+# (2) не-GET запросы требуют заголовок X-Avito-Local (чужая страница не может
+# выставить его без CORS-preflight, который сервер не разрешает) и, если есть
+# Origin, он должен быть нашим — против CSRF на платную публикацию и рассылку.
+# ---------------------------------------------------------------------------
+
+ALLOWED_ORIGINS = frozenset({
+    "http://localhost:7777",
+    "http://127.0.0.1:7777",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+})
+LOCAL_HEADER_NAME = "x-avito-local"
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+# Лишние Host-ы — только для тестов (например, AVITO_EXTRA_ALLOWED_HOSTS=testserver).
+_allowed_hosts = ["localhost", "127.0.0.1"] + [
+    host.strip()
+    for host in os.environ.get("AVITO_EXTRA_ALLOWED_HOSTS", "").split(",")
+    if host.strip()
+]
+
+
+@app.middleware("http")
+async def csrf_guard(request: Request, call_next):
+    """Отклоняет мутирующие запросы с чужим Origin или без X-Avito-Local."""
+    if request.method.upper() not in SAFE_METHODS:
+        origin = request.headers.get("origin")
+        if origin is not None and origin not in ALLOWED_ORIGINS:
+            logger.warning("CSRF: отклонён %s %s с Origin=%s", request.method, request.url.path, origin)
+            return JSONResponse({"error": "Запрещено: чужой Origin"}, status_code=403)
+        if request.headers.get(LOCAL_HEADER_NAME) != "1":
+            logger.warning("CSRF: отклонён %s %s без X-Avito-Local", request.method, request.url.path)
+            return JSONResponse({"error": "Запрещено: нет заголовка X-Avito-Local"}, status_code=403)
+    return await call_next(request)
+
+
+# Добавлен последним → внешний слой: чужой Host отсекается до остальной обработки.
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=_allowed_hosts)
+
+
+def _short_error(exc: BaseException, limit: int = 300) -> str:
+    """Текст исключения для ответа фронту: не длиннее limit символов."""
+    return str(exc)[:limit]
+
 # Собранный React-фронтенд (Vite build). Раздаётся через маршруты ниже.
 FRONTEND_DIST_DIR = Path("frontend") / "dist"
 FRONTEND_ASSETS_DIR = FRONTEND_DIST_DIR / "assets"
@@ -216,6 +265,24 @@ def _serialize_city(city: City) -> dict[str, Any]:
         "has_metro": city.has_metro,
         "population": city.population,
     }
+
+
+_PHOTO_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"})
+
+
+def _photo_ext(upload: UploadFile) -> Optional[str]:
+    """Расширение загруженного фото из белого списка; None — недопустимое.
+    Файл без расширения считаем JPEG (как раньше)."""
+    ext = Path(upload.filename or "").suffix.lower() or ".jpg"
+    return ext if ext in _PHOTO_EXTENSIONS else None
+
+
+def _bad_photo_ext_response() -> JSONResponse:
+    message = "Недопустимый тип фото: разрешены .jpg .jpeg .png .webp .heic .heif"
+    return JSONResponse(
+        {"error": message, "errors": [{"field": "photos", "error": message}]},
+        status_code=400,
+    )
 
 
 def _frontend_index_response() -> Response:
@@ -608,17 +675,17 @@ async def run_job(
         journal.log_event(
             "scout", "run_failed", "Авито заблокировал запрос разведки",
             run_id=job_id,
-            payload={"query": query, "error": str(exc)},
+            payload={"query": query, "error": _short_error(exc)},
         )
 
     except Exception as exc:
         logger.error("Непредвиденная ошибка задачи %s: %s", job_id, exc)
         job["status"] = "error"
-        job["error"] = f"Ошибка парсинга: {exc}"
+        job["error"] = f"Ошибка парсинга: {_short_error(exc)}"
         journal.log_event(
             "scout", "run_failed", "Ошибка разведки",
             run_id=job_id,
-            payload={"query": query, "error": str(exc)},
+            payload={"query": query, "error": _short_error(exc)},
         )
 
 
@@ -641,8 +708,13 @@ async def it_outreach_page() -> Response:
 @app.get("/assets/{asset_path:path}")
 async def frontend_assets(asset_path: str) -> Response:
     """Раздаёт собранные Vite-ассеты."""
-    file_path = FRONTEND_ASSETS_DIR / asset_path
-    if file_path.exists() and file_path.is_file():
+    assets_root = FRONTEND_ASSETS_DIR.resolve()
+    try:
+        file_path = (FRONTEND_ASSETS_DIR / asset_path).resolve()
+    except (OSError, ValueError):
+        return HTMLResponse("<h2>Asset not found</h2>", status_code=404)
+    # Путь с ../ или абсолютный не должен выводить за пределы папки ассетов.
+    if file_path.is_relative_to(assets_root) and file_path.is_file():
         return FileResponse(file_path)
 
     return HTMLResponse("<h2>Asset not found</h2>", status_code=404)
@@ -723,10 +795,10 @@ async def _run_stats_collector_job(run_id: str, period_days: int) -> None:
     except Exception as exc:
         logger.error("Сборщик статистики: запуск %s не удался: %s", run_id, exc)
         run["status"] = "error"
-        run["error"] = str(exc)
+        run["error"] = _short_error(exc)
         journal.log_event(
             "stats_collector", "run_failed", "Сборщик статистики не смог собрать снимок",
-            run_id=run_id, payload={"period_days": period_days, "error": str(exc)},
+            run_id=run_id, payload={"period_days": period_days, "error": _short_error(exc)},
         )
 
 
@@ -888,9 +960,9 @@ async def _run_strategist(
         logger.error("Стратег: запуск %s не удался (CLI): %s", run_id, exc)
         journal.log_event(
             "strategist", "run_failed", "Стратег не смог получить ответ Claude CLI",
-            run_id=run_id, payload={"error": str(exc)},
+            run_id=run_id, payload={"error": _short_error(exc)},
         )
-        return JSONResponse({"run_id": run_id, "status": "error", "error": str(exc)}, status_code=502)
+        return JSONResponse({"run_id": run_id, "status": "error", "error": _short_error(exc)}, status_code=502)
 
     try:
         hypotheses = strategist.parse_hypotheses(raw)
@@ -902,9 +974,9 @@ async def _run_strategist(
         )
         journal.log_event(
             "strategist", "run_failed", "Стратег получил невалидный ответ от Claude CLI",
-            run_id=run_id, payload={"error": str(exc), "raw_response_file": dump_path},
+            run_id=run_id, payload={"error": _short_error(exc), "raw_response_file": dump_path},
         )
-        return JSONResponse({"run_id": run_id, "status": "error", "error": str(exc)}, status_code=502)
+        return JSONResponse({"run_id": run_id, "status": "error", "error": _short_error(exc)}, status_code=502)
 
     try:
         journal.save_hypotheses(
@@ -917,9 +989,9 @@ async def _run_strategist(
         logger.error("Стратег: запуск %s — гипотезы не сохранены: %s", run_id, exc)
         journal.log_event(
             "strategist", "run_failed", "Стратег не смог сохранить гипотезы",
-            run_id=run_id, payload={"error": str(exc)},
+            run_id=run_id, payload={"error": _short_error(exc)},
         )
-        return JSONResponse({"run_id": run_id, "status": "error", "error": str(exc)}, status_code=500)
+        return JSONResponse({"run_id": run_id, "status": "error", "error": _short_error(exc)}, status_code=500)
 
     journal.log_event(
         "strategist", "artifact", "Стратег сформулировал гипотезы",
@@ -1377,6 +1449,7 @@ async def _run_prep_job_with_journal(
     drafts_count: int,
     facts: dict[str, str],
     base_dir: Path,
+    library: Optional[dict] = None,
 ) -> None:
     """Обёртка над preparation.run_prep_job с событиями журнала агентов.
 
@@ -1398,6 +1471,7 @@ async def _run_prep_job_with_journal(
         drafts_count=drafts_count,
         facts=facts,
         base_dir=base_dir,
+        **({"library": library} if library is not None else {}),
     )
     if prep_job.get("status") == "done":
         journal.log_event(
@@ -1452,7 +1526,7 @@ async def _run_publish_and_cleanup(
             job["user_action"] = None
             job["error"] = (
                 f"Непредвиденная ошибка публикации на шаге {job.get('step') or 'unknown'}: "
-                f"{exc}. Автоматическое продолжение решит по сохранённому состоянию; "
+                f"{_short_error(exc)}. Автоматическое продолжение решит по сохранённому состоянию; "
                 "уже созданные объявления проверьте в кабинете Авито."
             )
             _save_publish_outcome(job_id, job, draft, tmp_dir)
@@ -1681,6 +1755,13 @@ async def api_publish_categories() -> JSONResponse:
             "item_types": list(p.item_type_options.keys()),
             "materials": list(p.material_options.keys()),
             "styles": list(p.style_options.keys()),
+            # Телефоны: каскад модель → память → цвет. Пустые у одежды.
+            "models": list(p.model_options.keys()),
+            "memories": list(p.memory_options.keys()),
+            "model_memory": {m: list(p.memory_for(m)) for m in p.model_options},
+            "model_colors": {m: list(p.colors_for(m)) for m in p.model_options},
+            "has_size": p.has_size,
+            "fixed_brand": p.fixed_brand,
         })
     return JSONResponse({"categories": cats})
 
@@ -1745,6 +1826,10 @@ async def api_publish_start(
     item_type: str = Form(""),
     material: str = Form(""),
     style: str = Form(""),
+    model: str = Form(""),
+    memory: str = Form(""),
+    sim_type: str = Form(""),
+    pack_id: str = Form(""),
     photos: list[UploadFile] = File([]),
 ) -> JSONResponse:
     """
@@ -1792,12 +1877,63 @@ async def api_publish_start(
         "item_type": item_type,
         "material": material,
         "style": style,
+        "model": model,
+        "memory": memory,
+        "sim_type": sim_type if isinstance(sim_type, str) else "",
     }
+
+    prepared_photos: list[str] = []
+    if category == "iphone" and not prep_id:
+        return JSONResponse({"errors": [{
+            "field": "prep_id", "error": "Сначала подготовьте и проверьте черновики iPhone",
+        }]}, status_code=422)
+    if prep_id:
+        try:
+            prep_dir = TMP_PUBLISH_DIR / f"prep_{prep_id}"
+            snapshot = preparation.read_library_snapshot(prep_dir)
+            if snapshot:
+                import iphone_library
+
+                expected = {
+                    "title": snapshot["source_title"],
+                    "model": snapshot["model"],
+                    "memory": snapshot["memory"],
+                    "color": snapshot["color"],
+                    "sim_type": snapshot["sim_type"],
+                }
+                if category != "iphone" or photos:
+                    raise ValueError("Подготовка iPhone несовместима с этой категорией или своими фото")
+                for key, value in expected.items():
+                    if str(fields.get(key, "")).strip() != value:
+                        raise ValueError("Параметры изменены: подготовьте черновики заново")
+                selection = pack_id if isinstance(pack_id, str) else ""
+                if selection != snapshot.get("pack_selection", ""):
+                    raise ValueError("Выбор фотопака изменён: подготовьте черновики заново")
+                count = publisher.parse_drafts_count(drafts_count)
+                if count != len(snapshot["descriptions"]):
+                    raise ValueError("Количество изменено: подготовьте черновики заново")
+                # Проверяем все тексты до запуска Chrome, включая ручные правки.
+                for index in range(1, count + 1):
+                    card_title, card_text, card_photos = publisher._load_prep_variant(prep_dir, index)
+                    if iphone_library.validate_title_memory(card_title, memory) != model:
+                        raise ValueError("Модель в названии черновика не совпадает с подготовкой")
+                    iphone_library.validate_phone_text(card_text, fields["sim_type"])
+                    if index == 1:
+                        fields["description"] = card_text
+                        prepared_photos = card_photos
+                fields["condition"] = "Новое"
+        except (ValueError, OSError, KeyError, publisher.StepError) as exc:
+            return JSONResponse({"errors": [{
+                "field": "prep_id", "error": _short_error(exc),
+            }]}, status_code=422)
 
     # Метаданные фото для валидации БЕЗ чтения содержимого в память:
     # размер берём по спулу Starlette через seek/tell (лимит 25 МБ/файл
     # проверяется по факту, пиковая память не растёт со списком blob'ов)
     photo_meta: list[tuple[str, Optional[str], int]] = []
+    for path in prepared_photos:
+        photo = Path(path)
+        photo_meta.append((photo.name, mimetypes.guess_type(photo.name)[0], photo.stat().st_size))
     for upload in photos:
         upload.file.seek(0, os.SEEK_END)
         size = upload.file.tell()
@@ -1839,6 +1975,8 @@ async def api_publish_start(
     # Создаём задачу и сохраняем фото в tmp/publish/{job_id}/ —
     # читаем и пишем ПО ОДНОМУ файлу, не накапливая их содержимое в памяти
     # Диск — источник финального статуса: задачу мог закрыть другой процесс.
+    if any(_photo_ext(upload) is None for upload in photos):
+        return _bad_photo_ext_response()
     blocker = _start_publish_conflict(prep_id, include_disk=True)
     if blocker:
         return _publish_busy_response(blocker)
@@ -1852,9 +1990,14 @@ async def api_publish_start(
     photo_paths: list[str] = []
     try:
         tmp_dir.mkdir(parents=True, exist_ok=True)
+        for idx, source in enumerate(prepared_photos, start=1):
+            source_path = Path(source)
+            file_path = tmp_dir / f"photo_{idx:02d}{source_path.suffix.lower()}"
+            shutil.copy2(source_path, file_path)
+            photo_paths.append(str(file_path))
         for idx, upload in enumerate(photos, start=1):
             # Безопасное имя: порядковый номер + расширение исходника
-            ext = Path(upload.filename or "").suffix.lower() or ".jpg"
+            ext = _photo_ext(upload) or ".jpg"
             file_path = tmp_dir / f"photo_{idx:02d}{ext}"
             file_path.write_bytes(await upload.read())
             photo_paths.append(str(file_path))
@@ -1867,7 +2010,7 @@ async def api_publish_start(
         shutil.rmtree(tmp_dir, ignore_errors=True)
         logger.error("Publish: не удалось сохранить фото в %s: %s", tmp_dir, exc)
         return JSONResponse(
-            {"errors": [{"field": "photos", "error": f"Не удалось сохранить фото: {exc}"}]},
+            {"errors": [{"field": "photos", "error": f"Не удалось сохранить фото: {_short_error(exc)}"}]},
             status_code=500,
         )
 
@@ -1878,7 +2021,7 @@ async def api_publish_start(
         PUBLISH_JOBS.pop(job_id, None)
         shutil.rmtree(tmp_dir, ignore_errors=True)
         logger.exception("Publish: не удалось собрать задачу %s", job_id)
-        return JSONResponse({"error": f"Не удалось создать задачу публикации: {exc}"}, status_code=500)
+        return JSONResponse({"error": f"Не удалось создать задачу публикации: {_short_error(exc)}"}, status_code=500)
 
     PUBLISH_JOBS[job_id].update({
         "step": "",
@@ -1920,7 +2063,7 @@ async def api_publish_start(
         return JSONResponse(
             {"errors": [{
                 "field": "photos",
-                "error": f"Не удалось безопасно сохранить задачу публикации: {exc}",
+                "error": f"Не удалось безопасно сохранить задачу публикации: {_short_error(exc)}",
             }]},
             status_code=500,
         )
@@ -2262,6 +2405,20 @@ async def api_publish_result(job_id: str) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+@app.get("/api/publish/iphone-library")
+async def api_iphone_library(title: str = "", memory: str = "") -> JSONResponse:
+    """Перечитывает локальную библиотеку для модели и памяти из формы."""
+    import iphone_library
+
+    try:
+        result = await asyncio.to_thread(iphone_library.catalog, title, memory)
+    except (ValueError, OSError) as exc:
+        return JSONResponse({"errors": [{
+            "field": "title", "error": _short_error(exc),
+        }]}, status_code=422)
+    return JSONResponse(result)
+
+
 @app.post("/api/publish/prepare")
 async def api_prepare_start(
     title: str = Form(""),
@@ -2270,6 +2427,12 @@ async def api_prepare_start(
     size: str = Form(""),
     condition: str = Form(""),
     brand: str = Form(""),
+    category: str = Form("jackets"),
+    model: str = Form(""),
+    memory: str = Form(""),
+    color: str = Form(""),
+    sim_type: str = Form(""),
+    pack_id: str = Form(""),
     photos: list[UploadFile] = File([]),
 ) -> JSONResponse:
     """
@@ -2281,8 +2444,42 @@ async def api_prepare_start(
     Валидная → фото сохраняются в tmp/publish/prep_{prep_id}/, задача уходит в фон.
     Ответ: {"prep_id": "<uuid>"}.
     """
+    library = None
+    library_photos: list[Path] = []
+    if category == "iphone":
+        import iphone_library
+
+        if photos:
+            return JSONResponse({"errors": [{
+                "field": "photos", "error": "Для iPhone фотографии берутся из библиотеки",
+            }]}, status_code=422)
+        if not isinstance(sim_type, str) or sim_type not in iphone_library.SIM_TYPES:
+            return JSONResponse({"errors": [{
+                "field": "sim_type", "error": "Выберите тип SIM",
+            }]}, status_code=422)
+        try:
+            count = publisher.parse_drafts_count(drafts_count)
+            if count is None:
+                raise ValueError("Укажите количество объявлений от 1 до 20")
+            selection = pack_id if isinstance(pack_id, str) else ""
+            materials = await asyncio.to_thread(
+                iphone_library.select_materials,
+                title, memory, color, sim_type, count, selection,
+            )
+            library_photos = materials.pop("source_photos")
+            library = {**materials, "pack_selection": selection}
+            description = library["descriptions"][0]
+            condition = "Новое"
+            brand = "Apple"
+        except (ValueError, OSError) as exc:
+            return JSONResponse({"errors": [{
+                "field": "pack_id", "error": _short_error(exc),
+            }]}, status_code=422)
+
     # Метаданные фото для валидации (seek/tell, без чтения blob-ов в память)
     photo_meta: list[tuple[str, Optional[str], int]] = []
+    for photo in library_photos:
+        photo_meta.append((photo.name, mimetypes.guess_type(photo.name)[0], photo.stat().st_size))
     for upload in photos:
         upload.file.seek(0, os.SEEK_END)
         file_size = upload.file.tell()
@@ -2299,25 +2496,28 @@ async def api_prepare_start(
         logger.info("Prepare: форма не прошла валидацию (%d ошибок)", len(errors))
         return JSONResponse({"errors": errors}, status_code=422)
 
+    if any(_photo_ext(upload) is None for upload in photos):
+        return _bad_photo_ext_response()
+
     # Создаём prep_id и рабочую директорию
     prep_id = str(uuid.uuid4())
     prep_dir = TMP_PUBLISH_DIR / f"prep_{prep_id}"
 
     # Сохраняем исходные фото во временные файлы
-    source_photos: list[Path] = []
+    source_photos: list[Path] = list(library_photos)
     try:
         prep_dir.mkdir(parents=True, exist_ok=True)
         tmp_photos_dir = prep_dir / "_input"
         tmp_photos_dir.mkdir(parents=True, exist_ok=True)
         for idx, upload in enumerate(photos, start=1):
-            ext = Path(upload.filename or "").suffix.lower() or ".jpg"
+            ext = _photo_ext(upload) or ".jpg"
             file_path = tmp_photos_dir / f"photo_{idx:02d}{ext}"
             file_path.write_bytes(await upload.read())
             source_photos.append(file_path)
     except OSError as exc:
         logger.error("Prepare: не удалось сохранить фото в %s: %s", prep_dir, exc)
         return JSONResponse(
-            {"errors": [{"field": "photos", "error": f"Не удалось сохранить фото: {exc}"}]},
+            {"errors": [{"field": "photos", "error": f"Не удалось сохранить фото: {_short_error(exc)}"}]},
             status_code=500,
         )
 
@@ -2355,6 +2555,7 @@ async def api_prepare_start(
             drafts_count=n_drafts,
             facts=facts,
             base_dir=prep_dir,
+            **({"library": library} if library is not None else {}),
         )
     )
 
@@ -2406,7 +2607,10 @@ async def api_prepare_result(prep_id: str) -> JSONResponse:
     drafts_count: int = job.get("drafts_count") or 1
     drafts = preparation.build_result(prep_dir, drafts_count)
 
-    return JSONResponse({"prep_id": prep_id, "drafts": drafts})
+    return JSONResponse({
+        "prep_id": prep_id, "drafts": drafts,
+        "library": drafts[0].get("library") if drafts else None,
+    })
 
 
 @app.get("/api/publish/prepare/photo/{prep_id}/{draft_index}/{photo_index}")
@@ -2495,7 +2699,7 @@ async def api_prepare_regenerate(request: Request) -> JSONResponse:
         card = preparation.regenerate_draft(prep_dir, draft_index)
     except ValueError as exc:
         return JSONResponse(
-            {"errors": [{"field": "draft_index", "error": str(exc)}]},
+            {"errors": [{"field": "draft_index", "error": _short_error(exc)}]},
             status_code=422,
         )
 
@@ -2559,7 +2763,7 @@ async def api_prepare_update_text(request: Request) -> JSONResponse:
             description,
         )
     except ValueError as exc:
-        error_message = str(exc)
+        error_message = _short_error(exc)
         error_field = "title" if error_message.startswith("Название") else "draft_index"
         return JSONResponse(
             {
@@ -2716,11 +2920,11 @@ async def _run_outreach_collect_job(job_id: str, city: str, query: str, limit: i
     except outreach.OutreachStoppedError as exc:
         logger.warning("Рассылка: сбор %s остановлен: %s", job_id, exc)
         job["status"] = "needs_user_action"
-        job["error"] = str(exc)
+        job["error"] = _short_error(exc)
     except Exception as exc:
         logger.error("Рассылка: сбор %s упал: %s", job_id, exc)
         job["status"] = "failed"
-        job["error"] = str(exc)
+        job["error"] = _short_error(exc)
 
 
 async def _run_outreach_send_job(
@@ -2777,14 +2981,14 @@ async def _run_outreach_send_job(
     except outreach.OutreachStoppedError as exc:
         logger.warning("Рассылка: отправка %s остановлена: %s", job_id, exc)
         job["status"] = "needs_user_action"
-        job["error"] = str(exc)
+        job["error"] = _short_error(exc)
         if exc.result:
             _merge_outreach_result(job, exc.result)
         _checkpoint()
     except Exception as exc:
         logger.error("Рассылка: отправка %s упала: %s", job_id, exc)
         job["status"] = "failed"
-        job["error"] = str(exc)
+        job["error"] = _short_error(exc)
         _checkpoint()
 
 
@@ -3175,12 +3379,12 @@ async def _run_it_outreach_job(job_id: str, limit: int) -> None:
                 record = await asyncio.to_thread(it_outreach.inspect_site, site_url)
             except it_outreach.SourceUnavailableError as exc:
                 job["status"] = "blocked"
-                job["error"] = f"Источник недоступен: {exc}"
+                job["error"] = f"Источник недоступен: {_short_error(exc)}"
                 return
             except Exception as exc:
                 record = {
                     "domain": it_outreach.domain_key(site_url), "site_url": site_url,
-                    "status": "error", "error": str(exc),
+                    "status": "error", "error": _short_error(exc),
                 }
             await asyncio.to_thread(it_outreach_store.upsert_company, record, IT_OUTREACH_DB_PATH)
             job["scanned"] += 1
@@ -3191,11 +3395,11 @@ async def _run_it_outreach_job(job_id: str, limit: int) -> None:
     except it_outreach.SourceUnavailableError as exc:
         logger.warning("IT-поиск %s остановлен: %s", job_id, exc)
         job["status"] = "blocked"
-        job["error"] = f"Источник недоступен: {exc}"
+        job["error"] = f"Источник недоступен: {_short_error(exc)}"
     except Exception as exc:
         logger.exception("IT-поиск %s упал: %s", job_id, exc)
         job["status"] = "error"
-        job["error"] = str(exc)
+        job["error"] = _short_error(exc)
 
 
 @app.post("/api/it-outreach/start")
@@ -3336,7 +3540,7 @@ async def _run_seller_scan_job(job_id: str, profile_url: str, limit: int) -> Non
     except Exception as exc:
         logger.error("Разбор продавца %s упал: %s", job_id, exc)
         job["status"] = "error"
-        job["error"] = str(exc)
+        job["error"] = _short_error(exc)
 
 
 @app.post("/api/seller/scan")
@@ -3354,7 +3558,7 @@ async def api_seller_scan(request: Request) -> JSONResponse:
         profile_url = seller_scan.validate_profile_url(str(payload.get("url") or ""))
     except ValueError as exc:
         profile_url = ""
-        errors.append({"field": "url", "error": str(exc)})
+        errors.append({"field": "url", "error": _short_error(exc)})
 
     raw_limit = payload.get("limit")
     try:
@@ -3571,13 +3775,13 @@ async def _run_resale_scan_job(
         logger.error("Resale %s: claude CLI недоступен: %s", job_id, exc)
         job["status"] = "error"
         job["error"] = (
-            f"Не удалось разобрать объявления через claude CLI: {exc}. "
+            f"Не удалось разобрать объявления через claude CLI: {_short_error(exc)}. "
             "Вероятная причина — VPN не пускает claude, либо CLI не авторизован."
         )
     except Exception as exc:
         logger.error("Resale %s упал: %s", job_id, exc)
         job["status"] = "error"
-        job["error"] = str(exc)
+        job["error"] = _short_error(exc)
 
 
 @app.post("/api/resale/scan")

@@ -681,9 +681,9 @@ async def send_messages(
                 await page.goto(listing_url, wait_until="domcontentloaded", timeout=30_000)
             except Exception as exc:
                 logger.warning("Не загрузилось объявление %s: %s", listing_url, exc)
-                record_contact(candidate, "failed", message=message, error=str(exc))
+                record_contact(candidate, "failed", message=message, error=str(exc)[:300])
                 result["failed"] += 1
-                result["results"].append({**candidate, "status": "failed", "error": str(exc)})
+                result["results"].append({**candidate, "status": "failed", "error": str(exc)[:300]})
                 continue
             if await page.title() == "Ошибка 404. Страница не найдена":
                 error = "Авито вернуло 404: страница объявления не найдена."
@@ -730,24 +730,24 @@ async def send_messages(
                 record_contact(candidate, "sent", message=message)
             except ChatUnavailableError as exc:
                 logger.info("Чат недоступен у кандидата №%d, перехожу к следующему", item_index)
-                record_contact(candidate, "failed", message=message, error=str(exc))
+                record_contact(candidate, "failed", message=message, error=str(exc)[:300])
                 result["failed"] += 1
-                result["results"].append({**candidate, "status": "failed", "error": str(exc)})
+                result["results"].append({**candidate, "status": "failed", "error": str(exc)[:300]})
                 continue
             except (Exception, asyncio.CancelledError) as exc:
                 status = "uncertain" if click_started else "failed"
                 try:
-                    record_contact(candidate, status, message=message, error=str(exc))
+                    record_contact(candidate, status, message=message, error=str(exc)[:300])
                 except Exception:
                     logger.error("Не удалось записать результат отправки", exc_info=True)
                 result[status] += 1
-                result["results"].append({**candidate, "status": status, "error": str(exc)})
+                result["results"].append({**candidate, "status": status, "error": str(exc)[:300]})
                 if isinstance(exc, asyncio.CancelledError):
                     raise
-                await _dump(item_index, candidate, str(exc), click_started, chat_ctx["reloaded"])
+                await _dump(item_index, candidate, str(exc)[:300], click_started, chat_ctx["reloaded"])
                 raise OutreachStoppedError(
                     ("Результат отправки неизвестен; повтор заблокирован. " if click_started
-                     else "Отправка остановлена до клика. ") + str(exc), result,
+                     else "Отправка остановлена до клика. ") + str(exc)[:300], result,
                 ) from exc
             result["sent"] += 1
             result["results"].append({**candidate, "status": "sent"})
@@ -758,9 +758,9 @@ async def send_messages(
                                 wait_until="domcontentloaded", timeout=30_000)
                 await _checked_html(page)
             except Exception as exc:
-                await _dump(item_index, candidate, str(exc), True, chat_ctx["reloaded"])
+                await _dump(item_index, candidate, str(exc)[:300], True, chat_ctx["reloaded"])
                 raise OutreachStoppedError(
-                    "Сообщение отправлено, но вернуться к выдаче не удалось. " + str(exc), result,
+                    "Сообщение отправлено, но вернуться к выдаче не удалось. " + str(exc)[:300], result,
                 ) from exc
             _progress(progress_cb, index + 1, len(candidates), candidate["seller_name"])
             if index + 1 < len(candidates):

@@ -23,6 +23,12 @@ const PUBLISH_FIELD_NAMES = [
   // Стиль: есть не у всех категорий. Для остальных уходит пустой строкой —
   // бэкенд игнорирует (validate_publish_form: profile.has_style)
   "style",
+  // Телефоны: модель и память. Для одежды уходят пустыми — бэкенд игнорирует
+  // (validate_publish_form: profile.has_model)
+  "model",
+  "memory",
+  "sim_type",
+  "pack_id",
 ];
 
 // Терминальные статусы задачи публикации (контракт /api/publish/status)
@@ -235,7 +241,9 @@ export function buildPublishFormData(form, photos) {
   const formData = new FormData();
 
   for (const name of PUBLISH_FIELD_NAMES) {
-    formData.append(name, String(form[name]).trim());
+    if (form.category === "iphone" && name === "description") continue;
+    const value = form.category === "iphone" && name === "condition" ? "Новое" : form[name];
+    formData.append(name, String(value ?? "").trim());
   }
 
   const locations = resizeLocations(form.locations, Number(form.drafts_count)).map(
@@ -248,7 +256,7 @@ export function buildPublishFormData(form, photos) {
     normalizedViewPriceMax ?? String(form.view_price_max ?? "").trim().replace(",", "."),
   );
 
-  for (const file of photos) {
+  for (const file of form.category === "iphone" ? [] : photos) {
     formData.append("photos", file);
   }
 

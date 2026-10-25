@@ -14,6 +14,9 @@ TSHIRTS — «Кофты и футболки» (Мужская одежда). У
 Значения ждут живой разведки: python debug/recon_tshirts.py → debug/tshirts_map.txt.
 VESTS — «Жилеты» (Мужская одежда → Верхняя одежда). Значения подтверждены
 разведкой 2026-08-25.
+IPHONE — «Мобильные телефоны» (Электроника → Телефоны), только Apple iPhone 17/18.
+Разведка 2026-10-20 (debug/recon_iphone.py). Поля идут каскадом: Производитель →
+Модель → Встроенная память → Цвет; размера и бренда нет.
 
 Самотесты: python backend/category_profiles.py
 """
@@ -48,6 +51,55 @@ class CategoryProfile:
     # «Стиль» — радиогруппа, как «Состояние». Пустая пара = поля у категории нет.
     style_options: dict[str, int] = field(default_factory=dict)
     style_param: int = 0
+    # --- Расширения для не-одежды (телефоны). Все пустые по умолчанию:
+    # профили одежды ведут себя ровно как раньше. ---
+    # «Вид объявления» радиогруппой с маркером params[N]/option(ID) вместо
+    # комбобокса trade_type_prefix. 0 = комбобокс (одежда).
+    trade_type_param: int = 0
+    # Второе радио «Состояние» с маркером params[N]/option(ID): на форме
+    # телефонов два поля состояния одновременно (детальное + краткое).
+    # 0 = второго поля нет.
+    extra_condition_param: int = 0
+    extra_condition_option: int = 0
+    # Фиксированный производитель (автокомплит brand_param). Непусто = бренд
+    # не берётся из формы и «Без бренда» не подставляется (fail-closed).
+    fixed_brand: str = ""
+    # Каскадные комбобоксы «Модель» и «Встроенная память». Пустая пара = нет.
+    model_options: dict[str, int] = field(default_factory=dict)
+    model_prefix: str = ""
+    memory_options: dict[str, int] = field(default_factory=dict)
+    memory_prefix: str = ""
+    # Наблюдённые разведкой наборы памяти/цветов по модели (для фронта и
+    # валидации). Модель без записи = допустим весь словарь.
+    model_memory: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    model_colors: dict[str, tuple[str, ...]] = field(default_factory=dict)
+
+    @property
+    def has_size(self) -> bool:
+        """Есть ли у категории размер (у телефонов нет)."""
+        return bool(self.size_options and self.size_prefix)
+
+    @property
+    def has_model(self) -> bool:
+        """Есть ли каскад «Модель» (телефоны)."""
+        return bool(self.model_options and self.model_prefix)
+
+    @property
+    def has_memory(self) -> bool:
+        """Есть ли каскад «Встроенная память» (телефоны)."""
+        return bool(self.memory_options and self.memory_prefix)
+
+    def memory_for(self, model: str) -> tuple[str, ...]:
+        """Допустимые объёмы памяти для модели (весь словарь, если нет данных)."""
+        return self.model_memory.get(model, tuple(self.memory_options))
+
+    def colors_for(self, model: str) -> tuple[str, ...]:
+        """Допустимые цвета для модели (весь словарь, если нет данных)."""
+        return self.model_colors.get(model, tuple(self.color_options))
+
+    def option_radio(self, param: int, option_id: int) -> str:
+        """Селектор label радио нового вида: params[N]/option(ID)."""
+        return f"[data-marker='params[{param}]/option({option_id})']"
 
     @property
     def has_item_type(self) -> bool:
@@ -385,6 +437,100 @@ VESTS = CategoryProfile(
     style_param=192478,
 )
 
+# --- «Мобильные телефоны» (Электроника → Телефоны), только iPhone 17/18 ---
+# Разведка 2026-10-20 (debug/recon_iphone.py → debug/iphone_map.txt,
+# debug/iphone_memory.txt, снимки debug/iphone_additem*.html).
+# Hidden: category_id=84, params[110680]=458500.
+# Поля открываются каскадом: «Производитель» (автокомплит params[110618]) →
+# «Модель» (model) → «Встроенная память» (memory_size) → «Цвет» (color).
+# Размера и одежного бренда нет. SIM params[184666] и IMEI params[120713]
+# сознательно НЕ заполняем.
+# «Состояние» на форме ДВАЖДЫ (оба видимы в снимке после выбора памяти):
+#   - params[121588] — детальное (Новое/Отличное/…), маркер params[N]/ID,
+#     стоит вверху формы — его жмём как основное condition_param;
+#   - params[110395] — краткое (Новый, не использовался / Б/у), маркер
+#     params[N]/option(ID), в разделе «Параметры» — жмём вторым, если Авито
+#     не отметил его сам. Связь полей вживую не подтверждена.
+# «Вид объявления» — радио params[2822]/option(ID), ID отличаются от одежды.
+IPHONE_VERIFIED = True
+
+_IPHONE_MODEL_OPTIONS: dict[str, int] = {
+    "iPhone 17": 22446489,
+    "iPhone 17 Pro": 22446491,
+    "iPhone 17 Pro Max": 22446492,
+    "iPhone 17e": 22545058,
+    "iPhone 18 Pro": 22734708,
+    "iPhone 18 Pro Max": 22734712,
+}
+_IPHONE_MEMORY_OPTIONS: dict[str, int] = {
+    "128 ГБ": 458938,
+    "256 ГБ": 458968,
+    "512 ГБ": 458850,
+    "1024 ГБ": 458897,
+    "2048 ГБ": 22446493,
+}
+# Цвета телефонов — свой справочник Авито, ID НЕ совпадают с одеждой.
+# «Зеленый» — через «е», как на форме.
+_IPHONE_COLOR_OPTIONS: dict[str, int] = {
+    "Белый": 458743,
+    "Голубой": 458733,
+    "Зеленый": 458744,
+    "Фиолетовый": 458746,
+    "Чёрный": 458739,
+    "Оранжевый": 458735,
+    "Серебристый": 458732,
+    "Синий": 458738,
+    "Красный": 458737,
+    "Розовый": 458745,
+}
+# Наборы по модели: наблюдённые разведкой (объединение двух прогонов — списки
+# Авито нестабильны) плюс полный набор памяти по решению пользователя.
+# Варианта нет на живой форме — движок остановит объявление с перечнем.
+_IPHONE_MODEL_MEMORY: dict[str, tuple[str, ...]] = {
+    "iPhone 17": ("128 ГБ", "256 ГБ", "512 ГБ"),
+    "iPhone 17 Pro": ("256 ГБ", "512 ГБ", "1024 ГБ"),
+    "iPhone 17 Pro Max": ("256 ГБ", "512 ГБ", "1024 ГБ", "2048 ГБ"),
+    # iPhone 17e разведкой не снят — фронт покажет весь справочник памяти
+    "iPhone 18 Pro": ("256 ГБ", "512 ГБ", "1024 ГБ", "2048 ГБ"),
+    "iPhone 18 Pro Max": ("256 ГБ", "512 ГБ", "1024 ГБ", "2048 ГБ"),
+}
+_IPHONE_MODEL_COLORS: dict[str, tuple[str, ...]] = {
+    "iPhone 17": ("Белый", "Голубой", "Зеленый", "Фиолетовый", "Чёрный"),
+    "iPhone 17 Pro": ("Оранжевый", "Серебристый", "Синий"),
+    "iPhone 17 Pro Max": ("Оранжевый", "Серебристый", "Синий"),
+    "iPhone 18 Pro": ("Голубой", "Красный", "Серебристый", "Чёрный"),
+    # Не снято разведкой — как у 18 Pro (решение пользователя)
+    "iPhone 18 Pro Max": ("Голубой", "Красный", "Серебристый", "Чёрный"),
+    # iPhone 17e не снят — фронт покажет весь справочник цветов
+}
+
+IPHONE = CategoryProfile(
+    key="iphone",
+    label="iPhone",
+    full_path=("Электроника", "Телефоны", "Мобильные телефоны"),
+    category_title_text="Мобильные телефоны",
+    expected_category={"category_id": "84", "params[110680]": "458500"},
+    size_options={},
+    color_options=_IPHONE_COLOR_OPTIONS,
+    trade_type_options={"Продаю своё": 20018, "Товар приобретён на продажу": 20019},
+    condition_options={"Новое": 2850684},
+    size_prefix="",
+    color_prefix="color",
+    trade_type_prefix="",
+    condition_param=121588,
+    brand_param=110618,
+    trade_type_param=2822,
+    extra_condition_param=110395,
+    extra_condition_option=431241,  # «Новый, не использовался»
+    fixed_brand="Apple",
+    model_options=_IPHONE_MODEL_OPTIONS,
+    model_prefix="model",
+    memory_options=_IPHONE_MEMORY_OPTIONS,
+    memory_prefix="memory_size",
+    model_memory=_IPHONE_MODEL_MEMORY,
+    model_colors=_IPHONE_MODEL_COLORS,
+)
+
 PROFILES: dict[str, CategoryProfile] = {"jackets": JACKETS, "sneakers": SNEAKERS}
 if TSHIRTS_VERIFIED:
     PROFILES["tshirts"] = TSHIRTS
@@ -392,6 +538,8 @@ if DEMI_JACKETS_VERIFIED:
     PROFILES["demi_jackets"] = DEMI_JACKETS
 if VESTS_VERIFIED:
     PROFILES["vests"] = VESTS
+if IPHONE_VERIFIED:
+    PROFILES["iphone"] = IPHONE
 DEFAULT_CATEGORY = "jackets"
 
 
@@ -407,6 +555,7 @@ if __name__ == "__main__":
         | ({"tshirts"} if TSHIRTS_VERIFIED else set())
         | ({"demi_jackets"} if DEMI_JACKETS_VERIFIED else set())
         | ({"vests"} if VESTS_VERIFIED else set())
+        | ({"iphone"} if IPHONE_VERIFIED else set())
     )
     assert set(PROFILES) == _expected_registry, set(PROFILES)
     assert get_profile(None) is JACKETS
@@ -417,7 +566,7 @@ if __name__ == "__main__":
 
     # У каждого профиля словари непусты, option_id уникальны
     for p in PROFILES.values():
-        for nm, d in (("size", p.size_options), ("color", p.color_options),
+        for nm, d in ((("size", p.size_options),) if p.has_size else ()) + (("color", p.color_options),
                       ("trade_type", p.trade_type_options), ("condition", p.condition_options)):
             assert d, f"{p.key}: пустой словарь {nm}"
             ids = list(d.values())
@@ -548,5 +697,30 @@ if __name__ == "__main__":
     assert not JACKETS.has_material and not JACKETS.has_style
     assert not DEMI_JACKETS.has_material and not DEMI_JACKETS.has_style
     print("[OK] Инвариант material/style (парой) + jackets/demi_jackets без этих полей")
+
+    # IPHONE: телефоны без размера/бренда, каскад модель → память → цвет
+    assert PROFILES.get("iphone") is IPHONE
+    assert IPHONE.expected_category == {"category_id": "84", "params[110680]": "458500"}
+    assert IPHONE.full_path == ("Электроника", "Телефоны", "Мобильные телефоны")
+    assert not IPHONE.has_size and IPHONE.has_model and IPHONE.has_memory
+    assert IPHONE.fixed_brand == "Apple" and IPHONE.brand_param == 110618
+    assert IPHONE.model_options["iPhone 18 Pro Max"] == 22734712
+    assert "iPhone 18" not in IPHONE.model_options, "обычного iPhone 18 на Авито нет"
+    assert IPHONE.memory_options["2048 ГБ"] == 22446493
+    assert IPHONE.color_options["Зеленый"] == 458744
+    assert IPHONE.condition_radio(2850684) == "[data-marker='params[121588]/2850684']"
+    assert IPHONE.option_radio(2822, 20018) == "[data-marker='params[2822]/option(20018)']"
+    for _m in IPHONE.model_options:
+        assert set(IPHONE.memory_for(_m)) <= set(IPHONE.memory_options), _m
+        assert set(IPHONE.colors_for(_m)) <= set(IPHONE.color_options), _m
+    assert set(IPHONE.model_memory) <= set(IPHONE.model_options)
+    assert set(IPHONE.model_colors) <= set(IPHONE.model_options)
+    for _d in (IPHONE.model_options, IPHONE.memory_options, IPHONE.color_options):
+        assert len(set(_d.values())) == len(_d), "дубли ID"
+    # Одежда не задета расширением
+    for _p in (JACKETS, SNEAKERS, TSHIRTS, DEMI_JACKETS, VESTS):
+        assert _p.has_size and not _p.has_model and not _p.has_memory
+        assert not _p.fixed_brand and not _p.trade_type_param and not _p.extra_condition_param
+    print("[OK] IPHONE: профиль телефонов включён, одежда без новых полей")
 
     print("\n=== Все самотесты category_profiles.py пройдены ===")

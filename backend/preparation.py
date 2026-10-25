@@ -36,6 +36,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+from iphone_library import validate_phone_text, validate_title_memory
 from photo_variation import (
     apply_preset,
     build_modified_presets,
@@ -98,6 +99,44 @@ def _draft_dir(base_dir: Path, index: int) -> Path:
 
 def _source_dir(base_dir: Path) -> Path:
     return base_dir / "source"
+
+
+def read_library_snapshot(prep_dir: Path) -> dict | None:
+    """Читает зафиксированные материалы; повреждение не считается старой задачей."""
+    path = _source_dir(prep_dir) / "library.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        fields = ("model", "memory", "color", "sim_type", "pack_id", "pack_name", "source_title")
+        if not isinstance(data, dict) or any(
+            not isinstance(data.get(key), str) or not data[key].strip() for key in fields
+        ):
+            raise ValueError("не заполнены параметры библиотеки")
+        descriptions = data.get("descriptions")
+        names = data.get("template_names")
+        if (
+            not isinstance(descriptions, list) or not isinstance(names, list)
+            or not 1 <= len(descriptions) <= DRAFTS_MAX
+            or len(descriptions) != len(names)
+            or any(not isinstance(value, str) or not value.strip() for value in descriptions + names)
+        ):
+            raise ValueError("неверный список выбранных описаний")
+        if validate_title_memory(data["source_title"], data["memory"]) != data["model"]:
+            raise ValueError("модель не соответствует названию")
+        for text in descriptions:
+            validate_phone_text(text, data["sim_type"])
+        return data
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError(f"Повреждён снимок библиотеки {path}: {exc}") from exc
+
+
+def _description_from_snapshot(variant_description: str, library: dict | None, index: int) -> str:
+    """Сохраняет авторский текст целиком и существующий уникальный артикул."""
+    if library is None:
+        return variant_description
+    article = variant_description.rsplit("\n\n", 1)[1]
+    return library["descriptions"][index] + "\n\n" + article
 
 
 def _count_draft_dirs(base_dir: Path) -> int:
@@ -176,12 +215,18 @@ def _write_drafts(
     facts: dict,
     seed: int,
     source_photo_paths: list[Path],
+    only_missing: bool = False,
 ) -> None:
     """Генерирует и раскладывает все draft_NN по (title, description, facts,
     drafts_count, seed, source_photo_paths). Детерминирована по этим входам —
     вызывается и из run_prep_job (первый проход), и из восстановления после
     рестарта с тем же сидом (F38): результат в обоих случаях одинаковый.
     """
+    library = read_library_snapshot(base_dir)
+    if library is not None and len(library["descriptions"]) != drafts_count:
+        raise ValueError("Число описаний снимка не соответствует числу черновиков")
+    if library is not None:
+        facts = {**facts, "model": library["model"], "memory": library["memory"]}
     text_variants = vary_listing(
         title,
         description,
@@ -194,7 +239,11 @@ def _write_drafts(
 
     for i in range(drafts_count):
         draft_idx = i + 1  # 1-based
+        if only_missing and _draft_complete(base_dir, draft_idx):
+            continue
         tv = text_variants[i]
+        if library is not None and validate_title_memory(tv.title, library["memory"]) != library["model"]:
+            raise ValueError("Сгенерированное название не соответствует модели телефона")
         preset = presets[i]
 
         d_dir = _draft_dir(base_dir, draft_idx)
@@ -202,7 +251,10 @@ def _write_drafts(
         d_photos_dir.mkdir(parents=True, exist_ok=True)
 
         (d_dir / "title.txt").write_text(tv.title, encoding="utf-8")
-        (d_dir / "text.txt").write_text(tv.description, encoding="utf-8", newline="")
+        (d_dir / "text.txt").write_text(
+            _description_from_snapshot(tv.description, library, i),
+            encoding="utf-8", newline="",
+        )
 
         notes = tv.notes or ""
         warnings: list[str] = []
@@ -316,8 +368,8 @@ def validate_prepare_form(
     else:
         for filename, content_type, size in photo_meta:
             ext = Path(filename or "").suffix.lower()
-            mime = (content_type or "").lower()
-            if ext not in ALLOWED_PHOTO_EXTENSIONS and mime not in ALLOWED_PHOTO_MIME:
+            # Заявленному MIME не верим: решает только расширение из белого списка.
+            if ext not in ALLOWED_PHOTO_EXTENSIONS:
                 errors.append({
                     "field": "photos",
                     "error": (
@@ -358,6 +410,7 @@ async def run_prep_job(
     drafts_count: int,
     facts: dict[str, str],
     base_dir: Path,
+    library: dict | None = None,
 ) -> None:
     """Фоновая задача подготовки N вариантов текста и фото.
 
@@ -409,6 +462,16 @@ async def run_prep_job(
         # ── Шаг 1: vary_texts ────────────────────────────────────────────────
         _set_prep_step(job, "vary_texts")
 
+        if library is not None:
+            snapshot = dict(library)
+            snapshot.pop("source_photos", None)
+            snapshot_path = src_dir / "library.json"
+            temporary = snapshot_path.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(snapshot_path)
+            read_library_snapshot(base_dir)
+            if len(snapshot["descriptions"]) != drafts_count:
+                raise ValueError("Число описаний снимка не соответствует числу черновиков")
         seed = random.randrange(2**32)
         # Сид пишем на диск СРАЗУ, до генерации черновиков: если процесс
         # упадёт посреди раскладки draft_NN, после рестарта recover_prep_job
@@ -474,6 +537,7 @@ def regenerate_draft(prep_dir: Path, draft_index: int) -> dict:
         raise ValueError(f"draft_index должен быть >= 1, получено: {draft_index}")
 
     src_dir = _source_dir(prep_dir)
+    library = read_library_snapshot(prep_dir)
 
     # Читаем исходники
     title = (src_dir / "title.txt").read_text(encoding="utf-8")
@@ -511,12 +575,12 @@ def regenerate_draft(prep_dir: Path, draft_index: int) -> dict:
     text_variants = vary_listing(
         title,
         description,
-        n,
+        1 if library is not None else n,
         seed=new_seed,
-        facts=facts,
+        facts={**facts, "model": library["model"], "memory": library["memory"]} if library else facts,
         reserved_titles=reserved_titles,
     )
-    tv = text_variants[draft_index - 1]
+    tv = text_variants[0 if library is not None else draft_index - 1]
 
     # Фото-пресеты: генерируем все n, берём пресет с индексом draft_index-1
     presets = build_modified_presets(n, seed=new_seed)
@@ -534,7 +598,10 @@ def regenerate_draft(prep_dir: Path, draft_index: int) -> dict:
 
     # Перезаписываем текст
     (d_dir / "title.txt").write_text(tv.title, encoding="utf-8")
-    (d_dir / "text.txt").write_text(tv.description, encoding="utf-8", newline="")
+    (d_dir / "text.txt").write_text(
+        _description_from_snapshot(tv.description, library, draft_index - 1),
+        encoding="utf-8", newline="",
+    )
 
     # Перезаписываем фото выбранного варианта.
     notes = tv.notes or ""
@@ -598,6 +665,12 @@ def update_draft_text(
         raise ValueError("Название: поле не заполнено")
     if not normalized_description:
         raise ValueError("Описание: поле не заполнено")
+
+    library = read_library_snapshot(prep_dir)
+    if library is not None:
+        if validate_title_memory(normalized_title, library["memory"]) != library["model"]:
+            raise ValueError("Модель названия не соответствует снимку подготовки")
+        validate_phone_text(normalized_description, library["sim_type"])
 
     title_key = normalize_title_key(normalized_title)
     for index in range(1, n_drafts + 1):
@@ -697,6 +770,7 @@ def _regenerate_from_seed(prep_dir: Path, seed_info: dict) -> Optional[dict]:
             facts=facts,
             seed=seed_info["seed"],
             source_photo_paths=source_photo_paths,
+            only_missing=True,
         )
     except Exception:
         logger.exception(
@@ -731,6 +805,7 @@ def recover_prep_job(prep_dir: Path) -> Optional[dict]:
     if not prep_dir.is_dir():
         return None
 
+    read_library_snapshot(prep_dir)
     seed_info = _read_seed_info(prep_dir)
     if seed_info is not None:
         drafts_count = seed_info["drafts_count"]
@@ -794,7 +869,7 @@ def _build_card(prep_id: str, draft_index: int, d_dir: Path) -> dict:
     if not isinstance(warnings, list):
         warnings = []
 
-    return {
+    card = {
         "index": draft_index,
         "title": title,
         "description": description,
@@ -803,6 +878,14 @@ def _build_card(prep_id: str, draft_index: int, d_dir: Path) -> dict:
         "notes": meta.get("notes", ""),
         "warnings": warnings,
     }
+    library = read_library_snapshot(d_dir.parent)
+    if library is not None:
+        card["library"] = {
+            key: library[key]
+            for key in ("model", "memory", "color", "sim_type", "pack_id", "pack_name")
+        }
+        card["library"]["template_name"] = library["template_names"][draft_index - 1]
+    return card
 
 
 # ---------------------------------------------------------------------------

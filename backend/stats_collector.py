@@ -76,8 +76,12 @@ def _http_json(
                 raw = resp.read()
             return json.loads(raw.decode("utf-8")) if raw else {}
         except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            last_exc = StatsCollectorError(f"HTTP {exc.code} {method} {url}: {body[:300]}")
+            # Ответ /token может содержать секреты — его тело в ошибку не кладём.
+            if url.rstrip("/").endswith("/token"):
+                last_exc = StatsCollectorError(f"HTTP {exc.code} {method} {url}")
+            else:
+                body = exc.read().decode("utf-8", errors="replace")
+                last_exc = StatsCollectorError(f"HTTP {exc.code} {method} {url}: {body[:300]}")
         except (urllib.error.URLError, OSError, ValueError) as exc:
             last_exc = StatsCollectorError(f"Ошибка запроса {method} {url}: {exc}")
         if attempt < attempts:

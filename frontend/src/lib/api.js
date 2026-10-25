@@ -1,6 +1,22 @@
 import { extractPublishFieldErrors } from "./publish";
 import { extractResaleFieldErrors } from "./resale";
 
+// Заголовок для мутирующих запросов: бэкенд отклоняет не-GET без него (защита от CSRF).
+const LOCAL_HEADER = { "X-Avito-Local": "1" };
+
+// Единая обёртка: в этом модуле `fetch` — локальная функция, которая вызывает глобальный
+// fetch и добавляет X-Avito-Local всем не-GET запросам (JSON и multipart).
+function fetch(url, options = {}) {
+  const method = (options.method || "GET").toUpperCase();
+  if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
+    return globalThis.fetch(url, options);
+  }
+  return globalThis.fetch(url, {
+    ...options,
+    headers: { ...LOCAL_HEADER, ...(options.headers || {}) },
+  });
+}
+
 async function readJson(response) {
   const text = await response.text();
   const data = text ? JSON.parse(text) : {};
@@ -20,6 +36,17 @@ export async function fetchBootstrap() {
 
 export async function fetchPublishCategories() {
   const response = await fetch("/api/publish/categories");
+  return readJson(response);
+}
+
+export async function fetchIphoneLibrary(title, memory) {
+  const params = new URLSearchParams({ title, memory });
+  const response = await fetch(`/api/publish/iphone-library?${params}`);
+  if (response.status === 422) {
+    const data = await response.json();
+    const fields = extractPublishFieldErrors(data);
+    throw new Error(Object.values(fields).join(". ") || "Не удалось определить модель iPhone");
+  }
   return readJson(response);
 }
 
@@ -135,6 +162,13 @@ export async function startPrepare(formData) {
     method: "POST",
     body: formData,
   });
+  if (response.status === 422) {
+    const data = await response.json();
+    const error = new Error("Проверьте параметры и материалы библиотеки");
+    error.fieldErrors = extractPublishFieldErrors(data);
+    error.message = Object.values(error.fieldErrors).join(". ") || error.message;
+    throw error;
+  }
   return readJson(response);
 }
 

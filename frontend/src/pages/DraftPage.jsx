@@ -3,6 +3,7 @@ import {
   closePublishJob,
   fetchPendingPublishJobs,
   fetchPublishCategories,
+  fetchIphoneLibrary,
   generateAddresses,
   fetchPublishResult,
   fetchPublishStatus,
@@ -38,6 +39,7 @@ import {
   createPhotoStorage,
 } from "../lib/draftPersistence";
 import FieldShell from "../components/FieldShell";
+import { SIM_TYPES, applyIphoneCatalog, iphoneCatalogKey, validateIphoneLibrary } from "../lib/iphoneLibrary";
 import ProgressBar from "../components/ProgressBar";
 import SiteFooter from "../components/SiteFooter";
 import Topbar from "../components/Topbar";
@@ -166,6 +168,20 @@ function buildInitialForm() {
     // «Жилеты»); persistence подхватит их автоматически — идёт по ключам defaults
     material: "",
     style: "",
+    // Телефоны (iPhone): модель и память; наборы памяти и цветов зависят от модели
+    model: "",
+    memory: "",
+    sim_type: "",
+    pack_id: "",
+  };
+}
+
+// Телефоны: списки памяти/цветов для выбранной модели (пусто — модель не выбрана)
+function phoneOptions(profile, model) {
+  if (!model) return { memories: [], colors: [] };
+  return {
+    memories: profile?.model_memory?.[model] ?? profile?.memories ?? [],
+    colors: profile?.model_colors?.[model] ?? profile?.colors ?? [],
   };
 }
 
@@ -175,7 +191,10 @@ function validate(form, photos, profile) {
   if (!form.title.trim()) errors.title = "Укажите название";
   if (!form.trade_type) errors.trade_type = "Выберите вид объявления";
   if (!form.condition) errors.condition = "Выберите состояние";
-  if (!form.size) {
+  const isPhone = Array.isArray(profile?.models) && profile.models.length > 0;
+  if (profile?.has_size === false) {
+    // У категории нет размера (телефоны) — поле не проверяем
+  } else if (!form.size) {
     errors.size = "Выберите размер";
   } else if (
     // Размеры у категорий разные — если список загружен, значение должно в него входить
@@ -209,8 +228,20 @@ function validate(form, photos, profile) {
       errors.style = "Выберите стиль из списка категории";
     }
   }
-  if (!form.color) errors.color = "Выберите цвет";
-  if (!form.description.trim()) errors.description = "Добавьте описание";
+  if (isPhone) {
+    const options = phoneOptions(profile, form.model);
+    if (!form.model) {
+      errors.model = "Выберите модель";
+    } else if (!profile.models.includes(form.model)) {
+      errors.model = "Выберите модель из списка";
+    } else {
+      if (!form.memory) errors.memory = "Выберите объём памяти";
+      else if (!options.memories.includes(form.memory)) errors.memory = "Такого объёма нет у этой модели";
+      if (form.color && !options.colors.includes(form.color)) errors.color = "Такого цвета нет у этой модели";
+    }
+  }
+  if (!form.color && !errors.color) errors.color = "Выберите цвет";
+  if (form.category !== "iphone" && !form.description.trim()) errors.description = "Добавьте описание";
 
   const priceNum = Number(form.price);
   if (!form.price || !Number.isInteger(priceNum) || priceNum <= 0) {
@@ -229,6 +260,7 @@ function validate(form, photos, profile) {
     errors.view_price_max = "Укажите потолок стоимости просмотра — число больше 0";
   }
 
+  if (form.category === "iphone") return errors;
   if (photos.length === 0) errors.photos = "Добавьте хотя бы одно фото";
   if (photos.length > MAX_PHOTOS) errors.photos = `Максимум ${MAX_PHOTOS} фотографий`;
 
@@ -256,6 +288,8 @@ function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
   const [photosPersistenceError, setPhotosPersistenceError] = useState("");
   // Профили категорий с бэкенда; null до загрузки/при ошибке — тогда фолбэк
   const [categories, setCategories] = useState(null);
+  const [library, setLibrary] = useState({ key: "", data: null, loading: false, error: "" });
+  const [libraryRefresh, setLibraryRefresh] = useState(0);
   const [addressGeneration, setAddressGeneration] = useState({ loading: [], error: {}, general: "" });
   const fileInputRef = useRef(null);
   const mountedRef = useRef(true);
@@ -384,7 +418,34 @@ function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
   const adTypes = profile.trade_types ?? AD_TYPES;
   const conditions = profile.conditions ?? CONDITIONS;
   const sizes = profile.sizes ?? SIZES;
-  const colors = profile.colors ?? COLORS;
+  // Телефоны: модель → память → цвет; списки памяти и цветов зависят от модели
+  const models = Array.isArray(profile.models) ? profile.models : [];
+  const isPhone = models.length > 0;
+  const isIphone = form.category === "iphone";
+  const catalogKey = iphoneCatalogKey(form);
+  const catalogCurrent = library.key === catalogKey && !library.loading && !library.error;
+  const libraryErrors = isIphone ? validateIphoneLibrary(form, library.data, catalogCurrent) : {};
+
+  useEffect(() => {
+    if (!isHydrated || !isIphone || !categories) return;
+    let cancelled = false;
+    setLibrary({ key: catalogKey, data: null, loading: true, error: "" });
+    const timer = setTimeout(() => {
+      fetchIphoneLibrary(form.title, form.memory).then((data) => {
+        if (cancelled) return;
+        setLibrary({ key: catalogKey, data, loading: false, error: "" });
+        setForm((current) => applyIphoneCatalog(current, catalogKey, data, profile));
+      }).catch((error) => {
+        if (cancelled) return;
+        setLibrary({ key: catalogKey, data: null, loading: false, error: error.message });
+      });
+    }, 250);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [catalogKey, libraryRefresh, isHydrated, isIphone, categories]);
+  const phone = phoneOptions(profile, form.model);
+  const colors = isPhone ? phone.colors : (profile.colors ?? COLORS);
+  const hasSize = profile.has_size !== false;
+  const fixedBrand = profile.fixed_brand || "";
   // Непустой список = у категории есть «Вид товара» (фолбэк-профиль его не имеет)
   const itemTypes = Array.isArray(profile.item_types) ? profile.item_types : [];
   const materials = Array.isArray(profile.materials) ? profile.materials : [];
@@ -397,7 +458,10 @@ function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
 
   function updateField(e) {
     const { name, value } = e.target;
-    setForm((prev) => ({ ...prev, [name]: value }));
+    setForm((prev) => ({
+      ...prev, [name]: value,
+      ...(prev.category === "iphone" && ["title", "memory"].includes(name) ? { pack_id: "" } : {}),
+    }));
     clearError(name);
   }
 
@@ -484,12 +548,52 @@ function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
     const value = e.target.value;
     // Размер и вид товара — категорийные словари: старое значение чужой
     // категории бэкенд отвергнет, поэтому сбрасываем оба
-    setForm((prev) => ({ ...prev, category: value, size: "", item_type: "", material: "", style: "" }));
+    const next = resolveProfile(categories, value);
+    setForm((prev) => {
+      const nextConditions = next.conditions ?? CONDITIONS;
+      const nextTradeTypes = next.trade_types ?? AD_TYPES;
+      return {
+        ...prev,
+        category: value,
+        size: "",
+        item_type: "",
+        material: "",
+        style: "",
+        model: "",
+        memory: "",
+        sim_type: "",
+        pack_id: "",
+        // Справочники цветов и состояний у категорий разные (у телефонов свои ID)
+        color: "",
+        condition: nextConditions.includes(prev.condition) ? prev.condition : nextConditions[0] ?? "",
+        trade_type: nextTradeTypes.includes(prev.trade_type) ? prev.trade_type : nextTradeTypes[0] ?? "",
+      };
+    });
+    clearError("model");
+    clearError("memory");
+    clearError("color");
     clearError("category");
     clearError("size");
     clearError("item_type");
     clearError("material");
     clearError("style");
+  }
+
+  // Смена модели телефона: память и цвет, которых нет у новой модели, сбрасываем
+  function handleModelChange(e) {
+    const value = e.target.value;
+    setForm((prev) => {
+      const options = phoneOptions(profile, value);
+      return {
+        ...prev,
+        model: value,
+        memory: options.memories.includes(prev.memory) ? prev.memory : "",
+        color: options.colors.includes(prev.color) ? prev.color : "",
+      };
+    });
+    clearError("model");
+    clearError("memory");
+    clearError("color");
   }
 
   function handleFilesChange(e) {
@@ -579,6 +683,7 @@ function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
     setGeneralError("");
 
     const validationErrors = validate(form, photos, profile);
+    if (isIphone) Object.assign(validationErrors, libraryErrors);
     if (Object.keys(validationErrors).length > 0) {
       setErrors(validationErrors);
       const firstKey = Object.keys(validationErrors)[0];
@@ -594,7 +699,7 @@ function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
     try {
       const fd = buildPublishFormData(form, photos);
       const result = await startPrepare(fd);
-      onPrepared(result.prep_id, form, photos, {
+      onPrepared(result.prep_id, form, isIphone ? [] : photos, {
         title: form.title.trim(),
         price: Number(form.price),
         locationsCount: form.locations.length,
@@ -603,6 +708,7 @@ function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
         draftsCount: Number(form.drafts_count),
       });
     } catch (err) {
+      if (err.fieldErrors) setErrors(err.fieldErrors);
       setGeneralError(err.message || "Не удалось запустить подготовку вариантов");
     } finally {
       setIsPreparing(false);
@@ -610,8 +716,11 @@ function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
   }
 
   const draftsNum = Number(form.drafts_count);
-  const showPrepareButton = Number.isInteger(draftsNum) && draftsNum >= 2;
+  const showPrepareButton = isIphone || (Number.isInteger(draftsNum) && draftsNum >= 2);
   const anyBusy = isSubmitting || isPreparing || disabledByPendingJob;
+  const iphoneIncomplete = isIphone && (
+    Object.keys(libraryErrors).length > 0 || Object.keys(validate(form, [], profile)).length > 0
+  );
 
   return (
     <form
@@ -637,7 +746,7 @@ function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
 
       <fieldset
         className="draft-form-fields"
-        disabled={!isHydrated || isClearingSaved}
+        disabled={!isHydrated || isClearingSaved || isPreparing || isSubmitting}
         aria-describedby="draft-persistence-status"
       >
 
@@ -704,7 +813,7 @@ function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
             name="title"
             value={form.title}
             onChange={updateField}
-            placeholder="Например: Пиджак Hugo Boss классический"
+            placeholder={isIphone ? "Например: iPhone 17 Pro Max" : "Например: Пиджак Hugo Boss классический"}
             maxLength={120}
           />
         </FieldShell>
@@ -727,6 +836,7 @@ function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
       </div>
 
       {/* Состояние */}
+      {!isIphone ? (<>
       <div data-field="condition">
         <FieldShell label="Состояние" error={errors.condition}>
           <div className="draft-radio-group">
@@ -795,8 +905,59 @@ function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
         </FieldShell>
       </div>
 
-      {/* Размер + Бренд */}
+      {/* Телефоны: модель → память (каскад, как на форме Авито) */}
+      </>) : (
+        <p className="draft-view-price-hint">Новый · не использовался · неактивированный · коробка запечатана</p>
+      )}
+      {isPhone ? (
+        <div className="draft-two-col">
+          <div data-field="model">
+            <FieldShell label="Модель" error={errors.model}>
+              {isIphone ? (
+                <p className="draft-view-price-hint" aria-live="polite">
+                  {library.loading || library.key !== catalogKey ? "Проверяем название…" : library.data?.model || library.error || "Укажите название iPhone"}
+                </p>
+              ) : (
+              <select
+                className="field-input draft-select"
+                name="model"
+                value={form.model}
+                onChange={handleModelChange}
+              >
+                <option value="">— Выберите модель —</option>
+                {models.map((m) => (
+                  <option key={m} value={m}>{m}</option>
+                ))}
+              </select>
+              )}
+              {fixedBrand ? (
+                <p className="draft-view-price-hint">Производитель: {fixedBrand} (ставится автоматически).</p>
+              ) : null}
+            </FieldShell>
+          </div>
+          <div data-field="memory">
+            <FieldShell label="Встроенная память" error={errors.memory}>
+              <select
+                className="field-input draft-select"
+                name="memory"
+                value={form.memory}
+                onChange={updateField}
+                disabled={!form.model}
+              >
+                <option value="">{form.model ? "— Выберите объём —" : "— Сначала модель —"}</option>
+                {phone.memories.map((m) => (
+                  <option key={m} value={m}>{m}</option>
+                ))}
+              </select>
+            </FieldShell>
+          </div>
+        </div>
+      ) : null}
+
+      {/* Размер + Бренд (нет у телефонов) */}
+      {hasSize || !fixedBrand ? (
       <div className="draft-two-col">
+        {hasSize ? (
         <div data-field="size">
           <FieldShell label="Размер" error={errors.size}>
             <select
@@ -812,7 +973,9 @@ function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
             </select>
           </FieldShell>
         </div>
+        ) : null}
 
+        {!fixedBrand ? (
         <div data-field="brand">
           <FieldShell label="Бренд" error={errors.brand}>
             <input
@@ -828,7 +991,9 @@ function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
             </p>
           </FieldShell>
         </div>
+        ) : null}
       </div>
+      ) : null}
 
       {/* Цвет */}
       <div data-field="color">
@@ -838,8 +1003,9 @@ function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
             name="color"
             value={form.color}
             onChange={updateField}
+            disabled={isPhone && !form.model}
           >
-            <option value="">— Выберите цвет —</option>
+            <option value="">{isPhone && !form.model ? "— Сначала модель —" : "— Выберите цвет —"}</option>
             {colors.map((c) => (
               <option key={c} value={c}>{c}</option>
             ))}
@@ -892,6 +1058,7 @@ function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
       ) : null}
 
       {/* Описание */}
+      {!isIphone ? (
       <div data-field="description">
         <FieldShell label="Описание" error={errors.description}>
           <textarea
@@ -905,7 +1072,37 @@ function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
         </FieldShell>
       </div>
 
-      {/* Цена */}
+      ) : (
+        <>
+          <div data-field="sim_type">
+            <FieldShell label="SIM" error={errors.sim_type}>
+              <select className="field-input draft-select" name="sim_type" value={form.sim_type} onChange={updateField}>
+                <option value="">— Выберите SIM —</option>
+                {SIM_TYPES.map((sim) => <option key={sim} value={sim}>{sim}</option>)}
+              </select>
+            </FieldShell>
+          </div>
+          <div data-field="pack_id">
+            <FieldShell label="Фотопак" error={errors.pack_id || library.error || (catalogCurrent ? libraryErrors.pack_id : "")}>
+              <select className="field-input draft-select" name="pack_id" value={form.pack_id} onChange={updateField} disabled={!catalogCurrent}>
+                <option value="">Случайный</option>
+                {form.pack_id && !library.data?.packs?.some((pack) => pack.id === form.pack_id) ? (
+                  <option value={form.pack_id} disabled>{form.pack_id} — пак не найден</option>
+                ) : null}
+                {(catalogCurrent ? library.data?.packs ?? [] : []).map((pack) => (
+                  <option key={pack.id} value={pack.id} disabled={!pack.available}>
+                    {pack.name} — {pack.available ? `${pack.photos_count} фото` : pack.error || "недоступен"}
+                  </option>
+                ))}
+              </select>
+              <p className="draft-view-price-hint" aria-live="polite">
+                {library.loading ? "Проверяем материалы…" : `Описаний: ${library.data?.descriptions_count ?? 0}. Один фотопак для всех черновиков; цвет не ограничивает фото.`}
+              </p>
+              <button type="button" className="secondary-button" onClick={() => setLibraryRefresh((value) => value + 1)}>Обновить библиотеку</button>
+            </FieldShell>
+          </div>
+        </>
+      )}
       <div data-field="price">
         <FieldShell label="Цена, ₽" error={errors.price}>
           <input
@@ -1065,11 +1262,12 @@ function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
 
       {/* При N ≥ 2 сначала готовим разные тексты и фото, затем публикуем пакет. */}
       <div className="draft-submit-row draft-submit-buttons">
-        <button className="submit-button" type="submit" disabled={anyBusy}>
+        <button className="submit-button" type="submit" disabled={anyBusy || iphoneIncomplete}>
           {showPrepareButton
             ? (isPreparing ? "Готовим варианты..." : "Подготовить варианты")
             : (isSubmitting ? "Запускаем..." : publishButtonLabel(draftsNum))}
         </button>
+        {iphoneIncomplete ? <p className="draft-view-price-hint">Заполните обязательные поля и выберите доступные материалы библиотеки.</p> : null}
         {disabledByPendingJob ? (
           <p className="workspace-body-copy" style={{ marginTop: "0.5rem" }}>
             Сначала продолжите или закройте незавершённую публикацию выше.
@@ -1280,6 +1478,13 @@ function DraftPreviewCard({ draft, prepId, onUpdated, onEditingChange }) {
             <p key={wi}>⚠ {w}</p>
           ))}
         </div>
+      ) : null}
+
+      {draft.library ? (
+        <p className="draft-view-price-hint">
+          {draft.library.model} · {draft.library.memory} · {draft.library.color} · {draft.library.sim_type}
+          {" · Фотопак: "}{draft.library.pack_name || draft.library.pack_id}
+        </p>
       ) : null}
 
       {isEditing ? (

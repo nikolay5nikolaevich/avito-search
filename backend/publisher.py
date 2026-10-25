@@ -289,6 +289,11 @@ class DraftData:
     material: str = ""
     # Ключ profile.style_options (радио). Пустая строка для категорий без поля «Стиль».
     style: str = ""
+    # Телефоны: ключи profile.model_options / profile.memory_options.
+    # Пустые строки для одежды.
+    model: str = ""
+    memory: str = ""
+    sim_type: str = ""
 
     def location_for(self, item_index: int) -> LocationData:
         """Возвращает геолокацию объявления по 1-based индексу."""
@@ -316,6 +321,9 @@ class DraftData:
             "item_type": self.item_type,
             "material": self.material,
             "style": self.style,
+            "model": self.model,
+            "memory": self.memory,
+            "sim_type": self.sim_type,
             "photos_count": len(self.photo_paths),
         }
 
@@ -588,12 +596,17 @@ def validate_publish_form(
         })
 
     # --- Select/radio: только ключи словарей профиля категории ---
-    for field_name, options, label in (
+    # Размер — только у категорий, где он есть (у телефонов нет).
+    # Цвет у телефонов проверяется ниже, вместе с моделью.
+    choice_fields: list[tuple[str, dict[str, int], str]] = [
         ("trade_type", profile.trade_type_options, "Вид объявления"),
         ("condition", profile.condition_options, "Состояние"),
-        ("size", profile.size_options, "Размер"),
-        ("color", profile.color_options, "Цвет"),
-    ):
+    ]
+    if profile.has_size:
+        choice_fields.append(("size", profile.size_options, "Размер"))
+    if not profile.has_model:
+        choice_fields.append(("color", profile.color_options, "Цвет"))
+    for field_name, options, label in choice_fields:
         value = _text(field_name)
         if value not in options:
             errors.append({
@@ -630,6 +643,43 @@ def validate_publish_form(
                 "error": f"Стиль: недопустимое значение {style!r}",
             })
 
+    # --- Телефоны: модель → память → цвет (наборы зависят от модели) ---
+    if profile.has_model:
+        sim_type = _text("sim_type")
+        if sim_type:
+            try:
+                _phone_required_options(_text("description"), sim_type)
+            except StepError as exc:
+                errors.append({"field": "sim_type", "error": str(exc)})
+        model = _text("model")
+        if model not in profile.model_options:
+            errors.append({
+                "field": "model",
+                "error": f"Модель: недопустимое значение {model!r}",
+            })
+        else:
+            if profile.has_memory:
+                memory = _text("memory")
+                allowed_memory = profile.memory_for(model)
+                if memory not in allowed_memory or memory not in profile.memory_options:
+                    errors.append({
+                        "field": "memory",
+                        "error": (
+                            f"Память: недопустимое значение {memory!r} для {model} "
+                            f"(доступно: {', '.join(allowed_memory)})"
+                        ),
+                    })
+            color = _text("color")
+            allowed_colors = profile.colors_for(model)
+            if color not in allowed_colors or color not in profile.color_options:
+                errors.append({
+                    "field": "color",
+                    "error": (
+                        f"Цвет: недопустимое значение {color!r} для {model} "
+                        f"(доступно: {', '.join(allowed_colors)})"
+                    ),
+                })
+
     # --- Фотографии: 1–10, форматы, размер ---
     if not (MIN_PHOTOS <= len(photos) <= MAX_PHOTOS):
         errors.append({
@@ -640,8 +690,8 @@ def validate_publish_form(
     else:
         for filename, content_type, size in photos:
             ext = pathlib.Path(filename or "").suffix.lower()
-            mime = (content_type or "").lower()
-            if ext not in ALLOWED_PHOTO_EXTENSIONS and mime not in ALLOWED_PHOTO_MIME:
+            # Заявленному MIME не верим: решает только расширение из белого списка.
+            if ext not in ALLOWED_PHOTO_EXTENSIONS:
                 errors.append({
                     "field": "photos",
                     "error": f"Файл {filename!r}: недопустимый формат "
@@ -661,7 +711,14 @@ def build_draft_data(
     photo_paths: list[str],
     category: str = "jackets",
 ) -> DraftData:
-    """Собирает DraftData из ПРОВАЛИДИРОВАННЫХ полей формы."""
+    """Собирает DraftData из ПРОВАЛИДИРОВАННЫХ полей формы.
+
+    У профиля с fixed_brand (телефоны) бренд берётся из профиля, а не из формы.
+    """
+    category_key = str(category or "jackets").strip()
+    fixed_brand = ""
+    if category_key in category_profiles.PROFILES:
+        fixed_brand = category_profiles.PROFILES[category_key].fixed_brand
     locations = parse_locations_json(fields.get("locations_json"))
     view_price_max = parse_view_price(fields.get("view_price_max"))
     if locations is None or view_price_max is None:
@@ -670,19 +727,22 @@ def build_draft_data(
         title=str(fields["title"]).strip(),
         trade_type=str(fields["trade_type"]).strip(),
         condition=str(fields["condition"]).strip(),
-        size=str(fields["size"]).strip(),
-        brand=str(fields["brand"]).strip(),
+        size=str(fields.get("size") or "").strip(),
+        brand=fixed_brand or str(fields.get("brand") or "").strip(),
         color=str(fields["color"]).strip(),
         description=str(fields["description"]).strip(),
         price=int(str(fields["price"]).strip()),
         locations=locations,
         photo_paths=tuple(photo_paths),
         view_price_max=view_price_max,
-        category=str(category or "jackets").strip(),
+        category=category_key,
         # Есть не у всех категорий: отсутствие поля — норма, не ошибка
         item_type=str(fields.get("item_type") or "").strip(),
         material=str(fields.get("material") or "").strip(),
         style=str(fields.get("style") or "").strip(),
+        model=str(fields.get("model") or "").strip(),
+        memory=str(fields.get("memory") or "").strip(),
+        sim_type=str(fields.get("sim_type") or "").strip(),
     )
 
 
@@ -2179,11 +2239,245 @@ async def _select_brand(
     return brand_text
 
 
+# Сколько ждать появления следующего поля каскада (подгрузка асинхронная,
+# в разведке 2026-10-20 поле иногда не успевало появиться за пару секунд).
+CASCADE_FIELD_TIMEOUT_S = 15.0
+
+
+async def _native_select_options(page: Any, prefix: str) -> list[tuple[str, str]]:
+    """Пары (value, текст) непустых <option> нативного select комбобокса."""
+    selector = psel.COMBOBOX_SELECT_TMPL.format(prefix=prefix)
+    try:
+        raw = await page.locator(selector).first.evaluate(
+            "el => Array.from(el.options).filter(o => o.value)"
+            ".map(o => [o.value, (o.textContent || '').trim()])"
+        )
+    except Exception:
+        return []
+    return [(str(v), str(t)) for v, t in (raw or [])]
+
+
+async def _select_cascade_combobox(
+    page: Any,
+    prefix: str,
+    field_label: str,
+    label: str,
+    option_id: int,
+    timeout_s: float = CASCADE_FIELD_TIMEOUT_S,
+) -> None:
+    """
+    Выбор в каскадном комбобоксе (телефоны: модель → память → цвет).
+
+    1) Ждём, пока поле появится и в его нативном select будут варианты
+       (поле подгружается после выбора предыдущего).
+    2) Нужного option_id среди вариантов нет → StepError с перечнем доступных
+       (fail-closed: соседнее значение не угадываем, объявление пропускается).
+    3) Выбор и сверка value — штатный _select_combobox.
+    """
+    deadline = time.monotonic() + timeout_s
+    options: list[tuple[str, str]] = []
+    while True:
+        options = await _native_select_options(page, prefix)
+        if options:
+            break
+        if time.monotonic() >= deadline:
+            logger.error(
+                "SELECTOR_MISS: поле «%s» (%s) не появилось за %.0f с",
+                field_label, prefix, timeout_s,
+            )
+            raise StepError(
+                f"Поле «{field_label}» не появилось на форме за {timeout_s:.0f} с "
+                "после выбора предыдущего поля"
+            )
+        await asyncio.sleep(0.3)
+
+    if str(option_id) not in {value for value, _ in options}:
+        available = ", ".join(text for _, text in options)
+        logger.error(
+            "Поле «%s»: варианта %r (id=%s) нет на форме; доступно: %s",
+            field_label, label, option_id, available,
+        )
+        raise StepError(
+            f"{field_label}: варианта «{label}» нет на форме Авито. "
+            f"Доступно: {available}"
+        )
+
+    await _select_combobox(page, prefix, label, option_id)
+
+
+async def _radio_checked(page: Any, selector: str) -> bool:
+    """Отмечено ли радио внутри label с данным селектором."""
+    try:
+        return bool(await page.locator(selector).first.evaluate(
+            "el => { const i = el.querySelector('input'); return !!(i && i.checked); }"
+        ))
+    except Exception:
+        return False
+
+
+async def _click_radio(page: Any, selector: str, what: str) -> None:
+    """Клик по label радио с проверкой, что оно отметилось (fail-closed)."""
+    try:
+        await page.click(selector, timeout=WAIT_SELECTOR_TIMEOUT_MS)
+    except Exception as exc:
+        logger.error("SELECTOR_MISS: радио %s %s: %s", what, selector, exc)
+        raise StepError(f"Радио «{what}» не найдено: {selector}") from exc
+    await asyncio.sleep(0.3)
+    if not await _radio_checked(page, selector):
+        raise StepError(f"Радио «{what}» не отметилось после клика: {selector}")
+
+
+async def _select_fixed_manufacturer(page: Any, profile: CategoryProfile) -> str:
+    """
+    Производитель-автокомплит с фиксированным значением (телефоны: Apple).
+
+    В отличие от _select_brand, «Без бренда» не подставляем: без производителя
+    каскад модели не откроется — стоп с понятной причиной.
+    """
+    name = profile.fixed_brand
+    await _clear_and_type(page, profile.brand_input, name)
+    if not await _click_visible_text(page, name, timeout_s=6.0):
+        raise StepError(
+            f"Производитель «{name}» не найден в подсказках Авито — "
+            "публикация объявления остановлена до загрузки фото"
+        )
+    logger.info("Производитель: выбран видимый пункт подсказки %r", name)
+    return name
+
+
+def _phone_required_options(
+    description: str, sim_type: str = "",
+) -> list[tuple[int, int, str]]:
+    """Подтверждённые описанием свойства нового запечатанного телефона."""
+    if sim_type:
+        from iphone_library import validate_phone_text
+
+        try:
+            validate_phone_text(description, sim_type)
+        except ValueError as exc:
+            raise StepError(str(exc)) from exc
+        # Подписи и ID сняты с label/input в iphone_additem.html 20.10.2026.
+        sim_options = {
+            "eSIM": (3338069, "Только eSIM"),
+            "SIM + eSIM": (3338066, "SIM + eSIM"),
+            "SIM + SIM": (3338067, "2 SIM"),
+        }
+        if sim_type not in sim_options:
+            raise StepError("Выберите тип SIM")
+        option_id, label = sim_options[sim_type]
+        return [
+            (184666, option_id, label),
+            (184667, 3375453, "Неактивированный"),
+            (167055, 3270714, "Запечатана"),
+        ]
+    # Старые checkpoint не содержат sim_type: сохраняем строгую проверку текста.
+    text = description.casefold()
+    without_negated = re.sub(r"\bне\s*(?:активирован|вскрыт)\w*\b", "", text)
+    if re.search(
+        r"\b(?:активирован|вскрыт|распечатан)\w*\b|\bне\s*запечатан",
+        without_negated,
+    ):
+        raise StepError("В описании противоречивые данные об активации или упаковке")
+    if not re.search(r"\bsim\s*\+\s*esim\b", text):
+        raise StepError("В описании не подтверждён тип SIM + eSIM")
+    if not re.search(r"\bне\s*активирован\w*\b", text):
+        raise StepError("В описании не подтверждено, что телефон не активирован")
+    if not re.search(r"\bзапечатан\w*\b|\bне\s*вскрыт\w*\b", text):
+        raise StepError("В описании не подтверждена запечатанная упаковка")
+    return [
+        (184666, 3338066, "SIM + eSIM"),
+        (184667, 3375453, "Неактивированный"),
+        (167055, 3270714, "Запечатана"),
+    ]
+
+
+async def _step_fill_phone_fields(
+    page: Any, data: DraftData, profile: CategoryProfile
+) -> str:
+    """Поля телефонов: производитель → модель → память → цвет (каскад),
+    затем состояние и вид объявления (радио)."""
+    required_options = _phone_required_options(data.description, data.sim_type)
+    selected = await _select_fixed_manufacturer(page, profile)
+    await _pause()
+
+    await _select_cascade_combobox(
+        page, profile.model_prefix, "Модель", data.model,
+        profile.model_options[data.model],
+    )
+    await _pause()
+
+    if profile.has_memory:
+        await _select_cascade_combobox(
+            page, profile.memory_prefix, "Встроенная память", data.memory,
+            profile.memory_options[data.memory],
+        )
+        await _pause()
+
+    await _select_cascade_combobox(
+        page, profile.color_prefix, "Цвет", data.color,
+        profile.color_options[data.color],
+    )
+    await _pause()
+
+    condition_sel = profile.condition_radio(profile.condition_options[data.condition])
+    detailed_selected = False
+    if await page.locator(condition_sel).first.is_visible():
+        await _click_radio(page, condition_sel, "Состояние")
+        detailed_selected = True
+        logger.info("Состояние: выбрано %r", data.condition)
+    # Второе поле «Состояние» (краткое): жмём, только если Авито не отметил сам.
+    if profile.extra_condition_param:
+        extra_sel = profile.option_radio(
+            profile.extra_condition_param, profile.extra_condition_option
+        )
+        if await _radio_checked(page, extra_sel):
+            logger.info("Состояние (краткое): уже отмечено Авито")
+        else:
+            await _click_radio(page, extra_sel, "Состояние (краткое)")
+            logger.info("Состояние (краткое): отмечено")
+    if not detailed_selected:
+        if await page.locator(condition_sel).first.is_visible():
+            await _click_radio(page, condition_sel, "Состояние")
+            logger.info("Состояние: выбрано %r", data.condition)
+        elif not profile.extra_condition_param:
+            raise StepError("Поле состояния телефона не появилось на форме Авито")
+        else:
+            logger.info("Подробное состояние скрыто: подтверждено краткое состояние")
+    await _pause()
+
+    for param_id, option_id, label in required_options:
+        if data.sim_type and param_id == 184666:
+            locator = page.locator(profile.option_radio(param_id, option_id)).first
+            if _norm_label(await locator.inner_text()) != _norm_label(label):
+                raise StepError("Подпись варианта SIM на Авито изменилась: требуется проверка")
+        await _click_radio(page, profile.option_radio(param_id, option_id), label)
+        logger.info("Свойство телефона: выбрано %r", label)
+
+    # Вид объявления: радио params[N]/option(ID)
+    if profile.trade_type_param:
+        await _click_radio(
+            page,
+            profile.option_radio(
+                profile.trade_type_param, profile.trade_type_options[data.trade_type]
+            ),
+            "Вид объявления",
+        )
+    else:
+        await _select_combobox(
+            page, profile.trade_type_prefix, data.trade_type,
+            profile.trade_type_options[data.trade_type],
+        )
+    logger.info("Вид объявления: выбрано %r", data.trade_type)
+    return selected
+
+
 async def _step_fill_fields(
     page: Any, data: DraftData, profile: CategoryProfile
 ) -> str:
     """Шаг fill_fields: вид объявления, [вид товара], состояние, размер, бренд,
-    цвет, [материал], [стиль]."""
+    цвет, [материал], [стиль]. Телефоны — отдельный каскад."""
+    if profile.has_model:
+        return await _step_fill_phone_fields(page, data, profile)
     # Вид объявления — комбобокс
     await _select_combobox(
         page, profile.trade_type_prefix, data.trade_type,

@@ -138,6 +138,21 @@ def _title_with_suffix(title: str, suffix: str) -> str:
 def _title_candidates(title: str, facts: dict[str, str]) -> list[str]:
     """Кандидаты названия: оригинальный заголовок как база + безопасные добавки фактов
     к КОНЦУ. Порядок слов неприкосновенен. Оригинал в список не включается."""
+    if facts.get("model") and facts.get("memory"):
+        # Модель и память телефона неделимы: 1024 — объём, не трекинг-номер.
+        memory = re.search(r"\b\d+\s*(?:GB|ГБ|TB|ТБ)\b", title, re.IGNORECASE)
+        core = facts["model"] + (" " + memory.group() if memory else "")
+        bases = [" ".join(title.split()), core]
+        words = ("новый", "запечатан", "в наличии", "Apple", "не вскрыт", "в коробке")
+        suffixes = list(words) + [f"{a}, {b}" for a in words for b in words if a != b]
+        candidates = []
+        for base in bases:
+            for suffix in suffixes:
+                candidate = f"{base}, {suffix}"
+                if len(candidate) <= TITLE_MAX_LEN and candidate not in candidates:
+                    candidates.append(candidate)
+        return candidates
+
     base = _clean_base_title(title)
 
     size = facts.get("size", "")
