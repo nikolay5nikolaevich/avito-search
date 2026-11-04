@@ -242,8 +242,13 @@ export function buildPublishFormData(form, photos) {
 
   for (const name of PUBLISH_FIELD_NAMES) {
     if (form.category === "iphone" && name === "description") continue;
-    const value = form.category === "iphone" && name === "condition" ? "Новое" : form[name];
+    let value = form.category === "iphone" && name === "condition" ? "Новое" : form[name];
+    if (form.category === "iphone" && name === "pack_id") value = form.pack_id || form.library_preview_pack_id;
     formData.append(name, String(value ?? "").trim());
+  }
+
+  if (form.category === "iphone" && form.photo_order?.length) {
+    formData.append("photo_order", JSON.stringify(form.photo_order));
   }
 
   const locations = resizeLocations(form.locations, Number(form.drafts_count)).map(

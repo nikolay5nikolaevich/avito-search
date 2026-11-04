@@ -13,6 +13,7 @@ BACKEND_DIR = os.path.join(PROJECT_ROOT, "backend")
 if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
+import publish_test_isolation  # noqa: E402, F401
 import publisher  # noqa: E402
 
 
@@ -42,6 +43,16 @@ class _Options:
 
     def nth(self, index: int) -> _Option:
         return self.options[index]
+
+    async def evaluate_all(self, _script):
+        return [option.text for option in self.options]
+
+    def filter(self, *, has_text):
+        return _Options([option for option in self.options if has_text.search(option.text)])
+
+    @property
+    def first(self):
+        return self.options[0]
 
 
 class _ChangingSuggestPage:

@@ -1,14 +1,16 @@
 """Локальные материалы iPhone: проверка каталога и выбор одного фотопака."""
 
+import io
 import random
 import re
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 from category_profiles import IPHONE
 
 LIBRARY_ROOT = Path(__file__).resolve().parents[1] / "library" / "iphone"
+DIRECT_PACK_ID = "__memory__"
 SIM_TYPES = ("eSIM", "SIM + eSIM", "SIM + SIM")
 _MEMORY = re.compile(r"\b(\d+)\s*(GB|ГБ|TB|ТБ)\b", re.IGNORECASE)
 _MARKER = re.compile(r"\{([^{}]*)\}")
@@ -84,8 +86,30 @@ def _inside(path: Path, root: Path) -> Path:
     return path
 
 
+def _model_directory(root: Path, model: str) -> Path:
+    """Имя модели допускает разный регистр и повторные пробелы в папке."""
+    key = " ".join(model.casefold().split())
+    if root.is_dir():
+        matches = [
+            path for path in root.iterdir()
+            if path.is_dir() and " ".join(path.name.casefold().split()) == key
+        ]
+        if len(matches) > 1:
+            raise ValueError(f"Найдено несколько папок модели {model}: оставьте одну")
+        if matches:
+            return _inside(matches[0], root)
+    return _inside(root / model, root)
+
+
+def _pack_directory(memory_dir: Path, pack_id: str, root: Path) -> Path:
+    if pack_id == DIRECT_PACK_ID:
+        return _inside(memory_dir, root)
+    return _inside(memory_dir / pack_id, root)
+
+
 def _templates(model_dir: Path, root: Path) -> list[tuple[str, str]]:
-    directory = _inside(model_dir / "descriptions", root)
+    shared = _inside(root / "description", root)
+    directory = shared if shared.exists() else _inside(model_dir / "descriptions", root)
     if not directory.is_dir():
         raise ValueError(f"Нет описаний: добавьте UTF-8 .txt в {directory}")
     result = []
@@ -105,6 +129,8 @@ def _templates(model_dir: Path, root: Path) -> list[tuple[str, str]]:
         result.append((path.name, text))
     if not result:
         raise ValueError(f"Нет описаний: добавьте UTF-8 .txt в {directory}")
+    if directory == shared and len(result) != 1:
+        raise ValueError(f"В {directory} должен быть ровно один эталонный .txt")
     return result
 
 
@@ -145,17 +171,27 @@ def catalog(title: str, memory: str, *, root: Path | None = None) -> dict:
         return result
     try:
         validate_title_memory(title, memory)
-        model_dir = _inside(root / model, root)
+        model_dir = _model_directory(root, model)
         result["descriptions_count"] = len(_templates(model_dir, root))
         memory_dir = _inside(model_dir / memory.replace("ГБ", "GB"), root)
         if not memory_dir.is_dir():
             raise ValueError(f"Нет фотопаков: добавьте папку пака в {memory_dir}")
+        from publisher import ALLOWED_PHOTO_EXTENSIONS
+
+        packs = []
+        if any(p.is_file() and p.suffix.lower() in ALLOWED_PHOTO_EXTENSIONS for p in memory_dir.iterdir()):
+            packs.append((DIRECT_PACK_ID, "Основной", memory_dir))
         for pack in sorted(memory_dir.iterdir()):
-            if not pack.is_dir():
-                continue
-            item = {"id": pack.name, "name": pack.name, "available": False, "error": "", "photos_count": 0}
+            if pack.is_dir():
+                if pack.name == DIRECT_PACK_ID:
+                    raise ValueError(f"Имя {DIRECT_PACK_ID} зарезервировано: переименуйте папку пака")
+                packs.append((pack.name, pack.name, pack))
+        for pack_id, pack_name, pack in packs:
+            item = {"id": pack_id, "name": pack_name, "available": False, "error": "", "photos_count": 0}
             try:
-                item["photos_count"] = len(_photos(pack, root))
+                photos = _photos(pack, root)
+                item["photos_count"] = len(photos)
+                item["photos"] = [{"id": photo.name} for photo in photos]
                 item["available"] = True
             except (OSError, ValueError) as exc:
                 item["error"] = str(exc)
@@ -170,8 +206,9 @@ def catalog(title: str, memory: str, *, root: Path | None = None) -> dict:
 def select_materials(
     title: str, memory: str, color: str, sim_type: str, drafts_count: int,
     pack_id: str = "", *, root: Path | None = None, seed: int | None = None,
+    photo_order: list[str] | None = None,
 ) -> dict:
-    """Выбирает один пак и независимый шаблон для каждой карточки."""
+    """Фиксирует пак и порядок фото, подставляет параметры в эталонный текст."""
     from publisher import parse_drafts_count
 
     root = Path(root) if root is not None else LIBRARY_ROOT
@@ -197,8 +234,21 @@ def select_materials(
             raise ValueError(pack["error"])
     else:
         pack = rng.choice([p for p in packs if p["available"]])
-    model_dir = _inside(root / model, root)
-    photos = _photos(model_dir / memory.replace("ГБ", "GB") / pack["id"], root)
+    model_dir = _model_directory(root, model)
+    photos = _photos(_pack_directory(model_dir / memory.replace("ГБ", "GB"), pack["id"], root), root)
+    if photo_order is not None:
+        if (
+            not isinstance(photo_order, list)
+            or any(not isinstance(name, str) for name in photo_order)
+            or len(photo_order) != len(photos)
+            or set(photo_order) != {photo.name for photo in photos}
+        ):
+            raise ValueError(
+                "Порядок фото должен содержать каждое фото выбранного пака "
+                "ровно один раз. Обновите библиотеку"
+            )
+        by_name = {photo.name: photo for photo in photos}
+        photos = [by_name[name] for name in photo_order]
     values = {"модель": model, "память": memory, "цвет": color, "SIM": sim_type}
     templates = []
     for name, text in _templates(model_dir, root):
@@ -211,4 +261,29 @@ def select_materials(
         "pack_id": pack["id"], "pack_name": pack["name"], "source_title": title.strip(),
         "source_photos": photos, "descriptions": [text for _, text in chosen],
         "template_names": [name for name, _ in chosen],
+        "photo_order": [photo.name for photo in photos],
     }
+
+
+def preview_photo(
+    title: str, memory: str, pack_id: str, photo_id: str,
+    *, root: Path | None = None,
+) -> bytes:
+    """Возвращает небольшое JPEG-превью только фотографии внутри выбранного пака."""
+    root = Path(root) if root is not None else LIBRARY_ROOT
+    model = validate_title_memory(title, memory)
+    for value in (pack_id, photo_id):
+        if not value or value in (".", "..") or any(c in value for c in "/\\:"):
+            raise ValueError("Недопустимый идентификатор пака или фото")
+    model_dir = _model_directory(root, model)
+    pack = _pack_directory(model_dir / memory.replace("ГБ", "GB"), pack_id, root)
+    photos = _photos(pack, root)
+    photo = next((path for path in photos if path.name == photo_id), None)
+    if photo is None:
+        raise ValueError("Фото не найдено в выбранном паке. Обновите библиотеку")
+    with Image.open(photo) as source:
+        source.thumbnail((1000, 1000))
+        picture = ImageOps.exif_transpose(source).convert("RGB")
+        output = io.BytesIO()
+        picture.save(output, format="JPEG", quality=85)
+    return output.getvalue()

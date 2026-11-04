@@ -12,6 +12,11 @@ function isRecord(value) {
 }
 
 function isDraftValue(key, value, defaultValue) {
+  if (key === "photo_order") {
+    return Array.isArray(value) && value.length <= MAX_SAVED_PHOTOS
+      && value.every((name) => typeof name === "string" && name.length > 0)
+      && new Set(value).size === value.length;
+  }
   if (key === "drafts_count") {
     const count = Number(value);
     return (

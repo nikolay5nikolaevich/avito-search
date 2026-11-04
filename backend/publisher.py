@@ -46,6 +46,8 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Awaitable, Callable, NoReturn, Optional
 from urllib.parse import urlsplit
 
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
 import avito_publish_selectors as psel
 import category_profiles
 import journal
@@ -2096,6 +2098,39 @@ def _suggest_contains(needle: str, text: str) -> bool:
     )
 
 
+def _moscow_region_suggest(requested: str, text: str) -> bool:
+    """Москва и область взаимозаменяемы только при совпадении улицы/дома."""
+    normalized = _norm_suggest(requested)
+    if re.search(r"\bмосква\b", normalized):
+        alternative = re.sub(r"\bмосква\b", "московская область", normalized)
+    elif "московская область" in normalized:
+        alternative = normalized.replace("московская область", "москва")
+    else:
+        return False
+    return _suggest_contains(alternative, text)
+
+
+def _geo_city_matches(location: LocationData, shown_city: str, geo: Optional[dict[str, str]]) -> bool:
+    """Сверяет конкретный город с выбранной и подтверждённой гео-подсказкой."""
+    if _normalized_visible_value(shown_city) == _normalized_visible_value(location.city):
+        return True
+    if _norm_suggest(location.city) not in {"москва", "московская область"} or not geo:
+        return False
+    selected = geo.get("selected", "")
+    applied = geo.get("applied", "")
+    if not geo.get("location_id") or not _address_matches_requested(location.full_address(), applied):
+        return False
+    if not _address_matches_requested(location.full_address(), selected):
+        return False
+    # Областной город берём из выбранного адреса, а не из поля цены как эталон.
+    region_confirmed = "московская область" in _norm_suggest(selected)
+    return bool(
+        region_confirmed and shown_city.strip()
+        and _suggest_contains(shown_city, selected)
+        and _suggest_contains(shown_city, applied)
+    )
+
+
 def _address_matches_requested(requested: str, applied: str) -> bool:
     """Проверяет город, улицу и номер дома с допустимым каноническим суффиксом.
 
@@ -2103,7 +2138,7 @@ def _address_matches_requested(requested: str, applied: str) -> bool:
     улицы, применённый Авито дом (любой) считаем допустимым — сверяем лишь
     город и улицу.
     """
-    if not _suggest_contains(requested, applied):
+    if not (_suggest_contains(requested, applied) or _moscow_region_suggest(requested, applied)):
         return False
     requested_house = _address_house_number(requested)
     if not requested_house:
@@ -2150,46 +2185,52 @@ async def _click_suggest_option(
     «прилипает» только при КЛИКЕ пункта. Закрытие списка через Escape очищает поле
     бренда, а клик по контейнеру гео-саджеста адрес не выбирает.
     """
+    deadline = asyncio.get_event_loop().time() + timeout_ms / 1000
     if not await _selector_visible(page, option_selector, timeout_ms):
         return None
     want = _norm_suggest(prefer_text or "")
-    deadline = asyncio.get_event_loop().time() + timeout_ms / 1000
     while True:
         options = page.locator(option_selector)
         try:
-            count = await options.count()
+            visible_texts = await options.evaluate_all(
+                "els => els.filter(el => el.getClientRects().length "
+                "&& getComputedStyle(el).visibility !== 'hidden')"
+                ".map(el => (el.innerText || el.textContent || '').trim())"
+            )
         except Exception:
-            count = 0
+            visible_texts = []
 
-        visible_options: list[tuple[Any, str]] = []
-        for i in range(count):
-            option = options.nth(i)
-            try:
-                if not await option.is_visible():
-                    continue
-                text = (await option.inner_text()).strip()
-            except Exception:
-                continue
-            visible_options.append((option, text))
-
-        chosen: Optional[Any] = None
-        chosen_text = ""
+        chosen_text: Optional[str] = None
         if want:
-            for option, text in visible_options:
+            for text in visible_texts:
                 if _suggest_contains(want, text):
-                    chosen = option
                     chosen_text = text
                     break
-        elif visible_options:
-            chosen, chosen_text = visible_options[0]
+            if chosen_text is None:
+                chosen_text = next((text for text in visible_texts if _moscow_region_suggest(want, text)), None)
+        elif visible_texts:
+            chosen_text = visible_texts[0]
 
-        if chosen is not None:
-            await chosen.click(timeout=5_000)
-            return chosen_text or "(пункт без текста)"
+        if chosen_text is not None:
+            remaining_s = deadline - asyncio.get_event_loop().time()
+            if remaining_s <= 0:
+                return None
+            remaining_ms = max(1, int(remaining_s * 1000))
+            # React меняет список во время ввода: nth(i) может уже указывать
+            # на другой город. Фиксируем текст, а не позицию в старом списке.
+            exact_text = re.compile(
+                r"^\s*" + r"\s*".join(map(re.escape, chosen_text.split())) + r"\s*$"
+            )
+            target = options.filter(has_text=exact_text).first
+            try:
+                await target.click(timeout=min(700, remaining_ms))
+                return chosen_text or "(пункт без текста)"
+            except PlaywrightTimeoutError:
+                logger.info("Подсказка адреса обновилась перед кликом — перечитываю список")
 
         if asyncio.get_event_loop().time() >= deadline:
             return None
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(min(0.2, max(0.0, deadline - asyncio.get_event_loop().time())))
 
 
 async def _select_brand(
@@ -2673,6 +2714,13 @@ async def _step_fill_address(
 
         # Контроль: hidden address и locationId непустые (даём React время)
         if await _wait_until(_address_applied, attempts=10, interval_s=0.5):
+            if "московская область" in _norm_suggest(chosen_addr):
+                return {
+                    "requested": full_address,
+                    "selected": chosen_addr,
+                    "applied": await _hidden_value(page, psel.ADDRESS_HIDDEN),
+                    "location_id": await _hidden_value(page, psel.LOCATION_ID_HIDDEN),
+                }
             return None
         logger.warning("hidden address/locationId не заполнились (попытка %d)", attempt)
 
@@ -2756,16 +2804,22 @@ async def _step_continue_listing(page: Any) -> tuple[str, Any]:
     try:
         if not await button.is_visible():
             raise StepError("Кнопка «Продолжить» на заполненной форме не видна")
-        button_text = _norm_label(await button.inner_text())
-        # Разрешаем только два точных подтверждённых DOM-варианта
-        # (CONTINUE_BUTTON_LABELS): произвольный суффикс у финансово значимой
-        # кнопки по-прежнему блокирует клик.
-        if button_text not in CONTINUE_BUTTON_LABELS:
-            raise StepError(
-                f"Финальная кнопка формы имеет неизвестное название: {button_text!r}"
-            )
-        if not await button.is_enabled():
-            raise StepError("Кнопка «Продолжить» на заполненной форме недоступна")
+        # После выбора геолокации React ещё меняет подпись и доступность.
+        # Ждём только ДО финансовой границы; неизвестную подпись не разрешаем.
+        ready_deadline = time.monotonic() + 5.0
+        while True:
+            button_text = _norm_label(await button.inner_text())
+            known_label = button_text in CONTINUE_BUTTON_LABELS
+            if known_label and await button.is_enabled():
+                break
+            if time.monotonic() >= ready_deadline:
+                if not known_label:
+                    raise StepError(
+                        "Финальная кнопка формы имеет неизвестное название: "
+                        f"{button_text!r}"
+                    )
+                raise StepError("Кнопка «Продолжить» на заполненной форме недоступна")
+            await asyncio.sleep(0.2)
     except StepError:
         raise
     except Exception as exc:
@@ -2993,6 +3047,7 @@ async def _step_fill_view_price(
     items_total: int,
     *,
     view_price_max: Decimal,
+    applied_geo: Optional[dict[str, str]] = None,
 ) -> Decimal:
     """Вводит минимальную стоимость Авито и дословно проверяет её, ничего
     финансового не подтверждая."""
@@ -3007,7 +3062,7 @@ async def _step_fill_view_price(
         shown_city = await city_input.input_value()
     except Exception as exc:
         raise StepError("Не удалось прочитать город показа объявления") from exc
-    if _normalized_visible_value(shown_city) != _normalized_visible_value(location.city):
+    if not _geo_city_matches(location, shown_city, applied_geo):
         raise StepError(
             f"Город показа Авито «{shown_city}» не совпадает с городом "
             f"объявления «{location.city}»"
@@ -3144,8 +3199,12 @@ async def _find_view_price_action(
             try:
                 if not await button.is_visible():
                     continue
-                if _norm_label(await button.inner_text()) in VIEW_PRICE_ACTION_TEXTS:
-                    return button
+                text = _norm_label(await button.inner_text())
+                if text in VIEW_PRICE_ACTION_TEXTS:
+                    pattern = re.compile(r"^\s*" + r"\s+".join(map(re.escape, text.split())) + r"\s*$")
+                    stable = buttons.filter(has_text=pattern)
+                    if await stable.count() == 1:
+                        return stable
             except Exception:
                 continue
         await asyncio.sleep(0.2)
@@ -3440,6 +3499,8 @@ async def _run_single_item_steps(
     # ── Шаг 10: fill_address ──────────────────────────────────────────────
     _set_step(job, "fill_address")
     address_warning = await _step_fill_address(page, location.full_address())
+    if address_warning:
+        job["current_applied_geo"] = dict(address_warning)
     await _pause()
 
     # ── Шаг 11: continue_listing ──────────────────────────────────────────
@@ -3509,6 +3570,7 @@ async def _run_single_item_steps(
         item_index,
         items_total,
         view_price_max=data.view_price_max,
+        **({"applied_geo": address_warning} if address_warning else {}),
     )
 
     # ── Шаг 13: continue_view_price ───────────────────────────────────────

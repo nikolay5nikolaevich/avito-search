@@ -14,6 +14,7 @@ if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
 import avito_publish_selectors as psel  # noqa: E402
+import publish_test_isolation  # noqa: E402, F401
 import publisher  # noqa: E402
 
 

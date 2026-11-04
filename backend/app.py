@@ -8,6 +8,7 @@ import asyncio
 import csv
 import dataclasses
 import io
+import json
 import logging
 import mimetypes
 import os
@@ -2419,6 +2420,29 @@ async def api_iphone_library(title: str = "", memory: str = "") -> JSONResponse:
     return JSONResponse(result)
 
 
+@app.get("/api/publish/iphone-library/photo")
+async def api_iphone_library_photo(
+    request: Request,
+    title: str = "", memory: str = "", pack_id: str = "", photo_id: str = "",
+) -> Response:
+    """Предпросмотр локального пака до подготовки черновиков."""
+    import iphone_library
+
+    origin = request.headers.get("origin")
+    if (
+        (origin is not None and origin not in ALLOWED_ORIGINS)
+        or request.headers.get("sec-fetch-site") == "cross-site"
+    ):
+        return JSONResponse({"error": "Запрещено: чужой источник запроса"}, status_code=403)
+    try:
+        picture = await asyncio.to_thread(
+            iphone_library.preview_photo, title, memory, pack_id, photo_id,
+        )
+    except (ValueError, OSError) as exc:
+        return JSONResponse({"error": _short_error(exc)}, status_code=422)
+    return Response(picture, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
 @app.post("/api/publish/prepare")
 async def api_prepare_start(
     title: str = Form(""),
@@ -2433,6 +2457,7 @@ async def api_prepare_start(
     color: str = Form(""),
     sim_type: str = Form(""),
     pack_id: str = Form(""),
+    photo_order: str = Form(""),
     photos: list[UploadFile] = File([]),
 ) -> JSONResponse:
     """
@@ -2458,6 +2483,16 @@ async def api_prepare_start(
                 "field": "sim_type", "error": "Выберите тип SIM",
             }]}, status_code=422)
         try:
+            order = None
+            if isinstance(photo_order, str) and photo_order:
+                try:
+                    order = json.loads(photo_order)
+                except ValueError as exc:
+                    raise ValueError("Неверный порядок фотографий") from exc
+                if not isinstance(order, list):
+                    raise ValueError("Порядок фотографий должен быть списком")
+                if not isinstance(pack_id, str) or not pack_id:
+                    raise ValueError("Выберите фотопак перед изменением порядка фото")
             count = publisher.parse_drafts_count(drafts_count)
             if count is None:
                 raise ValueError("Укажите количество объявлений от 1 до 20")
@@ -2465,6 +2500,7 @@ async def api_prepare_start(
             materials = await asyncio.to_thread(
                 iphone_library.select_materials,
                 title, memory, color, sim_type, count, selection,
+                photo_order=order,
             )
             library_photos = materials.pop("source_photos")
             library = {**materials, "pack_selection": selection}

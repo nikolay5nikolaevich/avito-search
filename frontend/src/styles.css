@@ -1119,6 +1119,47 @@ button {
 }
 
 /* Зона загрузки фото */
+.iphone-library-preview {
+  grid-column: 1 / -1;
+}
+
+.iphone-library-photos {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 12px;
+  padding: 0;
+  list-style: none;
+}
+
+.iphone-library-photo {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid #d4d4d4;
+  border-radius: 12px;
+}
+
+.iphone-library-photo img {
+  width: 100%;
+  height: 160px;
+  object-fit: contain;
+  border-radius: 8px;
+}
+
+.iphone-library-photo-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.iphone-library-photo-actions {
+  display: flex;
+  gap: 8px;
+}
+
 .draft-photo-zone {
   display: flex;
   align-items: center;

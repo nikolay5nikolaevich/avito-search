@@ -44,6 +44,9 @@ class IphoneLibraryBrowserTest(unittest.TestCase):
             stack.enter_context(patch.dict(api.PREP_JOBS, {}, clear=True))
             stack.enter_context(patch.dict(api.PUBLISH_JOBS, {}, clear=True))
             stack.enter_context(patch.object(api.journal, "log_event"))
+            stack.enter_context(patch.object(api, "ALLOWED_ORIGINS", {
+                *api.ALLOWED_ORIGINS, "http://127.0.0.1:18779",
+            }))
             schedule = stack.enter_context(patch.object(api, "_schedule_publish"))
             run_publish = stack.enter_context(patch.object(api.publisher, "run_publish_job"))
             server = uvicorn.Server(uvicorn.Config(
@@ -57,7 +60,9 @@ class IphoneLibraryBrowserTest(unittest.TestCase):
                     time.sleep(0.05)
                 self.assertTrue(server.started)
                 with sync_playwright() as browser_api:
-                    browser = browser_api.chromium.launch(headless=True)
+                    bundled = Path(browser_api.chromium.executable_path)
+                    options = {} if bundled.is_file() else {"channel": "chrome"}
+                    browser = browser_api.chromium.launch(headless=True, **options)
                     try:
                         page = browser.new_page(viewport={"width": 1440, "height": 1000})
                         page.route("**/*", lambda route: route.continue_()
@@ -117,7 +122,7 @@ class IphoneLibraryBrowserTest(unittest.TestCase):
                         output.parent.mkdir(parents=True, exist_ok=True)
                         page.screenshot(path=str(output), full_page=True)
                         with page.expect_response(lambda response: response.url.endswith("/api/publish/start")) as response:
-                            page.get_by_role("button", name="Опубликовать 2 объявления").click()
+                            page.get_by_role("button", name="Отправить 2 объявления на Авито").click()
                         self.assertEqual(response.value.status, 200, response.value.text())
                         schedule.assert_called_once()
                         draft = schedule.call_args.args[1]

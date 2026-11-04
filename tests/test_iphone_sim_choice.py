@@ -19,7 +19,9 @@ class ExplicitSimDomAcceptance(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         playwright = await async_playwright().start()
         self.addAsyncCleanup(playwright.stop)
-        browser = await playwright.chromium.launch(headless=True)
+        bundled = Path(playwright.chromium.executable_path)
+        options = {} if bundled.is_file() else {"channel": "chrome"}
+        browser = await playwright.chromium.launch(headless=True, **options)
         self.addAsyncCleanup(browser.close)
         self.page = await browser.new_page()
         await self.page.route("**/*", lambda route: route.abort())

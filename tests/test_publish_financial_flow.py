@@ -93,6 +93,12 @@ class FakeLocator:
             return self
         return self.elements[index]
 
+    def filter(self, *, has_text) -> "FakeLocator":
+        matches = [node for node in (self.elements or [self]) if has_text.search(node.text)]
+        if len(matches) == 1:
+            return matches[0]
+        return FakeLocator(elements=matches, visible=False)
+
     def locator(self, selector: str) -> "FakeLocator":
         return self.children.get(selector, FakeLocator(visible=False))
 

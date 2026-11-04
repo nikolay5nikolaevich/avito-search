@@ -39,7 +39,15 @@ import {
   createPhotoStorage,
 } from "../lib/draftPersistence";
 import FieldShell from "../components/FieldShell";
-import { SIM_TYPES, applyIphoneCatalog, iphoneCatalogKey, validateIphoneLibrary } from "../lib/iphoneLibrary";
+import {
+  SIM_TYPES,
+  applyIphoneCatalog,
+  iphoneCatalogKey,
+  validateIphoneLibrary,
+  syncLibraryPreview,
+  moveLibraryPhoto,
+  libraryPhotoUrl,
+} from "../lib/iphoneLibrary";
 import ProgressBar from "../components/ProgressBar";
 import SiteFooter from "../components/SiteFooter";
 import Topbar from "../components/Topbar";
@@ -173,6 +181,9 @@ function buildInitialForm() {
     memory: "",
     sim_type: "",
     pack_id: "",
+    library_preview_pack_id: "",
+    library_preview_key: "",
+    photo_order: [],
   };
 }
 
@@ -434,7 +445,11 @@ function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
       fetchIphoneLibrary(form.title, form.memory).then((data) => {
         if (cancelled) return;
         setLibrary({ key: catalogKey, data, loading: false, error: "" });
-        setForm((current) => applyIphoneCatalog(current, catalogKey, data, profile));
+        setForm((current) => {
+          if (iphoneCatalogKey(current) !== catalogKey) return current;
+          const next = applyIphoneCatalog(current, catalogKey, data, profile);
+          return syncLibraryPreview(next, data);
+        });
       }).catch((error) => {
         if (cancelled) return;
         setLibrary({ key: catalogKey, data: null, loading: false, error: error.message });
@@ -460,9 +475,26 @@ function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
     const { name, value } = e.target;
     setForm((prev) => ({
       ...prev, [name]: value,
-      ...(prev.category === "iphone" && ["title", "memory"].includes(name) ? { pack_id: "" } : {}),
+      ...(prev.category === "iphone" && ["title", "memory"].includes(name)
+        ? { pack_id: "", library_preview_pack_id: "", photo_order: [] } : {}),
+      ...(name === "pack_id" ? { library_preview_pack_id: value, photo_order: [] } : {}),
     }));
     clearError(name);
+  }
+
+  function selectLibraryPack(e) {
+    const packId = e.target.value;
+    setForm((current) => syncLibraryPreview({
+      ...current, pack_id: packId, library_preview_pack_id: packId, photo_order: [],
+    }, library.data));
+    clearError("pack_id");
+  }
+
+  function reorderLibraryPhoto(from, to) {
+    if (anyBusy) return;
+    setForm((current) => ({
+      ...current, photo_order: moveLibraryPhoto(current.photo_order, from, to),
+    }));
   }
 
   function handleDraftsCountChange(e) {
@@ -563,6 +595,8 @@ function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
         memory: "",
         sim_type: "",
         pack_id: "",
+        library_preview_pack_id: "",
+        photo_order: [],
         // Справочники цветов и состояний у категорий разные (у телефонов свои ID)
         color: "",
         condition: nextConditions.includes(prev.condition) ? prev.condition : nextConditions[0] ?? "",
@@ -663,7 +697,7 @@ function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
         price: Number(form.price),
         locationsCount: form.locations.length,
         viewPriceMax: normalizeViewPrice(form.view_price_max),
-        photosCount: photos.length,
+        photosCount: isIphone ? form.photo_order.length : photos.length,
         draftsCount: Number(form.drafts_count),
       });
     } catch (err) {
@@ -704,7 +738,7 @@ function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
         price: Number(form.price),
         locationsCount: form.locations.length,
         viewPriceMax: normalizeViewPrice(form.view_price_max),
-        photosCount: photos.length,
+        photosCount: isIphone ? form.photo_order.length : photos.length,
         draftsCount: Number(form.drafts_count),
       });
     } catch (err) {
@@ -1084,7 +1118,7 @@ function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
           </div>
           <div data-field="pack_id">
             <FieldShell label="Фотопак" error={errors.pack_id || library.error || (catalogCurrent ? libraryErrors.pack_id : "")}>
-              <select className="field-input draft-select" name="pack_id" value={form.pack_id} onChange={updateField} disabled={!catalogCurrent}>
+              <select className="field-input draft-select" name="pack_id" value={form.pack_id} onChange={selectLibraryPack} disabled={!catalogCurrent || anyBusy}>
                 <option value="">Случайный</option>
                 {form.pack_id && !library.data?.packs?.some((pack) => pack.id === form.pack_id) ? (
                   <option value={form.pack_id} disabled>{form.pack_id} — пак не найден</option>
@@ -1098,9 +1132,45 @@ function DraftForm({ onStarted, onPrepared, disabledByPendingJob }) {
               <p className="draft-view-price-hint" aria-live="polite">
                 {library.loading ? "Проверяем материалы…" : `Описаний: ${library.data?.descriptions_count ?? 0}. Один фотопак для всех черновиков; цвет не ограничивает фото.`}
               </p>
-              <button type="button" className="secondary-button" onClick={() => setLibraryRefresh((value) => value + 1)}>Обновить библиотеку</button>
+              <button type="button" className="secondary-button" disabled={anyBusy} onClick={() => setLibraryRefresh((value) => value + 1)}>Обновить библиотеку</button>
+              {!form.pack_id && catalogCurrent && form.library_preview_pack_id ? (
+                <p className="draft-view-price-hint">
+                  Случайно выбран пак: {form.library_preview_pack_id}. Он будет использован для всех объявлений.{" "}
+                  <button type="button" className="secondary-button" disabled={anyBusy} onClick={() => selectLibraryPack({ target: { value: "" } })}>Выбрать случайный заново</button>
+                </p>
+              ) : null}
             </FieldShell>
           </div>
+          {catalogCurrent && form.photo_order.length > 0 ? (
+            <div className="iphone-library-preview" data-field="photo_order">
+              <p>Фото выбранного пака. Первое фото будет главным. Меняйте порядок стрелками или перетаскиванием.</p>
+              {errors.photo_order ? <p role="alert">{errors.photo_order}</p> : null}
+              <ol className="iphone-library-photos">
+                {form.photo_order.map((photoId, index) => (
+                  <li key={photoId} className="iphone-library-photo" draggable={!anyBusy}
+                    onDragStart={(event) => event.dataTransfer.setData("text/plain", String(index))}
+                    onDragOver={(event) => event.preventDefault()}
+                    onDrop={(event) => {
+                      event.preventDefault();
+                      const from = event.dataTransfer.getData("text/plain");
+                      if (/^\d+$/.test(from)) reorderLibraryPhoto(Number(from), index);
+                    }}>
+                    <a href={libraryPhotoUrl(form, photoId, libraryRefresh)} target="_blank" rel="noreferrer" aria-label={`Открыть фото ${index + 1}`}>
+                      <img src={libraryPhotoUrl(form, photoId, libraryRefresh)} alt={`Фото ${index + 1}: ${photoId}`} draggable={false} />
+                    </a>
+                    <span>{index === 0 ? "1 · Главное" : index + 1}</span>
+                    <span className="iphone-library-photo-name" title={photoId}>{photoId}</span>
+                    <div className="iphone-library-photo-actions">
+                      <button type="button" className="secondary-button" aria-label={`Переместить фото ${index + 1} левее`} disabled={index === 0 || anyBusy}
+                        onClick={() => reorderLibraryPhoto(index, index - 1)}>←</button>
+                      <button type="button" className="secondary-button" aria-label={`Переместить фото ${index + 1} правее`} disabled={index === form.photo_order.length - 1 || anyBusy}
+                        onClick={() => reorderLibraryPhoto(index, index + 1)}>→</button>
+                    </div>
+                  </li>
+                ))}
+              </ol>
+            </div>
+          ) : null}
         </>
       )}
       <div data-field="price">
@@ -1938,7 +2008,7 @@ function PublishProgressPanel({ jobId, summary, onBack }) {
           ) : null}
           {addressWarnings.length > 0 ? (
             <div className="draft-terminal-copy draft-terminal-partial">
-              <strong>Авито применил только город:</strong>
+              <strong>Адреса, уточнённые Авито:</strong>
               <ul>
                 {addressWarnings.map((warning) => (
                   <li key={`${warning.item_index}-${warning.requested}`}>
